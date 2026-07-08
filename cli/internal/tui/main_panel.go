@@ -48,6 +48,8 @@ func (m AppModel) renderMainPanel(width, height int) string {
 		switch m.promptType {
 		case "sync":
 			promptTitle = "Iniciar Sincronização em Tempo Real"
+		case "tunnel_direction":
+			promptTitle = "Direção do Túnel SSH"
 		case "tunnel":
 			promptTitle = "Configurar Novo Túnel SSH"
 		case "new_tmux_session":

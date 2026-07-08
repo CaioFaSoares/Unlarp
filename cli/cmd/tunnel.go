@@ -20,21 +20,29 @@ import (
 )
 
 var tunnelBackground bool
+var tunnelLocal bool
 
 var tunnelCmd = &cobra.Command{
 	Use:   "tunnel <portas> [name]",
 	Short: "Criar túnel SSH (port forwarding)",
-	Long: `Cria túneis SSH para encaminhar portas do workspace remoto para sua máquina local.
+	Long: `Cria túneis SSH para encaminhar portas entre sua máquina local e o workspace remoto.
 Substitui o script tunnel.sh com suporte a múltiplos túneis simultâneos e reconexão automática.
 
+Por padrão o túnel escuta no host REMOTO e encaminha para sua máquina local
+(equivalente a "ssh -R"), útil para expor um serviço local (ex: dev server)
+através do host remoto. Use --local para inverter: escuta na sua máquina e
+encaminha para o host remoto (equivalente a "ssh -L"), útil para acessar um
+serviço que já roda remotamente (ex: Postgres num container).
+
 Sintaxe de portas:
-  5432         — Porta remota 5432 → local 5432 (mesma porta)
-  3000:8080    — Porta remota 3000 → local 8080
+  5432         — Porta remota 5432 ↔ local 5432 (mesma porta)
+  3000:8080    — Porta remota 3000 ↔ local 8080
   5432,3000    — Múltiplas portas de uma vez
 
 Exemplos:
-  unlarp tunnel 5432                    # Postgres DinD → localhost:5432
-  unlarp tunnel 3000:8080               # Remoto 3000 → local 8080
+  unlarp tunnel 3000                    # Dev server local:3000 exposto no remoto:3000
+  unlarp tunnel 5432 --local            # Postgres remoto:5432 acessível em localhost:5432
+  unlarp tunnel 3000:8080               # Remoto 3000 ↔ local 8080
   unlarp tunnel 5432,3000,6379          # Múltiplos túneis
   unlarp tunnel 5432 coolify-prod       # Host específico
   unlarp tunnel 5432 -b                 # Background mode`,
@@ -68,6 +76,7 @@ func init() {
 	tunnelCmd.AddCommand(tunnelStopCmd)
 
 	tunnelCmd.Flags().BoolVarP(&tunnelBackground, "background", "b", false, "rodar em background")
+	tunnelCmd.Flags().BoolVarP(&tunnelLocal, "local", "l", false, "escutar na máquina local e encaminhar para o host remoto (ssh -L), em vez do padrão (ssh -R)")
 	tunnelStopCmd.Flags().BoolVar(&tunnelStopAll, "all", false, "parar todos os túneis")
 }
 
@@ -168,17 +177,26 @@ func runTunnel(cmd *cobra.Command, args []string) error {
 	// Session manager para persistência
 	sessMgr, _ := session.NewManager()
 
+	direction := tunnel.DirectionRemote
+	if tunnelLocal {
+		direction = tunnel.DirectionLocal
+	}
+
 	// Inicia túneis
 	var tunnelIDs []string
 	for _, m := range mappings {
-		id, err := mgr.Add(m.LocalPort, m.RemotePort)
+		id, err := mgr.Add(m.LocalPort, m.RemotePort, direction)
 		if err != nil {
 			ui.Error("Falha ao criar túnel %d → %d: %v", m.RemotePort, m.LocalPort, err)
 			continue
 		}
 
 		tunnelIDs = append(tunnelIDs, id)
-		ui.Success("Túnel %s: localhost:%d → workspace:%d", id, m.LocalPort, m.RemotePort)
+		if direction == tunnel.DirectionLocal {
+			ui.Success("Túnel %s: localhost:%d → workspace:%d", id, m.LocalPort, m.RemotePort)
+		} else {
+			ui.Success("Túnel %s: workspace:%d → localhost:%d", id, m.RemotePort, m.LocalPort)
+		}
 
 		// Registra no session state
 		if sessMgr != nil && displayName != "" {
@@ -186,6 +204,7 @@ func runTunnel(cmd *cobra.Command, args []string) error {
 				ID:         id,
 				RemotePort: m.RemotePort,
 				LocalPort:  m.LocalPort,
+				Direction:  direction.String(),
 			})
 		}
 	}
@@ -263,9 +282,9 @@ func printTunnelStatus(mgr *tunnel.Manager) {
 		}
 
 		totalBytes := tunnel.FormatBytes(info.BytesIn + info.BytesOut)
-		fmt.Printf("   %s%s\033[0m %d → %d  %d conn  %s\n",
+		fmt.Printf("   %s%s\033[0m %d → %d (%s)  %d conn  %s\n",
 			statusColor, statusIcon,
-			info.RemotePort, info.LocalPort,
+			info.RemotePort, info.LocalPort, info.Direction,
 			info.Connections, totalBytes,
 		)
 	}
@@ -281,13 +300,17 @@ func runTunnelList(cmd *cobra.Command, args []string) error {
 	hasTunnels := false
 
 	table := tablewriter.NewTable(os.Stdout)
-	table.Header("ID", "HOST", "MAPPING", "STATUS")
+	table.Header("ID", "HOST", "MAPPING", "DIRECTION", "STATUS")
 
 	for name, sess := range sessions {
 		for _, t := range sess.Tunnels {
 			hasTunnels = true
 			mapping := fmt.Sprintf("%d → %d", t.RemotePort, t.LocalPort)
-			table.Append(t.ID, name, mapping, "● Registered")
+			direction := t.Direction
+			if direction == "" {
+				direction = tunnel.DirectionRemote.String()
+			}
+			table.Append(t.ID, name, mapping, direction, "● Registered")
 		}
 	}
 

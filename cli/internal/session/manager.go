@@ -37,6 +37,7 @@ type TunnelEntry struct {
 	ID         string `json:"id"`
 	RemotePort int    `json:"remote_port"`
 	LocalPort  int    `json:"local_port"`
+	Direction  string `json:"direction,omitempty"` // "remote" (padrão) | "local"
 }
 
 // Manager gerencia múltiplas sessões com persistência

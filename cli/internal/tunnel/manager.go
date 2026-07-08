@@ -31,6 +31,7 @@ type ForwarderInfo struct {
 	ID          string
 	LocalPort   int
 	RemotePort  int
+	Direction   Direction
 	Status      ForwarderStatus
 	Connections int32
 	BytesIn     int64
@@ -60,8 +61,8 @@ func NewManager(sshClient *internalssh.Client, hostConfig *config.Host, hostName
 	return m
 }
 
-// Add cria e inicia um novo forwarder
-func (m *Manager) Add(localPort, remotePort int) (string, error) {
+// Add cria e inicia um novo forwarder na direção informada
+func (m *Manager) Add(localPort, remotePort int, direction Direction) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -73,7 +74,7 @@ func (m *Manager) Add(localPort, remotePort int) (string, error) {
 	}
 
 	id := generateID()
-	forwarder := NewForwarder(id, localPort, remotePort, m.sshClient.Conn())
+	forwarder := NewForwarder(id, localPort, remotePort, m.sshClient.Conn(), direction)
 
 	if err := forwarder.Start(); err != nil {
 		return "", err
@@ -120,6 +121,7 @@ func (m *Manager) List() []ForwarderInfo {
 			ID:          f.ID,
 			LocalPort:   f.LocalPort,
 			RemotePort:  f.RemotePort,
+			Direction:   f.Direction,
 			Status:      f.Status(),
 			Connections: f.Connections(),
 			BytesIn:     f.BytesIn(),

@@ -37,12 +37,34 @@ func (s ForwarderStatus) String() string {
 	}
 }
 
-// Forwarder encapsula um único túnel local → remoto via SSH
+// Direction indica de que lado o túnel escuta por conexões
+type Direction int
+
+const (
+	// DirectionRemote escuta no host remoto e encaminha para a máquina local
+	// (equivalente a `ssh -R`). É o padrão: a maioria dos túneis expõe um
+	// serviço local (ex: dev server) através do host remoto.
+	DirectionRemote Direction = iota
+	// DirectionLocal escuta na máquina local e encaminha para o host remoto
+	// (equivalente a `ssh -L`). Útil para acessar um serviço que já roda no
+	// host remoto (ex: Postgres num container) via uma porta local.
+	DirectionLocal
+)
+
+func (d Direction) String() string {
+	if d == DirectionLocal {
+		return "local"
+	}
+	return "remote"
+}
+
+// Forwarder encapsula um único túnel SSH entre uma porta local e uma remota
 type Forwarder struct {
 	ID         string
 	LocalPort  int
 	RemotePort int
-	RemoteHost string // default "localhost" (dentro do container)
+	RemoteHost string // default "localhost" (dentro do container, usado em DirectionLocal)
+	Direction  Direction
 
 	listener  net.Listener
 	sshClient *ssh.Client
@@ -59,26 +81,38 @@ type Forwarder struct {
 }
 
 // NewForwarder cria um novo forwarder
-func NewForwarder(id string, localPort, remotePort int, sshClient *ssh.Client) *Forwarder {
-	remoteHost := "localhost"
+func NewForwarder(id string, localPort, remotePort int, sshClient *ssh.Client, direction Direction) *Forwarder {
 	return &Forwarder{
 		ID:         id,
 		LocalPort:  localPort,
 		RemotePort: remotePort,
-		RemoteHost: remoteHost,
+		RemoteHost: "localhost",
+		Direction:  direction,
 		sshClient:  sshClient,
 		status:     StatusStopped,
 	}
 }
 
-// Start inicia o forwarder: abre listener local e aceita conexões
+// Start inicia o forwarder: abre o listener do lado apropriado (local ou
+// remoto via SSH, conforme Direction) e aceita conexões
 func (f *Forwarder) Start() error {
-	addr := fmt.Sprintf("localhost:%d", f.LocalPort)
-	listener, err := net.Listen("tcp", addr)
-	if err != nil {
-		f.setStatus(StatusError)
-		f.lastError = fmt.Errorf("erro ao abrir porta local %d: %w", f.LocalPort, err)
-		return f.lastError
+	var listener net.Listener
+	var err error
+
+	if f.Direction == DirectionLocal {
+		listener, err = net.Listen("tcp", fmt.Sprintf("localhost:%d", f.LocalPort))
+		if err != nil {
+			f.setStatus(StatusError)
+			f.lastError = fmt.Errorf("erro ao abrir porta local %d: %w", f.LocalPort, err)
+			return f.lastError
+		}
+	} else {
+		listener, err = f.sshClient.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", f.RemotePort))
+		if err != nil {
+			f.setStatus(StatusError)
+			f.lastError = fmt.Errorf("erro ao abrir porta remota %d: %w", f.RemotePort, err)
+			return f.lastError
+		}
 	}
 
 	f.listener = listener
@@ -137,12 +171,9 @@ func (f *Forwarder) StartedAt() time.Time {
 	return f.startedAt
 }
 
-// Mapping retorna a string de mapeamento (ex: "5432 → 5432")
+// Mapping retorna a string de mapeamento (ex: "5432 → 5432 (remote)")
 func (f *Forwarder) Mapping() string {
-	if f.LocalPort == f.RemotePort {
-		return fmt.Sprintf("%d → %d", f.RemotePort, f.LocalPort)
-	}
-	return fmt.Sprintf("%d → %d", f.RemotePort, f.LocalPort)
+	return fmt.Sprintf("%d → %d (%s)", f.RemotePort, f.LocalPort, f.Direction)
 }
 
 // UpdateSSHClient atualiza o cliente SSH (para reconexão)
@@ -188,37 +219,48 @@ func (f *Forwarder) acceptLoop() {
 	}
 }
 
-func (f *Forwarder) handleConnection(localConn net.Conn) {
+// dialPeer conecta ao lado oposto do listener que recebeu a conexão: em
+// DirectionLocal disca o host remoto via canal SSH; em DirectionRemote disca
+// a porta local diretamente (o listener já é o lado remoto, via SSH).
+func (f *Forwarder) dialPeer() (net.Conn, string, error) {
+	if f.Direction == DirectionLocal {
+		addr := fmt.Sprintf("%s:%d", f.RemoteHost, f.RemotePort)
+		conn, err := f.sshClient.Dial("tcp", addr)
+		return conn, addr, err
+	}
+
+	addr := fmt.Sprintf("localhost:%d", f.LocalPort)
+	conn, err := net.Dial("tcp", addr)
+	return conn, addr, err
+}
+
+func (f *Forwarder) handleConnection(inConn net.Conn) {
 	f.connections.Add(1)
 	defer func() {
 		f.connections.Add(-1)
-		localConn.Close()
+		inConn.Close()
 	}()
 
-	// Conecta ao lado remoto via SSH channel
-	remoteAddr := fmt.Sprintf("%s:%d", f.RemoteHost, f.RemotePort)
-	remoteConn, err := f.sshClient.Dial("tcp", remoteAddr)
+	peerConn, peerAddr, err := f.dialPeer()
 	if err != nil {
 		f.statusMu.Lock()
-		f.lastError = fmt.Errorf("erro ao conectar a %s: %w", remoteAddr, err)
+		f.lastError = fmt.Errorf("erro ao conectar a %s: %w", peerAddr, err)
 		f.statusMu.Unlock()
 		return
 	}
-	defer remoteConn.Close()
+	defer peerConn.Close()
 
 	// Bridge bidirecional com contagem de bytes
 	done := make(chan struct{}, 2)
 
-	// local → remote
 	go func() {
-		n, _ := io.Copy(remoteConn, localConn)
+		n, _ := io.Copy(peerConn, inConn)
 		f.bytesOut.Add(n)
 		done <- struct{}{}
 	}()
 
-	// remote → local
 	go func() {
-		n, _ := io.Copy(localConn, remoteConn)
+		n, _ := io.Copy(inConn, peerConn)
 		f.bytesIn.Add(n)
 		done <- struct{}{}
 	}()
