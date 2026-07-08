@@ -44,11 +44,24 @@ type liveSyncSession struct {
 	stopChan      chan struct{}
 }
 
+// pendingSync representa um sync que o usuário acabou de confirmar mas cuja
+// conexão/engine/watchers ainda estão sendo verificados em background —
+// mostrado otimisticamente na lista de Syncs antes da confirmação definitiva
+// (syncStartedMsg), para que o usuário nunca veja "nenhum sync" logo após
+// cadastrar um.
+type pendingSync struct {
+	id        string
+	localDir  string
+	remoteDir string
+}
+
 // TmuxSession representa metadados de uma sessão Tmux remota
 type TmuxSession struct {
 	Name     string
 	Windows  int
 	Attached bool
+	Command  string // comando em execução no painel ativo
+	Path     string // diretório onde o comando está rodando
 }
 
 type tmuxSessionsMsg []TmuxSession
@@ -128,6 +141,7 @@ type AppModel struct {
 	sftpClients    map[string]*sftp.Client
 	tunnelManagers map[string]*tunnel.Manager
 	syncSessions   map[string]map[string]*liveSyncSession
+	pendingSyncs   map[string][]pendingSync
 
 	// Sessões Tmux
 	tmuxSessions []TmuxSession
@@ -218,6 +232,7 @@ func NewAppModel() (*AppModel, error) {
 		sftpClients:    make(map[string]*sftp.Client),
 		tunnelManagers: make(map[string]*tunnel.Manager),
 		syncSessions:   make(map[string]map[string]*liveSyncSession),
+		pendingSyncs:   make(map[string][]pendingSync),
 		projectOutput:  make(map[string]string),
 		restoredHosts:  make(map[string]bool),
 		isOnboarding:   isOnboarding,
@@ -316,8 +331,17 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.pickerActive = false
 				m.addLog(fmt.Sprintf("Diretório remoto selecionado: %s. Conectando e iniciando sincronização (pode levar alguns segundos)...", m.chosenRemote))
 
+				// Mostra o sync na lista imediatamente como "verificando...",
+				// antes mesmo da conexão/engine confirmarem que está ativo.
+				syncID := "s-" + generateRandomString(6)
+				m.pendingSyncs[m.activeHost] = append(m.pendingSyncs[m.activeHost], pendingSync{
+					id:        syncID,
+					localDir:  m.chosenLocal,
+					remoteDir: m.chosenRemote,
+				})
+
 				// Inicia o sync em tempo real em background, sem travar a TUI
-				cmds = append(cmds, m.createSyncLiveCmd(fmt.Sprintf("%s:%s", m.chosenLocal, m.chosenRemote)))
+				cmds = append(cmds, m.createSyncLiveCmd(syncID, fmt.Sprintf("%s:%s", m.chosenLocal, m.chosenRemote)))
 			}
 		} else if m.dirPicker.Cancelled {
 			m.pickerActive = false
@@ -898,7 +922,7 @@ func (m *AppModel) handlePromptSubmit() tea.Cmd {
 	case "tunnel":
 		m.createTunnelLive(val)
 	case "sync":
-		return m.createSyncLiveCmd(val)
+		return m.createSyncLiveCmd("s-"+generateRandomString(6), val)
 	case "new_tmux_session":
 		return m.createTmuxSessionCmd(val)
 	}
@@ -974,14 +998,17 @@ func (m *AppModel) createTunnelLive(val string) {
 // TUI. A varredura inicial do diretório remoto via SFTP (feita dentro de
 // RemoteWatcher.Start) pode levar vários segundos em hosts reais — se isso
 // rodasse direto dentro de Update(), a TUI inteira travaria sem feedback
-// nenhum até terminar.
-func (m *AppModel) createSyncLiveCmd(val string) tea.Cmd {
+// nenhum até terminar. syncID é gerado e mostrado como pendente ANTES desta
+// chamada (ver o confirm do dirpicker em Update()), para que o sync apareça
+// na lista imediatamente com um status de "verificando..." em vez de só
+// surgir (ou nem isso, em caso de erro) quando a conexão terminar.
+func (m *AppModel) createSyncLiveCmd(syncID, val string) tea.Cmd {
 	host := m.activeHost
 
 	return func() tea.Msg {
 		hostCfg, ok := m.cfg.Hosts[host]
 		if !ok {
-			return syncStartedMsg{err: fmt.Errorf("host ativo não configurado"), host: host}
+			return syncStartedMsg{err: fmt.Errorf("host ativo não configurado"), host: host, syncID: syncID}
 		}
 
 		parts := strings.Split(val, ":")
@@ -996,30 +1023,28 @@ func (m *AppModel) createSyncLiveCmd(val string) tea.Cmd {
 		}
 
 		if remoteDir == "" {
-			return syncStartedMsg{err: fmt.Errorf("diretório remoto é obrigatório"), host: host}
+			return syncStartedMsg{err: fmt.Errorf("diretório remoto é obrigatório"), host: host, syncID: syncID}
 		}
 
 		absLocal, err := filepath.Abs(localDir)
 		if err != nil {
-			return syncStartedMsg{err: fmt.Errorf("caminho local inválido: %w", err), host: host}
+			return syncStartedMsg{err: fmt.Errorf("caminho local inválido: %w", err), host: host, syncID: syncID}
 		}
 
 		// Garante conexão SSH e SFTP
 		client, err := m.getOrCreateSSHClient(host, &hostCfg)
 		if err != nil {
-			return syncStartedMsg{err: fmt.Errorf("erro SSH: %w", err), host: host}
+			return syncStartedMsg{err: fmt.Errorf("erro SSH: %w", err), host: host, syncID: syncID}
 		}
 
 		sftpCli, err := m.getOrCreateSFTPClient(host, client)
 		if err != nil {
-			return syncStartedMsg{err: fmt.Errorf("erro SFTP: %w", err), host: host}
+			return syncStartedMsg{err: fmt.Errorf("erro SFTP: %w", err), host: host, syncID: syncID}
 		}
-
-		syncID := "s-" + generateRandomString(6)
 
 		engine, localWatcher, remoteWatcher, err := m.startSyncEngine(host, syncID, absLocal, remoteDir, client, sftpCli)
 		if err != nil {
-			return syncStartedMsg{err: err, host: host}
+			return syncStartedMsg{err: err, host: host, syncID: syncID}
 		}
 
 		return syncStartedMsg{
@@ -1109,22 +1134,22 @@ func (m *AppModel) restoreSyncsCmd(host string) tea.Cmd {
 		cmds = append(cmds, func() tea.Msg {
 			hostCfg, ok := m.cfg.Hosts[host]
 			if !ok {
-				return syncStartedMsg{err: fmt.Errorf("host '%s' não configurado", host), host: host, restored: true}
+				return syncStartedMsg{err: fmt.Errorf("host '%s' não configurado", host), host: host, syncID: entry.ID, restored: true}
 			}
 
 			client, err := m.getOrCreateSSHClient(host, &hostCfg)
 			if err != nil {
-				return syncStartedMsg{err: fmt.Errorf("erro SSH ao restaurar sync %s: %w", entry.ID, err), host: host, restored: true}
+				return syncStartedMsg{err: fmt.Errorf("erro SSH ao restaurar sync %s: %w", entry.ID, err), host: host, syncID: entry.ID, restored: true}
 			}
 
 			sftpCli, err := m.getOrCreateSFTPClient(host, client)
 			if err != nil {
-				return syncStartedMsg{err: fmt.Errorf("erro SFTP ao restaurar sync %s: %w", entry.ID, err), host: host, restored: true}
+				return syncStartedMsg{err: fmt.Errorf("erro SFTP ao restaurar sync %s: %w", entry.ID, err), host: host, syncID: entry.ID, restored: true}
 			}
 
 			engine, localWatcher, remoteWatcher, err := m.startSyncEngine(host, entry.ID, entry.LocalDir, entry.RemoteDir, client, sftpCli)
 			if err != nil {
-				return syncStartedMsg{err: err, host: host, restored: true}
+				return syncStartedMsg{err: err, host: host, syncID: entry.ID, restored: true}
 			}
 
 			return syncStartedMsg{
@@ -1151,6 +1176,8 @@ func (m *AppModel) restoreSyncsCmd(host string) tea.Cmd {
 // (exceto quando restaurado — já está persistido) e dispara a reconciliação
 // inicial de arquivos.
 func (m *AppModel) handleSyncStarted(msg syncStartedMsg) {
+	m.removePendingSync(msg.host, msg.syncID)
+
 	if msg.err != nil {
 		m.addLog(fmt.Sprintf("Erro ao criar sincronização: %v", msg.err))
 		return
@@ -1295,6 +1322,19 @@ func (m *AppModel) getOrCreateSFTPClient(hostName string, client *internalssh.Cl
 	return newSFTP.Inner(), nil
 }
 
+// removePendingSync tira um sync da lista otimista de "verificando..." —
+// chamado quando syncStartedMsg chega (sucesso ou erro), já que a partir daí
+// ele passa a existir de verdade (persistido) ou nunca existiu.
+func (m *AppModel) removePendingSync(host, syncID string) {
+	list := m.pendingSyncs[host]
+	for i, p := range list {
+		if p.id == syncID {
+			m.pendingSyncs[host] = append(list[:i], list[i+1:]...)
+			return
+		}
+	}
+}
+
 func generateRandomString(n int) string {
 	const chars = "abcdefghijklmnopqrstuvwxyz0123456789"
 	b := make([]byte, n)
@@ -1317,8 +1357,9 @@ func (m *AppModel) checkTmuxCmd() tea.Cmd {
 			return tmuxSessionsMsg(nil)
 		}
 
-		// List sessions formatted: session_name|session_windows|attached_flag
-		stdout, _, err := client.RunCommand("tmux list-sessions -F '#{session_name}|#{session_windows}|#{?session_attached,1,0}' 2>/dev/null")
+		// Uma linha por sessão: dados da sessão + comando/diretório do painel ativo
+		// da janela ativa (o que está de fato rodando ali no momento).
+		stdout, _, err := client.RunCommand("tmux list-panes -a -f '#{&&:#{window_active},#{pane_active}}' -F '#{session_name}|#{session_windows}|#{?session_attached,1,0}|#{pane_current_command}|#{pane_current_path}' 2>/dev/null")
 		if err != nil {
 			return tmuxSessionsMsg(nil)
 		}
@@ -1339,11 +1380,17 @@ func (m *AppModel) checkTmuxCmd() tea.Cmd {
 			windows, _ := strconv.Atoi(parts[1])
 			attached := parts[2] == "1"
 
-			sessions = append(sessions, TmuxSession{
+			session := TmuxSession{
 				Name:     name,
 				Windows:  windows,
 				Attached: attached,
-			})
+			}
+			if len(parts) >= 5 {
+				session.Command = parts[3]
+				session.Path = parts[4]
+			}
+
+			sessions = append(sessions, session)
 		}
 		return tmuxSessionsMsg(sessions)
 	}
