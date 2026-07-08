@@ -4,14 +4,6 @@
 mkdir -p /root/.ssh
 chmod 700 /root/.ssh
 
-# Injeta a chave pública se fornecida via variável de ambiente (útil para Coolify/bootstrap)
-if [ -n "$SSH_PUBLIC_KEY" ]; then
-    echo "Injetando SSH_PUBLIC_KEY das variáveis de ambiente..."
-    if ! grep -qxf "$SSH_PUBLIC_KEY" /root/.ssh/authorized_keys 2>/dev/null; then
-        echo "$SSH_PUBLIC_KEY" >> /root/.ssh/authorized_keys
-    fi
-fi
-
 # Garante permissões corretas no diretório home do root (evita erros do sshd com volumes montados)
 chown -R root:root /root
 chmod 700 /root

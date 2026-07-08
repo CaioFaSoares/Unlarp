@@ -25,26 +25,33 @@ func (m AppModel) renderOnboarding(width, height int) string {
 	switch m.onboardingStep {
 	case 0:
 		stepText = "Boas-vindas"
-		content = "Bem-vindo ao Unlarp!\n\nNão detectamos nenhum host configurado.\nEste assistente irá guiar você para conectar e sincronizar\nseu workspace de desenvolvimento remoto.\n\nPressione [Enter] para começar."
+		if len(m.hostNames) > 0 {
+			content = "Adicionar Novo Host ao Unlarp!\n\nEste assistente irá guiar você para configurar e registrar\num novo workspace de desenvolvimento remoto.\n\nPressione [Enter] para começar ou [Esc] para voltar."
+		} else {
+			content = "Bem-vindo ao Unlarp!\n\nNão detectamos nenhum host configurado.\nEste assistente irá guiar você para conectar e sincronizar\nseu workspace de desenvolvimento remoto.\n\nPressione [Enter] para começar."
+		}
 	case 1:
-		stepText = "Etapa 1 de 5: Endereço do Host"
-		content = "Digite o endereço IP ou domínio do servidor remoto:\n\n" + m.textInput.View()
+		stepText = "Etapa 1 de 6: Nome do Perfil"
+		content = "Digite um nome/alias para este host (ex: coolify-prod):\n\n" + m.textInput.View()
 	case 2:
-		stepText = "Etapa 2 de 5: Porta SSH"
-		content = "Digite a porta SSH (default 2222 para DinD):\n\n" + m.textInput.View()
+		stepText = "Etapa 2 de 6: Endereço do Host"
+		content = "Digite o endereço IP ou domínio do servidor remoto:\n\n" + m.textInput.View()
 	case 3:
-		stepText = "Etapa 3 de 5: Usuário SSH"
-		content = "Digite o usuário SSH (default root):\n\n" + m.textInput.View()
+		stepText = "Etapa 3 de 6: Porta SSH"
+		content = "Digite a porta SSH (default 2222 para DinD):\n\n" + m.textInput.View()
 	case 4:
-		stepText = "Etapa 4 de 5: Diretório Workspace"
-		content = "Digite o caminho do diretório workspace no servidor\n(default /workspace):\n\n" + m.textInput.View()
+		stepText = "Etapa 4 de 6: Usuário SSH"
+		content = "Digite o usuário SSH (default root):\n\n" + m.textInput.View()
 	case 5:
-		stepText = "Etapa 5 de 5: Chave SSH"
-		content = "Gostaria de injetar sua chave SSH pública local para login sem senha?\nDigite s (sim) ou n (não):\n\n" + m.textInput.View()
+		stepText = "Etapa 5 de 6: Diretório Workspace"
+		content = "Digite o caminho do diretório workspace no servidor\n(default /workspace):\n\n" + m.textInput.View()
 	case 6:
+		stepText = "Etapa 6 de 6: Chave SSH"
+		content = "Gostaria de injetar sua chave SSH pública local para login sem senha?\nDigite s (sim) ou n (não):\n\n" + m.textInput.View()
+	case 7:
 		stepText = "Processando..."
 		content = fmt.Sprintf("Conectando ao host e configurando o workspace...\n\n%s Por favor, aguarde.", m.spinner.View())
-	case 7:
+	case 8:
 		stepText = "Onboarding Completo"
 		content = "Configuração concluída com sucesso!\n\nSeu host foi salvo em ~/.unlarp.yaml.\n\nPressione [Enter] para acessar a dashboard principal."
 	}
