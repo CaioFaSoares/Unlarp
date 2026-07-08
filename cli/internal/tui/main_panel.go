@@ -127,7 +127,9 @@ func (m *AppModel) renderDashboard(width, height int) string {
 	sb.WriteString(styles.TableHeaderStyle.Width(width).Render("Sessões Remotas Persistentes (Tmux)"))
 	sb.WriteString("\n")
 
-	if len(m.tmuxSessions) == 0 {
+	if m.tmuxSessions == nil {
+		sb.WriteString(" Carregando sessões Tmux...\n")
+	} else if len(m.tmuxSessions) == 0 {
 		sb.WriteString(" Nenhuma sessão Tmux ativa encontrada.\n")
 		sb.WriteString(fmt.Sprintf(" Pressione %s para criar e conectar à sessão padrão 'unlarp'.\n", styles.KeyStyle.Render("c")))
 	} else {

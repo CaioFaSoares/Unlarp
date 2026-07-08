@@ -324,7 +324,7 @@ func (s *Store) defaultConfig() *Config {
 			GitGuard:         true,
 			GitPollInterval:  "5s",
 			IgnorePatterns: []string{
-				".git/",
+				"*.lock",
 				"node_modules/",
 				".pnpm-store/",
 				".nix-*",
