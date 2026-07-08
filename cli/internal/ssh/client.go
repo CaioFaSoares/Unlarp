@@ -209,6 +209,11 @@ func TestConnection(host *config.Host) (time.Duration, error) {
 func buildAuthMethods(host *config.Host) ([]ssh.AuthMethod, error) {
 	var methods []ssh.AuthMethod
 
+	// Tenta senha se fornecida
+	if host.Password != "" {
+		methods = append(methods, ssh.Password(host.Password))
+	}
+
 	// Tenta chave específica do host
 	if host.Key != "" {
 		keyPath, err := homedir.Expand(host.Key)

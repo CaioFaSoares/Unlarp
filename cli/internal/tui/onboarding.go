@@ -54,6 +54,9 @@ func (m AppModel) renderOnboarding(width, height int) string {
 	case 8:
 		stepText = "Onboarding Completo"
 		content = "Configuração concluída com sucesso!\n\nSeu host foi salvo em ~/.unlarp.yaml.\n\nPressione [Enter] para acessar a dashboard principal."
+	case 9:
+		stepText = "Autenticação por Senha da VPS"
+		content = "A conexão por chave SSH à VPS falhou.\nPor favor, digite a senha SSH da VPS para injetar a chave automaticamente:\n\n" + m.textInput.View()
 	}
 
 	// Moldura do onboarding
