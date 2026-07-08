@@ -135,7 +135,12 @@ func (m AppModel) renderDashboard(width, height int) string {
 				statusStr = "ATTACHED"
 			}
 
-			line := fmt.Sprintf("  ● %-12s (%d janelas) [%s]", s.Name, s.Windows, statusStr)
+			displayName := s.Command
+			if displayName == "" {
+				displayName = s.Name
+			}
+
+			line := fmt.Sprintf("  ● %-14s %-30s (%d janelas) [%s]", displayName, s.Path, s.Windows, statusStr)
 
 			if i == m.selectedTmuxRow && !m.sidebarFocus {
 				sb.WriteString(styles.HostSelectedStyle.Render(line))
