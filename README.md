@@ -1,113 +1,145 @@
 # Virtual Dev Workspace (Debian 13 + Nix + DinD)
 
-Este repositório contém as definições para subir e rodar um workspace virtual de desenvolvimento focado em isolamento completo, reprodutibilidade com Nix Flakes, ferramentas modernas de IA (Claude Code) e suporte nativo a Docker-in-Docker (DinD).
+Este repositório contém as definições para subir e rodar um workspace virtual de desenvolvimento focado em isolamento completo, reprodutibilidade com Nix Flakes, ferramentas modernas de IA e suporte nativo a Docker-in-Docker (DinD).
+
+A interação com o workspace local ou remoto é gerida através do CLI **Unlarp** em Go, que substitui scripts legados de conexão, adiciona suporte a sincronização bidirecional em tempo real (sem necessidade de SSHFS ou FUSE no Mac) e oferece uma TUI interativa.
 
 ---
 
-## 🚀 Arquitetura e Recursos
+## 🛠️ O CLI Unlarp (Go + Cobra + Viper)
 
-- **Debian 13 (Trixie-slim)**: Ambiente Linux moderno e leve.
-- **Nix (Single-User Mode)**: Gerenciador de pacotes ativado nativamente com suporte a **Flakes** e **Nix Commands**.
-- **Docker-in-Docker (DinD)**: Possibilidade de rodar containers (como bancos de dados locais de teste) dentro do seu workspace isolado.
-- **Claude Code**: Pré-instalado globalmente no container como seu assistente de terminal.
-- **SSH Pronto**: Acesso remoto rápido (porta `2222` do host) via par de chaves SSH (senha desativada por segurança).
-- **Persistência Brutal**: Volumes nomeados montados para garantir que seu código, dependências Nix, chaves SSH e cache do Docker não sejam perdidos ao recriar o container.
+O CLI Unlarp (`unlarp`) é a sua central de controle. Ele lê a configuração do arquivo `~/.unlarp.yaml` e persiste o estado da sessão ativa em `~/.unlarp/state.json`.
 
----
+### Como Compilar e Instalar
 
-## 🛠️ Pré-requisitos
+No diretório raiz deste projeto:
 
-1. **Docker e Docker Compose** instalados na sua máquina local.
-2. Uma chave SSH pública configurada na sua máquina local em `~/.ssh/` (ex: `id_rsa.pub` ou `id_ed25519.pub`). Se não tiver, gere uma com:
-   ```bash
-   ssh-keygen -t ed25519
-   ```
-
----
-
-## 💻 Como Usar Localmente (Passo a Passo)
-
-### 1. Iniciar o Workspace
-No diretório do projeto, execute o Docker Compose em segundo plano:
 ```bash
-docker compose up -d
-```
+# Entrar na pasta do CLI
+cd cli
 
-### 2. Configurar a Chave SSH
-Para conseguir se conectar sem senha, rode o script utilitário de configuração de chave local:
-```bash
-./shs/setup-local-ssh.sh
-```
-*Esse script detectará sua chave pública local, copiará para o container e ajustará as permissões corretas.*
+# Compilar o binário
+go build -o unlarp .
 
-### 3. Conectar ao Workspace via SSH
-Use o script de conexão rápida:
-```bash
-./shs/connect-local.sh
-```
-Ou conecte-se manualmente usando o comando:
-```bash
-ssh root@localhost -p 2222
+# Instalar globalmente no sistema
+mv unlarp /usr/local/bin/
 ```
 
 ---
 
-## 🔌 Conectando sua IDE (VSCode, Antigravity)
+## 💻 Comandos e Fluxo de Trabalho (Tutorial)
 
-Para programar nos projetos dentro da pasta `/workspace` do container utilizando a sua IDE instalada localmente na sua máquina física:
+### 1. Configurar Conexões (`unlarp config`)
 
-### Opção A: VSCode (Remote - SSH)
-1. Instale a extensão oficial **Remote - SSH** no VSCode.
-2. Adicione o host no seu arquivo `~/.ssh/config` local:
-   ```text
-   Host unlarp
-       HostName localhost
-       User root
-       Port 2222
-       IdentityFile ~/.ssh/id_rsa # ou caminho para sua chave privada correspondente
-   ```
-3. Abra a paleta de comandos do VSCode (`Ctrl+Shift+P` ou `Cmd+Shift+P`), digite `Remote-SSH: Connect to Host...` e selecione `unlarp`.
-4. Uma vez conectado, abra a pasta `/workspace`.
+Você pode adicionar conexões manualmente ou importando uma entrada existente do seu `~/.ssh/config` (modo read-only, não modifica o seu arquivo original):
 
-### Opção B: Montagem via SSHFS (Antigravity e outras IDEs locais)
-Se você usa o Antigravity ou qualquer outra IDE que lê arquivos locais da sua máquina física, você pode montar a pasta `/workspace` do container diretamente em uma pasta local do seu computador via SSHFS:
-1. Crie uma pasta vazia na sua máquina local:
-   ```bash
-   mkdir -p ~/Projects/unlarp-workspace
-   ```
-2. Monte a pasta do container usando o SSHFS:
-   ```bash
-   sshfs -p 2222 root@localhost:/workspace ~/Projects/unlarp-workspace -o cache=no,allow_other
-   ```
-3. Abra a pasta `~/Projects/unlarp-workspace` no Antigravity ou em sua IDE local de preferência. Todas as alterações serão sincronizadas em tempo real.
-4. Para desmontar quando terminar:
-   ```bash
-   umount ~/Projects/unlarp-workspace
-   ```
+```bash
+# Importar automaticamente do ~/.ssh/config
+unlarp config add meu-servidor --from-ssh-config meu-alias --workspace /workspace
+
+# Adicionar manualmente
+unlarp config add local --host localhost --port 2222 --user root --workspace /workspace --container workspace_machine
+
+# Listar todos os perfis configurados
+unlarp config list
+
+# Editar um host (abre no $EDITOR) ou via flag inline
+unlarp config edit local --port 2223
+```
+
+### 2. Injetar Chave SSH (`unlarp setup`)
+
+Para configurar conexões sem senha de forma segura:
+
+```bash
+# Auto-detecta chaves locais em ~/.ssh e injeta no authorized_keys do host
+unlarp setup meu-servidor
+```
+
+### 3. Alternar entre Sessões (`unlarp use`)
+
+Você pode trocar o host padrão para os comandos subsequentes:
+
+```bash
+unlarp use meu-servidor
+```
+
+### 4. SSH e Execução Remota (`unlarp connect` / `unlarp exec`)
+
+Substitui os scripts de conexão antigos:
+
+```bash
+# Conectar à sessão ativa em um terminal interativo completo (com PTY)
+unlarp connect
+
+# Executar um comando remoto e retornar a saída
+unlarp exec -- ls -la /workspace
+unlarp exec -- nix develop --command "go version"
+```
+
+### 5. Sincronização Bidirecional em Tempo Real (`unlarp sync`)
+
+A sincronização de arquivos do Unlarp é baseada em um algoritmo **Three-way Reconciliation** (Reconciliação de 3 vias) usando um histórico de estado local. 
+**Não requer SSHFS nem extensões de kernel (FUSE) no macOS.**
+
+Você edita os arquivos localmente no seu Mac na sua IDE de preferência e eles são propagados para o container via SFTP em milissegundos. Alterações remotas (geradas por builds ou instalações) são baixadas de volta.
+
+```bash
+# Inicia a sincronização do projeto atual com o workspace
+unlarp sync start --local-dir . --remote-dir /workspace/meu-projeto
+
+# Verifica o status das sessões de sincronização
+unlarp sync status
+
+# Parar uma sessão de sincronização
+unlarp sync stop s-abc123
+```
+
+Você pode criar um arquivo `.unlarpignore` na raiz do seu projeto local seguindo a sintaxe do `.gitignore` para pular arquivos e pastas (ex: `node_modules/`, `.git/`, `dist/`).
+
+### 6. Túneis SSH / Port Forwarding (`unlarp tunnel`)
+
+Para acessar portas internas rodando no Docker-in-Docker (DinD) remoto de volta no seu Mac (ex: um banco Postgres na 5432):
+
+```bash
+# Encaminha a porta remota 5432 para localhost:5432 no Mac (foreground por padrão)
+unlarp tunnel 5432
+
+# Encaminha portas diferentes (remota 3000 -> local 8080)
+unlarp tunnel 3000:8080
+
+# Múltiplas portas de uma vez
+unlarp tunnel 5432,3000:8080,6379
+
+# Rodar o túnel em background
+unlarp tunnel 5432 -b
+
+# Listar e parar túneis ativos
+unlarp tunnel list
+unlarp tunnel stop t-xyz123
+```
 
 ---
 
-## 🔀 Acesso a Portas do DinD (Túnel SSH)
+## 📺 Dashboard Interativa (TUI)
 
-Ao rodar bancos de dados ou servidores web dentro do Docker interno (DinD) do workspace, eles escutam em portas internas do container. Para acessar esses serviços de volta na sua máquina física (como acessar o Postgres na porta 5432 usando o DBeaver local), use o script `shs/tunnel.sh`.
+A dashboard interativa centraliza todas as funcionalidades em uma única interface visual de terminal desenvolvida com a Charm Stack (`bubbletea`, `lipgloss` e `bubbles`).
 
-### Como usar o túnel:
 ```bash
-./shs/tunnel.sh <porta_no_DinD> <porta_na_sua_maquina> [host_ip_ou_nome] [porta_ssh]
+unlarp tui
 ```
 
-- **Exemplo 1 (Postgres rodando localmente no DinD na 5432)**:
-  Para acessar o banco na porta 5432 da sua máquina local:
-  ```bash
-  ./shs/tunnel.sh 5432 5432
-  ```
-- **Exemplo 2 (Servidor Web na porta 3000 do DinD remoto rodando na porta 8080 local)**:
-  Para criar um túnel com um servidor remoto do Coolify:
-  ```bash
-  ./shs/tunnel.sh 3000 8080 IP_DO_SEU_SERVIDOR
-  ```
-
-Pressione `Ctrl+C` no terminal para encerrar o túnel quando terminar.
+### Controles da TUI:
+- **`Tab`**: Alterna o foco entre a barra lateral de sessões (hosts) e o painel de abas principal.
+- **`Setas Cima/Baixo` (ou `j/k`)**:
+  - Na barra lateral: Seleciona um host diferente.
+  - No painel principal: Navega/seleciona itens nas tabelas de **Syncs** e **Túneis**.
+- **`Enter`**: Define o host selecionado como a sessão ativa no CLI.
+- **`Setas Esquerda/Direita`**: Navega entre as abas do painel principal (Dashboard ↔ Syncs ↔ Túneis ↔ Logs).
+- **`s`**: Inicia uma nova sessão de sincronização bidirecional em tempo real a partir de um prompt na aba de Syncs. (Ex: `local_dir:remote_dir` ou apenas `remote_dir`).
+- **`t`**: Cria um novo túnel SSH port forwarding a partir de um prompt na aba de Túneis. (Ex: `5432` ou `3000:8080`).
+- **`x`**: Encerra e remove o item selecionado (sync ou túnel) na aba ativa do painel principal.
+- **`q` ou `Ctrl+C`**: Sai da TUI de forma limpa, finalizando todas as conexões ativas.
 
 ---
 
@@ -115,8 +147,8 @@ Pressione `Ctrl+C` no terminal para encerrar o túnel quando terminar.
 
 ### 1. Criar Aplicação no Coolify
 1. No painel do Coolify, adicione um novo recurso do tipo **Docker Compose**.
-2. Aponte para este repositório Git ou cole o conteúdo do arquivo `docker-compose.yml`.
-3. Certifique-se de que os volumes estão mapeados como **Named Volumes** (como definido no nosso compose padrão):
+2. Cole o conteúdo do arquivo `docker-compose.yml` deste repositório.
+3. Configure os Named Volumes:
    - `workspace-data` -> `/workspace`
    - `workspace-nix-store` -> `/nix`
    - `workspace-ssh` -> `/root/.ssh`
@@ -124,115 +156,8 @@ Pressione `Ctrl+C` no terminal para encerrar o túnel quando terminar.
 4. Deploy a aplicação.
 
 ### 2. Configurar Chave SSH Remota
-Após o Coolify iniciar o container, você precisará liberar a chave pública do seu dispositivo (PC ou Celular) no servidor para autenticar a conexão.
-
-#### A) Se estiver conectando a partir do seu PC local:
-1. Na sua máquina física local, rode o gerador de comandos:
-   ```bash
-   ./shs/setup-remote-ssh.sh
-   ```
-2. Copie o comando gerado (que contém a sua chave pública).
-3. Conecte-se ao terminal do seu servidor principal (onde o Coolify está instalado) e execute o comando copiado.
-
-#### B) Se estiver conectando a partir do Celular (ex: Termius, Termux):
-1. Gere ou copie a chave pública SSH do seu celular.
-2. Acesse o terminal do seu servidor principal (onde o Coolify está instalado).
-3. Execute o comando abaixo substituindo `SUA_CHAVE_PUBLICA_DO_CELULAR` pelo texto da chave copiada:
-   ```bash
-   docker exec -i workspace_machine sh -c "mkdir -p /root/.ssh && chmod 700 /root/.ssh && echo 'SUA_CHAVE_PUBLICA_DO_CELULAR' >> /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys && chown -R root:root /root/.ssh"
-   ```
-
----
-
-## 📱 Conexão e Fluxo de Trabalho por Terminal SSH (Sem IDE)
-
-Se você estiver em trânsito ou quiser programar diretamente do celular ou de qualquer terminal de comando puro sem usar o VSCode/Antigravity:
-
-### 1. Conectando via Terminal
-No terminal do seu dispositivo, rode o comando especificando a porta `2222` e o IP do servidor:
+Após iniciar o container no Coolify, execute o assistente de setup na sua máquina:
 ```bash
-ssh root@IP_DO_SEU_SERVIDOR -p 2222
+unlarp setup coolify-prod
 ```
-*(Se estiver usando chaves SSH personalizadas ou no celular, lembre-se de selecionar a chave privada correspondente no aplicativo cliente SSH, como o Termius)*.
-
-### 2. Fluxo de Desenvolvimento Direto no Terminal:
-Uma vez logado dentro do container do workspace:
-
-1. **Navegue até o seu projeto**:
-   ```bash
-   cd /workspace/nome-do-seu-projeto
-   ```
-2. **Ative o ambiente do Flake**:
-   Caso o projeto possua um `flake.nix`, carregue todas as ferramentas dele executando:
-   ```bash
-   nix develop
-   ```
-   *Você será colocado dentro do shell isolado com todas as linguagens (Python, Go, Node, Rust, etc.) prontas.*
-3. **Programando com o Claude Code**:
-   Inicie o Claude Code diretamente no terminal para implementar features, consertar bugs ou rodar testes:
-   ```bash
-   claude
-   ```
-4. **Editar Arquivos Manualmente**:
-   Se precisar mexer em algum arquivo diretamente, use editores rápidos de terminal instalados no sistema (ex: `nano` ou `vim`).
-5. **Subir Serviços de Banco de Dados**:
-   Utilize o Docker interno (DinD) para gerenciar containers secundários do seu projeto:
-   ```bash
-   docker compose up -d
-   ```
-
----
-
-## 📂 Organização dos Volumes (Persistência Brutal)
-
-Para evitar perda de dados durante atualizações do Coolify ou restarts de container:
-- `/workspace`: Onde ficam os seus códigos de projetos e repositórios.
-- `/nix`: Pasta onde ficam o Nix store e os pacotes instalados via Flakes.
-- `/root/.ssh`: Onde ficam as chaves públicas autorizadas a acessar o terminal.
-- `/var/lib/docker`: Local de cache e dados do Docker interno (DinD).
-
----
-
-## ⚙️ Fluxo de Trabalho Diário
-
-Uma vez conectado via SSH no workspace:
-
-1. **Criar ou abrir um projeto na pasta `/workspace`**:
-   ```bash
-   cd /workspace
-   mkdir meu-projeto && cd meu-projeto
-   ```
-
-2. **Criar seu ambiente com Nix Flakes**:
-   Crie um arquivo `flake.nix` definindo as ferramentas necessárias (Python, Go, Node, Rust, etc.). Exemplo simples para Node.js:
-   ```nix
-   {
-     description = "Node.js environment";
-     inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-     outputs = { self, nixpkgs }: {
-       devShells.x86_64-linux.default = let
-         pkgs = nixpkgs.legacyPackages.x86_64-linux;
-       in pkgs.mkShell {
-         buildInputs = [ pkgs.nodejs_20 ];
-       };
-     };
-   }
-   ```
-
-3. **Ativar o Ambiente**:
-   ```bash
-   nix develop
-   ```
-   *Pronto! Você estará dentro de um shell isolado com o Node.js disponível sem ter instalado nada no Debian.*
-
-4. **Rodar dependências em Docker (DinD)**:
-   Se seu projeto precisa de um banco PostgreSQL ou Redis, crie um `docker-compose.yml` para ele e suba o serviço diretamente de dentro do seu workspace:
-   ```bash
-   docker compose up -d postgres
-   ```
-
-5. **Utilizar o Claude Code**:
-   Execute o Claude Code diretamente no seu workspace para auxiliar na escrita de código ou na infraestrutura:
-   ```bash
-   claude
-   ```
+E você estará pronto para conectar via TUI ou CLI normal.
