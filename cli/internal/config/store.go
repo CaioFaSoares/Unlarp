@@ -257,6 +257,7 @@ func (s *Store) defaultConfig() *Config {
 			IgnorePatterns: []string{
 				".git/",
 				"node_modules/",
+				".pnpm-store/",
 				".nix-*",
 				"*.swp",
 				".DS_Store",
