@@ -32,6 +32,17 @@ func (m AppModel) renderMainPanel(width, height int) string {
 	contentHeight := height - lipgloss.Height(tabRow) - 1
 	var content string
 
+	if m.pickerActive {
+		pickerBox := lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(styles.ColorSecondary).
+			Padding(1, 2).
+			Width(width - 6).
+			Render(m.dirPicker.View())
+
+		return lipgloss.JoinVertical(lipgloss.Left, tabRow, pickerBox)
+	}
+
 	if m.promptActive {
 		var promptTitle string
 		switch m.promptType {

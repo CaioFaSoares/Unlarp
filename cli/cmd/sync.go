@@ -26,6 +26,7 @@ var (
 	syncMode       string
 	syncInit       string
 	syncStopAll    bool
+	syncInteractive bool
 )
 
 var syncCmd = &cobra.Command{
@@ -41,7 +42,8 @@ var syncStartCmd = &cobra.Command{
 
 Exemplos:
   unlarp sync start --local-dir . --remote-dir /workspace/meu-projeto
-  unlarp sync start coolify-prod --local-dir ~/Projects/api --remote-dir /workspace/api`,
+  unlarp sync start coolify-prod --local-dir ~/Projects/api --remote-dir /workspace/api
+  unlarp sync start -i`,
 	Args: cobra.MaximumNArgs(1),
 	RunE: runSyncStart,
 }
@@ -69,11 +71,10 @@ func init() {
 
 	// Flags para start
 	syncStartCmd.Flags().StringVar(&syncLocalDir, "local-dir", "", "diretório local no Mac (default: diretório atual)")
-	syncStartCmd.Flags().StringVar(&syncRemoteDir, "remote-dir", "", "diretório remoto no workspace (obrigatório)")
+	syncStartCmd.Flags().StringVar(&syncRemoteDir, "remote-dir", "", "diretório remoto no workspace")
 	syncStartCmd.Flags().StringVar(&syncMode, "mode", "bidirectional", "modo: bidirectional | push | pull")
 	syncStartCmd.Flags().StringVar(&syncInit, "initial-sync", "full", "sync inicial: full | none")
-
-	syncStartCmd.MarkFlagRequired("remote-dir")
+	syncStartCmd.Flags().BoolVarP(&syncInteractive, "interactive", "i", false, "iniciar seletor interativo de pastas")
 
 	// Flags para stop
 	syncStopCmd.Flags().BoolVar(&syncStopAll, "all", false, "parar todas as sessões de sync")
@@ -95,14 +96,28 @@ func runSyncStart(cmd *cobra.Command, args []string) error {
 		displayName = getActiveHost()
 	}
 
-	// Resolve localDir absoluto
-	localPath := syncLocalDir
-	if localPath == "" {
-		localPath = "."
-	}
-	absLocal, err := filepath.Abs(localPath)
-	if err != nil {
-		return fmt.Errorf("caminho local inválido: %w", err)
+	// Verifica se deve rodar no modo interativo (caso as pastas não sejam fornecidas ou forçado por flag)
+	isInteractive := syncInteractive || (syncLocalDir == "" && syncRemoteDir == "")
+
+	var absLocal string
+	if isInteractive {
+		localStart := syncLocalDir
+		if localStart == "" {
+			localStart = "."
+		}
+		absLocal, err = ui.ChooseLocalDir(localStart)
+		if err != nil {
+			return err
+		}
+	} else {
+		localPath := syncLocalDir
+		if localPath == "" {
+			localPath = "."
+		}
+		absLocal, err = filepath.Abs(localPath)
+		if err != nil {
+			return fmt.Errorf("caminho local inválido: %w", err)
+		}
 	}
 
 	// Cria e configura o cliente SSH e SFTP
@@ -128,6 +143,27 @@ func runSyncStart(cmd *cobra.Command, args []string) error {
 	}
 	spin.StopWithSuccess("Conectado a " + displayName)
 
+	// Resolve remoteDir
+	remoteDir := syncRemoteDir
+	if isInteractive {
+		remoteStart := syncRemoteDir
+		if remoteStart == "" {
+			remoteStart = hostCfg.Workspace
+		}
+		remoteDir, err = ui.ChooseRemoteDir(sftpClient.Inner(), remoteStart)
+		if err != nil {
+			sftpClient.Close()
+			sshClient.Close()
+			return err
+		}
+	}
+
+	if remoteDir == "" {
+		sftpClient.Close()
+		sshClient.Close()
+		return fmt.Errorf("diretório remoto é obrigatório")
+	}
+
 	// Carrega as configurações globais de sync
 	store := config.NewStore()
 	cfg, _ := store.Load()
@@ -140,7 +176,7 @@ func runSyncStart(cmd *cobra.Command, args []string) error {
 	engine, err := internalsync.NewEngine(
 		syncID,
 		absLocal,
-		syncRemoteDir,
+		remoteDir,
 		displayName,
 		globalIgnores,
 		internalsync.ConflictStrategy(cfg.Sync.ConflictStrategy),
@@ -159,7 +195,7 @@ func runSyncStart(cmd *cobra.Command, args []string) error {
 		_ = sessMgr.AddSync(displayName, session.SyncEntry{
 			ID:        syncID,
 			LocalDir:  absLocal,
-			RemoteDir: syncRemoteDir,
+			RemoteDir: remoteDir,
 			Mode:      syncMode,
 			LastSync:  time.Now(),
 		})
@@ -167,7 +203,7 @@ func runSyncStart(cmd *cobra.Command, args []string) error {
 
 	ui.Success("Sessão de sincronização %s criada", syncID)
 	ui.Info("Local:  %s", absLocal)
-	ui.Info("Remoto: %s", syncRemoteDir)
+	ui.Info("Remoto: %s", remoteDir)
 
 	// Executa sincronização inicial completa se configurado
 	if syncInit == "full" {
@@ -223,7 +259,7 @@ func runSyncStart(cmd *cobra.Command, args []string) error {
 
 	// Inicia o Remote Watcher (SFTP poll)
 	// Como precisamos de um ignore matcher que seja gerado localmente, passamos o matcher da engine
-	remoteWatcher := watcher.NewRemoteWatcher(syncRemoteDir, sftpClient.Inner(), pollInterval, engine.IgnoreMatcher(), func() {
+	remoteWatcher := watcher.NewRemoteWatcher(remoteDir, sftpClient.Inner(), pollInterval, engine.IgnoreMatcher(), func() {
 		select {
 		case triggerSync <- "mudança remota":
 		default:
