@@ -107,7 +107,7 @@ func (m AppModel) renderDashboard(width, height int) string {
 	}
 
 	sb.WriteString("\n")
-	sb.WriteString(styles.TableHeaderStyle.Width(width).Render("Sessões Tmux Remotas (Claude Code / Agentes)"))
+	sb.WriteString(styles.TableHeaderStyle.Width(width).Render("Sessões Remotas Persistentes (Tmux)"))
 	sb.WriteString("\n")
 
 	if len(m.tmuxSessions) == 0 {

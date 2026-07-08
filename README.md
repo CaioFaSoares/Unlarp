@@ -66,11 +66,17 @@ unlarp use meu-servidor
 
 ### 4. SSH e Execução Remota (`unlarp connect` / `unlarp exec`)
 
-Substitui os scripts de conexão antigos:
+Substitui os scripts de conexão antigos, com suporte a sessões virtuais persistentes via Tmux:
 
 ```bash
 # Conectar à sessão ativa em um terminal interativo completo (com PTY)
 unlarp connect
+
+# Conectar abrindo uma sessão persistente do Tmux (com auto-criação/auto-anexação)
+unlarp connect --tmux
+
+# Abrir uma sessão persistente com nome customizado (ex: claude-dev)
+unlarp connect --tmux --tmux-session claude-dev
 
 # Executar um comando remoto e retornar a saída
 unlarp exec -- ls -la /workspace
@@ -129,16 +135,27 @@ A dashboard interativa centraliza todas as funcionalidades em uma única interfa
 unlarp tui
 ```
 
+### 🚀 Onboarding Wizard (Primeiro Acesso)
+Se você não tiver nenhum host configurado no arquivo `~/.unlarp.yaml`, a TUI abrirá automaticamente um **Assistente de Onboarding**. Ele guiará você passo a passo para cadastrar o IP, porta, usuário, caminho remoto do workspace e injetará sua chave pública SSH em segundo plano com feedback visual (spinner), salvando a configuração final para você.
+
+### 🔄 Persistência de Sessões Tmux (Claude Code / Agentes)
+A aba **Dashboard** da TUI mostra a lista de sessões virtuais Tmux ativas no servidor remoto, indicando se estão conectadas (`ATTACHED`) ou em background (`DETACHED`).
+* **Enquadramento Unlarp**: A barra inferior do Tmux remoto é customizada nas cores roxa e ciano com a identificação do Unlarp e um lembrete visual de detach.
+* **Desconexão Segura (`Ctrl+G`)**: Você pode se desanexar de qualquer sessão Tmux a qualquer momento pressionando **`Ctrl+G`** (sem prefixo). Isso devolve você à TUI imediatamente e mantém seus processos (como agentes de código) rodando no container remoto.
+* **Redimensionamento (`SIGWINCH`)**: O PTY local propaga alterações de tamanho de janela dinamicamente para o Tmux remoto, eliminando quebras de layout.
+
 ### Controles da TUI:
 - **`Tab`**: Alterna o foco entre a barra lateral de sessões (hosts) e o painel de abas principal.
 - **`Setas Cima/Baixo` (ou `j/k`)**:
   - Na barra lateral: Seleciona um host diferente.
-  - No painel principal: Navega/seleciona itens nas tabelas de **Syncs** e **Túneis**.
+  - No painel principal: Navega pelas tabelas de **Syncs**, **Túneis** e lista de **Sessões Tmux** (na aba Dashboard).
 - **`Enter`**: Define o host selecionado como a sessão ativa no CLI.
 - **`Setas Esquerda/Direita`**: Navega entre as abas do painel principal (Dashboard ↔ Syncs ↔ Túneis ↔ Logs).
+- **`c`**: Conecta/anexa (attach) na sessão Tmux selecionada no Dashboard.
+- **`n`**: Abre o prompt na aba Dashboard para criar uma nova sessão Tmux remota nomeada.
 - **`s`**: Inicia uma nova sessão de sincronização bidirecional em tempo real a partir de um prompt na aba de Syncs. (Ex: `local_dir:remote_dir` ou apenas `remote_dir`).
 - **`t`**: Cria um novo túnel SSH port forwarding a partir de um prompt na aba de Túneis. (Ex: `5432` ou `3000:8080`).
-- **`x`**: Encerra e remove o item selecionado (sync ou túnel) na aba ativa do painel principal.
+- **`x`**: Encerra e remove o item selecionado (sync, túnel ou sessão Tmux remota) na aba ativa do painel principal.
 - **`q` ou `Ctrl+C`**: Sai da TUI de forma limpa, finalizando todas as conexões ativas.
 
 ---
@@ -151,7 +168,7 @@ unlarp tui
 3. Configure os Named Volumes:
    - `workspace-data` -> `/workspace`
    - `workspace-nix-store` -> `/nix`
-   - `workspace-ssh` -> `/root/.ssh`
+   - `workspace-home` -> `/root` (persiste chaves SSH, preferências de terminal, login de agentes e histórico)
    - `workspace-docker` -> `/var/lib/docker`
 4. Deploy a aplicação.
 

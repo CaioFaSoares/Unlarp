@@ -118,6 +118,10 @@ func (c *Client) RunCommand(command string) (string, string, error) {
 
 // InteractiveShell abre uma sessão SSH interativa com PTY
 func (c *Client) InteractiveShell(shell string) error {
+	// Desabilita focus reporting temporariamente para que o terminal local não envie sequências ^[[I / ^[[O
+	// que confundem ferramentas de stdin como o Claude Code.
+	_, _ = os.Stdout.Write([]byte("\x1b[?1004l"))
+
 	session, err := c.Session()
 	if err != nil {
 		return err

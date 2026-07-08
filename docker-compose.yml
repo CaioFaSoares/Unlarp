@@ -10,7 +10,7 @@ services:
     volumes:
       - workspace-data:/workspace
       - workspace-nix-store:/nix
-      - workspace-ssh:/root/.ssh
+      - workspace-home:/root
       - workspace-docker:/var/lib/docker
     restart: unless-stopped
 
@@ -19,7 +19,7 @@ volumes:
     name: workspace-data
   workspace-nix-store:
     name: workspace-nix-store
-  workspace-ssh:
-    name: workspace-ssh
+  workspace-home:
+    name: workspace-home
   workspace-docker:
     name: workspace-docker
