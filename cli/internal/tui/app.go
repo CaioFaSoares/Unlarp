@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
@@ -62,6 +63,20 @@ type obSetupFinishedMsg struct {
 
 type obVpsPasswordRequiredMsg struct{}
 
+// syncStartedMsg carrega o resultado (ou erro) da criação assíncrona de um sync,
+// já que conectar/varrer o diretório remoto via SFTP pode ser lento e não pode
+// travar o loop de eventos da TUI.
+type syncStartedMsg struct {
+	err           error
+	host          string
+	syncID        string
+	localDir      string
+	remoteDir     string
+	engine        *internalsync.Engine
+	localWatcher  *watcher.LocalWatcher
+	remoteWatcher *watcher.RemoteWatcher
+}
+
 // AppModel é o modelo central do Bubble Tea
 type AppModel struct {
 	width  int
@@ -87,7 +102,12 @@ type AppModel struct {
 	promptType   string // "sync" | "tunnel"
 	textInput    textinput.Model
 
-	// Clientes e Managers ativos por HostName
+	// Clientes e Managers ativos por HostName. sshMu protege sshClients e
+	// sftpClients, que são lidos/escritos tanto no goroutine principal do
+	// Update() quanto em tea.Cmd assíncronos (checkTmuxCmd, createSyncLiveCmd
+	// etc.) — sem essa trava, dois goroutines escrevendo ao mesmo tempo
+	// derrubam o processo inteiro com "fatal error: concurrent map writes".
+	sshMu          *sync.Mutex
 	sshClients     map[string]*internalssh.Client
 	sftpClients    map[string]*sftp.Client
 	tunnelManagers map[string]*tunnel.Manager
@@ -169,6 +189,7 @@ func NewAppModel() (*AppModel, error) {
 		sidebarFocus:   true,
 		promptActive:   false,
 		textInput:      ti,
+		sshMu:          &sync.Mutex{},
 		sshClients:     make(map[string]*internalssh.Client),
 		sftpClients:    make(map[string]*sftp.Client),
 		tunnelManagers: make(map[string]*tunnel.Manager),
@@ -212,9 +233,12 @@ func (m *AppModel) Cleanup() {
 	for _, mgr := range m.tunnelManagers {
 		mgr.Close()
 	}
+
+	m.sshMu.Lock()
 	for _, client := range m.sshClients {
 		client.Close()
 	}
+	m.sshMu.Unlock()
 }
 
 // Update gerencia mensagens e entrada do usuário
@@ -232,6 +256,7 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.pickerStage == "local" {
 				m.chosenLocal = m.dirPicker.SelectedPath
 				m.pickerStage = "remote"
+				m.addLog(fmt.Sprintf("Diretório local selecionado: %s. Conectando a %s para escolher o remoto...", m.chosenLocal, m.activeHost))
 
 				// Obter cliente SFTP para o host ativo
 				hostCfg, ok := m.cfg.Hosts[m.activeHost]
@@ -243,17 +268,19 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 				client, err := m.getOrCreateSSHClient(m.activeHost, &hostCfg)
 				if err != nil {
-					m.addLog(fmt.Sprintf("Erro SSH: %v", err))
+					m.addLog(fmt.Sprintf("Erro SSH ao conectar em %s: %v", m.activeHost, err))
 					m.pickerActive = false
 					return m, nil
 				}
 
 				sftpCli, err := m.getOrCreateSFTPClient(m.activeHost, client)
 				if err != nil {
-					m.addLog(fmt.Sprintf("Erro SFTP: %v", err))
+					m.addLog(fmt.Sprintf("Erro SFTP ao conectar em %s: %v", m.activeHost, err))
 					m.pickerActive = false
 					return m, nil
 				}
+
+				m.addLog(fmt.Sprintf("Conectado a %s. Navegue e confirme (Tab/s) o diretório remoto.", m.activeHost))
 
 				// Inicia picker remoto no diretório workspace configurado do host
 				m.dirPicker = ui.NewDirPicker(true, sftpCli, hostCfg.Workspace)
@@ -261,12 +288,14 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// Confirmado remoto!
 				m.chosenRemote = m.dirPicker.SelectedPath
 				m.pickerActive = false
+				m.addLog(fmt.Sprintf("Diretório remoto selecionado: %s. Conectando e iniciando sincronização (pode levar alguns segundos)...", m.chosenRemote))
 
-				// Inicia o sync em tempo real em background
-				m.createSyncLive(fmt.Sprintf("%s:%s", m.chosenLocal, m.chosenRemote))
+				// Inicia o sync em tempo real em background, sem travar a TUI
+				cmds = append(cmds, m.createSyncLiveCmd(fmt.Sprintf("%s:%s", m.chosenLocal, m.chosenRemote)))
 			}
 		} else if m.dirPicker.Cancelled {
 			m.pickerActive = false
+			m.addLog("Seleção de diretório cancelada.")
 		}
 
 		return m, tea.Batch(cmds...)
@@ -297,6 +326,9 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.addLog("Retornou do terminal SSH.")
 		}
 		cmds = append(cmds, m.checkTmuxCmd())
+
+	case syncStartedMsg:
+		m.handleSyncStarted(msg)
 
 	case obSetupFinishedMsg:
 		if msg.err != nil {
@@ -497,6 +529,7 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "s":
 			// Atalho para iniciar sync (somente se não estiver na barra lateral)
 			if !m.sidebarFocus {
+				m.addLog(fmt.Sprintf("Abrindo seletor de diretório local para host %s...", m.activeHost))
 				m.pickerActive = true
 				m.pickerStage = "local"
 				m.dirPicker = ui.NewDirPicker(false, nil, ".")
@@ -776,7 +809,7 @@ func (m *AppModel) handlePromptSubmit() tea.Cmd {
 	case "tunnel":
 		m.createTunnelLive(val)
 	case "sync":
-		m.createSyncLive(val)
+		return m.createSyncLiveCmd(val)
 	case "new_tmux_session":
 		return m.createTmuxSessionCmd(val)
 	}
@@ -847,69 +880,149 @@ func (m *AppModel) createTunnelLive(val string) {
 	m.addLog(fmt.Sprintf("Túnel %s criado com sucesso: local:%d -> remoto:%d", id, localPort, remotePort))
 }
 
-// createSyncLive inicializa a sincronização em tempo real em background na TUI
-func (m *AppModel) createSyncLive(val string) {
-	hostCfg, ok := m.cfg.Hosts[m.activeHost]
-	if !ok {
-		m.addLog("Erro: Host ativo não configurado.")
+// createSyncLiveCmd prepara a conexão, a engine e os watchers de uma nova
+// sincronização em background (tea.Cmd), sem bloquear o loop de eventos da
+// TUI. A varredura inicial do diretório remoto via SFTP (feita dentro de
+// RemoteWatcher.Start) pode levar vários segundos em hosts reais — se isso
+// rodasse direto dentro de Update(), a TUI inteira travaria sem feedback
+// nenhum até terminar.
+func (m *AppModel) createSyncLiveCmd(val string) tea.Cmd {
+	host := m.activeHost
+
+	return func() tea.Msg {
+		hostCfg, ok := m.cfg.Hosts[host]
+		if !ok {
+			return syncStartedMsg{err: fmt.Errorf("host ativo não configurado"), host: host}
+		}
+
+		parts := strings.Split(val, ":")
+		var localDir, remoteDir string
+
+		if len(parts) == 2 {
+			localDir = strings.TrimSpace(parts[0])
+			remoteDir = strings.TrimSpace(parts[1])
+		} else {
+			localDir = "."
+			remoteDir = strings.TrimSpace(val)
+		}
+
+		if remoteDir == "" {
+			return syncStartedMsg{err: fmt.Errorf("diretório remoto é obrigatório"), host: host}
+		}
+
+		absLocal, err := filepath.Abs(localDir)
+		if err != nil {
+			return syncStartedMsg{err: fmt.Errorf("caminho local inválido: %w", err), host: host}
+		}
+
+		// Garante conexão SSH e SFTP
+		client, err := m.getOrCreateSSHClient(host, &hostCfg)
+		if err != nil {
+			return syncStartedMsg{err: fmt.Errorf("erro SSH: %w", err), host: host}
+		}
+
+		sftpCli, err := m.getOrCreateSFTPClient(host, client)
+		if err != nil {
+			return syncStartedMsg{err: fmt.Errorf("erro SFTP: %w", err), host: host}
+		}
+
+		syncID := "s-" + generateRandomString(6)
+
+		// Cria Engine
+		engine, err := internalsync.NewEngine(
+			syncID,
+			absLocal,
+			remoteDir,
+			host,
+			m.cfg.Sync.IgnorePatterns,
+			internalsync.ConflictStrategy(m.cfg.Sync.ConflictStrategy),
+			client,
+			sftpCli,
+		)
+		if err != nil {
+			return syncStartedMsg{err: fmt.Errorf("erro ao iniciar engine de sync: %w", err), host: host}
+		}
+
+		// Watcher local. onWarn vai para m.addLog (aba Logs) em vez de
+		// os.Stderr, que corromperia visualmente a TUI em alt-screen.
+		localWatcher, err := watcher.NewLocalWatcher(absLocal, 200*time.Millisecond, engine.IgnoreMatcher(), m.addLog, func() {
+			go func() {
+				_, err := engine.SyncExec()
+				if err != nil {
+					m.addLog(fmt.Sprintf("[%s] Erro ao sincronizar local: %v", syncID, err))
+				}
+			}()
+		})
+		if err != nil {
+			return syncStartedMsg{err: fmt.Errorf("erro ao criar watcher local: %w", err), host: host}
+		}
+
+		if err := localWatcher.Start(); err != nil {
+			return syncStartedMsg{err: fmt.Errorf("erro ao iniciar watcher local: %w", err), host: host}
+		}
+
+		// Watcher remoto: Start() faz uma varredura SFTP completa e síncrona
+		// do diretório remoto (é por isso que esta função inteira roda fora
+		// do Update()).
+		pollInterval := m.cfg.Sync.PollIntervalDuration()
+		remoteWatcher := watcher.NewRemoteWatcher(remoteDir, sftpCli, pollInterval, engine.IgnoreMatcher(), func() {
+			go func() {
+				_, err := engine.SyncExec()
+				if err != nil {
+					m.addLog(fmt.Sprintf("[%s] Erro ao sincronizar remoto: %v", syncID, err))
+				}
+			}()
+		})
+		remoteWatcher.Start()
+
+		return syncStartedMsg{
+			host:          host,
+			syncID:        syncID,
+			localDir:      absLocal,
+			remoteDir:     remoteDir,
+			engine:        engine,
+			localWatcher:  localWatcher,
+			remoteWatcher: remoteWatcher,
+		}
+	}
+}
+
+// handleSyncStarted processa o resultado assíncrono de createSyncLiveCmd:
+// registra a sessão viva, persiste no session manager e dispara a
+// reconciliação inicial de arquivos.
+func (m *AppModel) handleSyncStarted(msg syncStartedMsg) {
+	if msg.err != nil {
+		m.addLog(fmt.Sprintf("Erro ao criar sincronização: %v", msg.err))
 		return
 	}
 
-	parts := strings.Split(val, ":")
-	var localDir, remoteDir string
+	stopChan := make(chan struct{})
 
-	if len(parts) == 2 {
-		localDir = strings.TrimSpace(parts[0])
-		remoteDir = strings.TrimSpace(parts[1])
-	} else {
-		localDir = "."
-		remoteDir = strings.TrimSpace(val)
+	if _, exists := m.syncSessions[msg.host]; !exists {
+		m.syncSessions[msg.host] = make(map[string]*liveSyncSession)
+	}
+	m.syncSessions[msg.host][msg.syncID] = &liveSyncSession{
+		id:            msg.syncID,
+		engine:        msg.engine,
+		localWatcher:  msg.localWatcher,
+		remoteWatcher: msg.remoteWatcher,
+		stopChan:      stopChan,
 	}
 
-	if remoteDir == "" {
-		m.addLog("Erro: Diretório remoto é obrigatório.")
-		return
+	if err := m.sessMgr.AddSync(msg.host, session.SyncEntry{
+		ID:        msg.syncID,
+		LocalDir:  msg.localDir,
+		RemoteDir: msg.remoteDir,
+		Mode:      "bidirectional",
+		LastSync:  time.Now(),
+	}); err != nil {
+		m.addLog(fmt.Sprintf("Erro ao salvar registro de sync: %v", err))
 	}
 
-	// Configura caminhos
-	absLocal, err := filepath.Abs(localDir)
-	if err != nil {
-		m.addLog(fmt.Sprintf("Erro no caminho local: %v", err))
-		return
-	}
+	m.addLog(fmt.Sprintf("Sincronização %s iniciada com sucesso em %s.", msg.syncID, msg.host))
 
-	// Garante conexão SSH e SFTP
-	client, err := m.getOrCreateSSHClient(m.activeHost, &hostCfg)
-	if err != nil {
-		m.addLog(fmt.Sprintf("Erro SSH: %v", err))
-		return
-	}
-
-	sftpCli, err := m.getOrCreateSFTPClient(m.activeHost, client)
-	if err != nil {
-		m.addLog(fmt.Sprintf("Erro SFTP: %v", err))
-		return
-	}
-
-	syncID := "s-" + generateRandomString(6)
-
-	// Cria Engine
-	engine, err := internalsync.NewEngine(
-		syncID,
-		absLocal,
-		remoteDir,
-		m.activeHost,
-		m.cfg.Sync.IgnorePatterns,
-		internalsync.ConflictStrategy(m.cfg.Sync.ConflictStrategy),
-		client,
-		sftpCli,
-	)
-	if err != nil {
-		m.addLog(fmt.Sprintf("Erro ao iniciar engine de sync: %v", err))
-		return
-	}
-
-	// Executa sync inicial no background para não congelar a TUI
+	engine := msg.engine
+	syncID := msg.syncID
 	go func() {
 		m.addLog(fmt.Sprintf("[%s] Iniciando reconciliação de arquivos...", syncID))
 		count, err := engine.SyncExec()
@@ -919,63 +1032,6 @@ func (m *AppModel) createSyncLive(val string) {
 			m.addLog(fmt.Sprintf("[%s] Sync inicial finalizado. %d modificações aplicadas.", syncID, count))
 		}
 	}()
-
-	// Watcher local
-	localWatcher, err := watcher.NewLocalWatcher(absLocal, 200*time.Millisecond, func() {
-		go func() {
-			_, err := engine.SyncExec()
-			if err != nil {
-				m.addLog(fmt.Sprintf("[%s] Erro ao sincronizar local: %v", syncID, err))
-			}
-		}()
-	})
-	if err != nil {
-		m.addLog(fmt.Sprintf("Erro ao criar watcher local: %v", err))
-		return
-	}
-
-	err = localWatcher.Start()
-	if err != nil {
-		m.addLog(fmt.Sprintf("Erro ao iniciar watcher local: %v", err))
-		return
-	}
-
-	// Watcher remoto
-	pollInterval := m.cfg.Sync.PollIntervalDuration()
-	remoteWatcher := watcher.NewRemoteWatcher(remoteDir, sftpCli, pollInterval, engine.IgnoreMatcher(), func() {
-		go func() {
-			_, err := engine.SyncExec()
-			if err != nil {
-				m.addLog(fmt.Sprintf("[%s] Erro ao sincronizar remoto: %v", syncID, err))
-			}
-		}()
-	})
-	remoteWatcher.Start()
-
-	stopChan := make(chan struct{})
-
-	// Registra live session
-	if _, exists := m.syncSessions[m.activeHost]; !exists {
-		m.syncSessions[m.activeHost] = make(map[string]*liveSyncSession)
-	}
-	m.syncSessions[m.activeHost][syncID] = &liveSyncSession{
-		id:            syncID,
-		engine:        engine,
-		localWatcher:  localWatcher,
-		remoteWatcher: remoteWatcher,
-		stopChan:      stopChan,
-	}
-
-	// Adiciona ao session manager persistente
-	_ = m.sessMgr.AddSync(m.activeHost, session.SyncEntry{
-		ID:        syncID,
-		LocalDir:  absLocal,
-		RemoteDir: remoteDir,
-		Mode:      "bidirectional",
-		LastSync:  time.Now(),
-	})
-
-	m.addLog(fmt.Sprintf("Sincronização %s iniciada com sucesso.", syncID))
 }
 
 // handleDeleteSelection deleta o item que está selecionado na view ativa
@@ -1033,6 +1089,9 @@ func (m *AppModel) handleDeleteSelection() tea.Cmd {
 }
 
 func (m *AppModel) getOrCreateSSHClient(hostName string, hostCfg *config.Host) (*internalssh.Client, error) {
+	m.sshMu.Lock()
+	defer m.sshMu.Unlock()
+
 	client, exists := m.sshClients[hostName]
 	if exists && client.IsConnected() {
 		return client, nil
@@ -1053,6 +1112,9 @@ func (m *AppModel) getOrCreateSSHClient(hostName string, hostCfg *config.Host) (
 }
 
 func (m *AppModel) getOrCreateSFTPClient(hostName string, client *internalssh.Client) (*sftp.Client, error) {
+	m.sshMu.Lock()
+	defer m.sshMu.Unlock()
+
 	sftpCli, exists := m.sftpClients[hostName]
 	if exists {
 		return sftpCli, nil

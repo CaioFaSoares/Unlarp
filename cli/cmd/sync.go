@@ -236,7 +236,9 @@ func runSyncStart(cmd *cobra.Command, args []string) error {
 	}()
 
 	// Inicia o Local Watcher (fsnotify)
-	localWatcher, err := watcher.NewLocalWatcher(absLocal, 200*time.Millisecond, func() {
+	localWatcher, err := watcher.NewLocalWatcher(absLocal, 200*time.Millisecond, engine.IgnoreMatcher(), func(msg string) {
+		ui.Warn("%s", msg)
+	}, func() {
 		select {
 		case triggerSync <- "mudança local":
 		default:

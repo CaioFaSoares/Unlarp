@@ -125,16 +125,24 @@ func (m *Manager) ListSessions() map[string]*Session {
 	return result
 }
 
+// getOrCreateSession retorna a sessão existente ou cria uma nova.
+// Chamador deve segurar m.mu.Lock().
+func (m *Manager) getOrCreateSession(name string) *Session {
+	session, ok := m.state.Sessions[name]
+	if !ok {
+		now := time.Now()
+		session = &Session{Name: name, ConnectedAt: &now}
+		m.state.Sessions[name] = session
+	}
+	return session
+}
+
 // AddSync adiciona uma entrada de sync a uma sessão
 func (m *Manager) AddSync(sessionName string, entry SyncEntry) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	session, ok := m.state.Sessions[sessionName]
-	if !ok {
-		return fmt.Errorf("sessão '%s' não encontrada", sessionName)
-	}
-
+	session := m.getOrCreateSession(sessionName)
 	session.Syncs = append(session.Syncs, entry)
 	return m.saveState()
 }
@@ -165,11 +173,7 @@ func (m *Manager) AddTunnel(sessionName string, entry TunnelEntry) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	session, ok := m.state.Sessions[sessionName]
-	if !ok {
-		return fmt.Errorf("sessão '%s' não encontrada", sessionName)
-	}
-
+	session := m.getOrCreateSession(sessionName)
 	session.Tunnels = append(session.Tunnels, entry)
 	return m.saveState()
 }
