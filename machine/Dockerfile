@@ -36,14 +36,15 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # 4. Instalar o Gerenciador de Pacotes Nix (Single User Mode)
-RUN curl -L https://nixos.org/nix/install | bash -s -- --no-daemon
+# Criamos o nix.conf previamente para desabilitar o build-users-group (necessário para rodar sob o root no container)
+# e habilitar os experimental-features (nix-command flakes)
+RUN mkdir -p /etc/nix && \
+    echo "build-users-group =" >> /etc/nix/nix.conf && \
+    echo "experimental-features = nix-command flakes" >> /etc/nix/nix.conf && \
+    curl -L https://nixos.org/nix/install | bash -s -- --no-daemon
 
 # Adicionar Nix ao PATH global do Dockerfile
 ENV PATH="/root/.nix-profile/bin:/nix/var/nix/profiles/default/bin:$PATH"
-
-# 5. Habilitar Flakes e Nix Command nativamente
-RUN mkdir -p /etc/nix && \
-    echo "experimental-features = nix-command flakes" >> /etc/nix/nix.conf
 
 # Garantir que o Nix seja carregado sempre que você logar via SSH com bash
 RUN echo "if [ -e /root/.nix-profile/etc/profile.d/nix.sh ]; then . /root/.nix-profile/etc/profile.d/nix.sh; fi" >> /root/.bashrc
