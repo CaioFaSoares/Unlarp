@@ -1,17 +1,5 @@
 #!/bin/bash
 
-# Garante a criação do diretório .ssh
-mkdir -p /root/.ssh
-chmod 700 /root/.ssh
-
-# Garante permissões corretas no diretório home do root (evita erros do sshd com volumes montados)
-chown -R root:root /root
-chmod 700 /root
-chmod 700 /root/.ssh 2>/dev/null
-if [ -f /root/.ssh/authorized_keys ]; then
-    chmod 600 /root/.ssh/authorized_keys
-fi
-
 echo "Iniciando Docker Daemon interno (DinD)..."
 # Inicia o docker daemon em background
 dockerd > /var/log/dockerd.log 2>&1 &
