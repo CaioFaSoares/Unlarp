@@ -104,6 +104,7 @@ type AppModel struct {
 	// Onboarding Wizard
 	isOnboarding   bool
 	onboardingStep int
+	obProfileName  string
 	obHost         string
 	obPort         int
 	obUser         string
@@ -167,6 +168,7 @@ func NewAppModel() (*AppModel, error) {
 		syncSessions:   make(map[string]map[string]*liveSyncSession),
 		isOnboarding:   isOnboarding,
 		onboardingStep: 0,
+		obProfileName:  "",
 		obPort:         2222,
 		obUser:         "root",
 		obWorkspace:    "/workspace",
@@ -244,7 +246,7 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.addLog("Chave SSH pública injetada com sucesso.")
 		}
-		m.onboardingStep = 7
+		m.onboardingStep = 8
 		m.textInput.Blur()
 
 	case spinner.TickMsg:
@@ -258,6 +260,13 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			switch msg.String() {
 			case "ctrl+c":
 				return m, tea.Quit
+			case "esc":
+				// Só permite cancelar o onboarding se já houver pelo menos um host configurado
+				if len(m.hostNames) > 0 {
+					m.isOnboarding = false
+					m.textInput.Blur()
+					return m, nil
+				}
 			case "enter":
 				cmd := m.handleOnboardingSubmit()
 				if cmd != nil {
@@ -331,6 +340,22 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				store := config.NewStore()
 				_ = store.SetDefault(m.activeHost)
 				m.addLog(fmt.Sprintf("Sessão ativa alterada para: %s", m.activeHost))
+			}
+
+		case "a":
+			// Atalho para adicionar novo host via Onboarding Wizard (na barra lateral)
+			if m.sidebarFocus {
+				m.isOnboarding = true
+				m.onboardingStep = 0
+				m.obProfileName = ""
+				m.obHost = ""
+				m.obPort = 2222
+				m.obUser = "root"
+				m.obWorkspace = "/workspace"
+				m.textInput.SetValue("")
+				m.textInput.Placeholder = ""
+				m.textInput.Blur()
+				return m, nil
 			}
 
 		case "c":
@@ -957,17 +982,26 @@ func (m *AppModel) handleOnboardingSubmit() tea.Cmd {
 	case 0: // Welcome screen
 		m.onboardingStep = 1
 		m.textInput.SetValue("")
+		m.textInput.Placeholder = "dev-server"
+		m.textInput.Focus()
+	case 1: // Profile Name
+		if val == "" {
+			val = "dev-server"
+		}
+		m.obProfileName = val
+		m.onboardingStep = 2
+		m.textInput.SetValue("")
 		m.textInput.Placeholder = "192.168.1.100"
 		m.textInput.Focus()
-	case 1: // Host IP
+	case 2: // Host IP
 		if val == "" {
 			return nil
 		}
 		m.obHost = val
-		m.onboardingStep = 2
+		m.onboardingStep = 3
 		m.textInput.SetValue("2222")
 		m.textInput.Focus()
-	case 2: // Port
+	case 3: // Port
 		port := 2222
 		if val != "" {
 			if p, err := strconv.Atoi(val); err == nil {
@@ -975,43 +1009,40 @@ func (m *AppModel) handleOnboardingSubmit() tea.Cmd {
 			}
 		}
 		m.obPort = port
-		m.onboardingStep = 3
+		m.onboardingStep = 4
 		m.textInput.SetValue("root")
 		m.textInput.Focus()
-	case 3: // User
+	case 4: // User
 		user := "root"
 		if val != "" {
 			user = val
 		}
 		m.obUser = user
-		m.onboardingStep = 4
+		m.onboardingStep = 5
 		m.textInput.SetValue("/workspace")
 		m.textInput.Focus()
-	case 4: // Workspace path
+	case 5: // Workspace path
 		workspace := "/workspace"
 		if val != "" {
 			workspace = val
 		}
 		m.obWorkspace = workspace
-		m.onboardingStep = 5
+		m.onboardingStep = 6
 		m.textInput.SetValue("s")
 		m.textInput.Placeholder = "s/n"
 		m.textInput.Focus()
-	case 5: // Inject key Confirm
+	case 6: // Inject key Confirm
 		m.obSetupKey = strings.ToLower(val) == "s" || strings.ToLower(val) == "sim" || val == ""
 		if m.obSetupKey {
-			m.onboardingStep = 6
+			m.onboardingStep = 7
 			m.textInput.Blur()
 			return m.runSSHKeySetupCmd()
 		} else {
-			m.onboardingStep = 7
+			m.onboardingStep = 8
 			m.textInput.Blur()
 		}
-	case 7: // Finalizar e inicializar dashboard
-		m.activeHost = "remote-workspace"
-		if m.obHost == "localhost" || m.obHost == "127.0.0.1" {
-			m.activeHost = "local"
-		}
+	case 8: // Finalizar e inicializar dashboard
+		m.activeHost = m.obProfileName
 		_ = m.finalizeOnboarding()
 		m.sessMgr.SetActive(m.activeHost)
 		m.isOnboarding = false
@@ -1051,32 +1082,94 @@ func (m *AppModel) runSSHKeySetupCmd() tea.Cmd {
 		}
 		pubKeyStr := strings.TrimSpace(string(pubKey))
 
-		host := config.Host{
+		// Tenta conexão direta primeiro
+		containerHost := config.Host{
 			Host:      m.obHost,
 			Port:      m.obPort,
 			User:      m.obUser,
 			Workspace: m.obWorkspace,
 		}
 
-		client, err := internalssh.NewClient(&host)
+		directClient, err := internalssh.NewClient(&containerHost)
+		if err == nil {
+			if err = directClient.Connect(); err == nil {
+				defer directClient.Close()
+				// Conexão direta funcionou! Instala a chave.
+				installCmd := fmt.Sprintf(
+					`mkdir -p ~/.ssh && chmod 700 ~/.ssh && `+
+					`grep -qxF '%s' ~/.ssh/authorized_keys 2>/dev/null || echo '%s' >> ~/.ssh/authorized_keys && `+
+					`chmod 600 ~/.ssh/authorized_keys && chown -R $(whoami):$(id -gn) ~/.ssh`,
+					pubKeyStr, pubKeyStr,
+				)
+				_, _, err2 := directClient.RunCommand(installCmd)
+				return obSetupFinishedMsg{err: err2}
+			}
+		}
+
+		// Se a conexão direta falhou e for localhost/127.0.0.1, tenta rodar docker exec local
+		if m.obHost == "localhost" || m.obHost == "127.0.0.1" {
+			cmd := exec.Command("docker", "exec", "-i", "workspace_machine", "sh", "-c",
+				"mkdir -p /root/.ssh && cat >> /root/.ssh/authorized_keys && chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys && chown -R root:root /root")
+			cmd.Stdin = strings.NewReader(pubKeyStr + "\n")
+			if err := cmd.Run(); err != nil {
+				cmdLabel := exec.Command("sh", "-c", "docker exec -i $(docker ps -qf label=com.docker.compose.service=workspace) sh -c 'mkdir -p /root/.ssh && cat >> /root/.ssh/authorized_keys && chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys && chown -R root:root /root'")
+				cmdLabel.Stdin = strings.NewReader(pubKeyStr + "\n")
+				err = cmdLabel.Run()
+			}
+			return obSetupFinishedMsg{err: err}
+		}
+
+		// Para hosts remotos, tenta bootstrap via host SSH do VPS (porta 22)
+		vpsHost := config.Host{
+			Host:      m.obHost,
+			Port:      22,
+			User:      m.obUser,
+			Workspace: m.obWorkspace,
+		}
+
+		vpsClient, err := internalssh.NewClient(&vpsHost)
 		if err != nil {
-			return obSetupFinishedMsg{err: err}
+			return obSetupFinishedMsg{err: fmt.Errorf("falha ao configurar conexão com o host VPS: %w", err)}
 		}
 
-		if err := client.Connect(); err != nil {
-			return obSetupFinishedMsg{err: err}
+		if err = vpsClient.Connect(); err != nil {
+			// Se falhar com o usuário padrão, tenta root
+			vpsHost.User = "root"
+			rootClient, errRoot := internalssh.NewClient(&vpsHost)
+			if errRoot == nil {
+				if errRoot = rootClient.Connect(); errRoot == nil {
+					vpsClient = rootClient
+					err = nil
+				}
+			}
+			if err != nil {
+				return obSetupFinishedMsg{err: fmt.Errorf("conexão direta falhou e não foi possível conectar ao host VPS (porta 22): %w", err)}
+			}
 		}
-		defer client.Close()
+		defer vpsClient.Close()
 
-		installCmd := fmt.Sprintf(
-			`mkdir -p ~/.ssh && chmod 700 ~/.ssh && `+
-			`grep -qxF '%s' ~/.ssh/authorized_keys 2>/dev/null || echo '%s' >> ~/.ssh/authorized_keys && `+
-			`chmod 600 ~/.ssh/authorized_keys && chown -R $(whoami):$(id -gn) ~/.ssh`,
-			pubKeyStr, pubKeyStr,
+		// Conectado ao VPS! Roda docker exec para injetar a chave
+		bootstrapCmd := fmt.Sprintf(
+			`docker exec -i $(docker ps -qf label=com.docker.compose.service=workspace) sh -c `+
+			`"mkdir -p /root/.ssh && echo '%s' >> /root/.ssh/authorized_keys && chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys && chown -R root:root /root"`,
+			pubKeyStr,
 		)
 
-		_, _, err = client.RunCommand(installCmd)
-		return obSetupFinishedMsg{err: err}
+		_, stderr, err := vpsClient.RunCommand(bootstrapCmd)
+		if err != nil {
+			// Fallback para nome padrão de container se a label falhar
+			bootstrapCmdFallback := fmt.Sprintf(
+				`docker exec -i workspace_machine sh -c `+
+				`"mkdir -p /root/.ssh && echo '%s' >> /root/.ssh/authorized_keys && chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys && chown -R root:root /root"`,
+				pubKeyStr,
+			)
+			_, stderr, err = vpsClient.RunCommand(bootstrapCmdFallback)
+			if err != nil {
+				return obSetupFinishedMsg{err: fmt.Errorf("falha ao injetar chave via docker exec no VPS: %s (%w)", stderr, err)}
+			}
+		}
+
+		return obSetupFinishedMsg{err: nil}
 	}
 }
 
@@ -1090,7 +1183,7 @@ func (m *AppModel) finalizeOnboarding() error {
 		Workspace: m.obWorkspace,
 	}
 
-	err := store.AddHost(m.activeHost, h)
+	err := store.AddHost(m.obProfileName, h)
 	if err != nil {
 		return err
 	}
@@ -1109,6 +1202,14 @@ func (m *AppModel) finalizeOnboarding() error {
 	}
 	m.hostNames = hostNames
 	m.selectedHost = 0
+
+	// Altera a seleção na barra lateral para o novo host adicionado
+	for idx, name := range hostNames {
+		if name == m.obProfileName {
+			m.selectedHost = idx
+			break
+		}
+	}
 
 	return nil
 }

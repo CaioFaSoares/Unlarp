@@ -170,10 +170,6 @@ A aba **Dashboard** da TUI mostra a lista de sessões virtuais Tmux ativas no se
    - `workspace-nix-store` -> `/nix`
    - `workspace-home` -> `/root` (persiste chaves SSH, preferências de terminal, login de agentes e histórico)
    - `workspace-docker` -> `/var/lib/docker`
-4. **Adicione a Variável de Ambiente (Bootstrap Seguro)**:
-   - Vá no painel **Environment Variables** da aplicação no Coolify.
-   - Adicione uma nova variável chamada **`SSH_PUBLIC_KEY`**.
-   - No valor, cole o conteúdo da sua chave pública local do Mac (geralmente o conteúdo de `~/.ssh/id_ed25519.pub`).
-5. Deploy a aplicação.
+4. Deploy a aplicação.
 
-O container inicializará e injetará sua chave automaticamente no primeiro boot com as permissões corretas. E você estará pronto para conectar via TUI ou CLI normal de forma imediata!
+O container inicializará o servidor SSH de forma limpa. Em seguida, basta abrir a TUI local (`./unlarp tui`), apertar `a` na barra lateral e passar as credenciais do seu host. O assistente de Onboarding do Unlarp detectará se o container está sem a sua chave SSH local e usará automaticamente a sua conexão com o host VPS (porta 22) para injetar a chave pública dentro do container via `docker exec`, sem requerer nenhuma configuração de variável de ambiente ou senhas.
