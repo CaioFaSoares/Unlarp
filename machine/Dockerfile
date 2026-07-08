@@ -54,7 +54,8 @@ RUN echo "if [ -e /root/.nix-profile/etc/profile.d/nix.sh ]; then . /root/.nix-p
 RUN mkdir -p /var/run/sshd \
     && mkdir -p /root/.ssh && chmod 700 /root/.ssh \
     && sed -i 's/#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config \
-    && sed -i 's/#PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
+    && sed -i 's/#PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config \
+    && echo "StrictModes no" >> /etc/ssh/sshd_config
 
 WORKDIR /workspace
 
