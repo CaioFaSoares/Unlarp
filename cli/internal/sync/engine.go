@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -518,7 +519,8 @@ func (e *Engine) SyncExec() (int, error) {
 		e.progressMu.Unlock()
 	}()
 
-	// Executa ações
+	// Executa ações com acumulação de erros para resiliência
+	var errs []error
 
 	// 1. Deleta localmente
 	for _, path := range localDeletes {
@@ -526,6 +528,9 @@ func (e *Engine) SyncExec() (int, error) {
 		localPath := filepath.Join(e.LocalDir, path)
 		err := os.RemoveAll(localPath)
 		e.finishFileProgress(path, "local_delete", false, err)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("falha ao deletar local %s: %w", path, err))
+		}
 	}
 
 	// 2. Deleta remotamente
@@ -534,6 +539,9 @@ func (e *Engine) SyncExec() (int, error) {
 		remotePath := filepath.ToSlash(filepath.Join(e.RemoteDir, path))
 		err := e.sftpClient.Remove(remotePath)
 		e.finishFileProgress(path, "remote_delete", false, err)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("falha ao deletar remoto %s: %w", path, err))
+		}
 	}
 
 	// 3. Executa Downloads (Remoto -> Local)
@@ -548,7 +556,7 @@ func (e *Engine) SyncExec() (int, error) {
 		err := e.downloadFile(remotePath, localPath)
 		e.finishFileProgress(path, "download", false, err)
 		if err != nil {
-			return 0, fmt.Errorf("falha ao baixar %s: %w", path, err)
+			errs = append(errs, fmt.Errorf("falha ao baixar %s: %w", path, err))
 		}
 	}
 
@@ -567,7 +575,7 @@ func (e *Engine) SyncExec() (int, error) {
 		isNew := !inR
 		e.finishFileProgress(path, "upload", isNew, err)
 		if err != nil {
-			return 0, fmt.Errorf("falha ao enviar %s: %w", path, err)
+			errs = append(errs, fmt.Errorf("falha ao enviar %s: %w", path, err))
 		}
 	}
 
@@ -579,10 +587,40 @@ func (e *Engine) SyncExec() (int, error) {
 		e.saveLastState()
 	}
 
+	if len(errs) > 0 {
+		return totalActions - len(errs), fmt.Errorf("sync concluído com %d falha(s). Exemplo: %v", len(errs), errs[0])
+	}
+
 	return totalActions, nil
 }
 
 func (e *Engine) downloadFile(remotePath, localPath string) error {
+	// 1. Verifica se o remote é um link simbólico
+	stat, err := e.sftpClient.Lstat(remotePath)
+	if err == nil && stat.Mode()&os.ModeSymlink != 0 {
+		target, err := e.sftpClient.ReadLink(remotePath)
+		if err != nil {
+			return err
+		}
+		
+		// Traduz target se for caminho absoluto contendo o base remoto
+		remoteBase := filepath.ToSlash(e.RemoteDir)
+		localBase := filepath.ToSlash(e.LocalDir)
+		if strings.HasPrefix(filepath.ToSlash(target), remoteBase) {
+			target = strings.Replace(filepath.ToSlash(target), remoteBase, localBase, 1)
+			target = filepath.FromSlash(target)
+		}
+
+		// Limpa colisão local
+		_ = os.RemoveAll(localPath)
+		return os.Symlink(target, localPath)
+	}
+
+	// 2. Se for arquivo regular, primeiro limpa colisão local (se existir diretório ou arquivo antigo no caminho)
+	if _, err := os.Lstat(localPath); err == nil {
+		_ = os.RemoveAll(localPath)
+	}
+
 	remoteFile, err := e.sftpClient.Open(remotePath)
 	if err != nil {
 		return err
@@ -595,14 +633,26 @@ func (e *Engine) downloadFile(remotePath, localPath string) error {
 	}
 	defer localFile.Close()
 
-	_, err = io.Copy(localFile, remoteFile)
-	if err != nil {
-		return err
+	relPath, errRel := filepath.Rel(e.LocalDir, localPath)
+	if errRel == nil && e.shouldRewriteGitPath(relPath) {
+		content, err := io.ReadAll(remoteFile)
+		if err != nil {
+			return err
+		}
+		rewritten := e.rewriteGitContent(content, "download")
+		_, err = localFile.Write(rewritten)
+		if err != nil {
+			return err
+		}
+	} else {
+		_, err = io.Copy(localFile, remoteFile)
+		if err != nil {
+			return err
+		}
 	}
 
 	// Preserva ModTime e permissões
-	stat, err := remoteFile.Stat()
-	if err == nil {
+	if stat, err := remoteFile.Stat(); err == nil {
 		_ = os.Chmod(localPath, stat.Mode())
 		_ = os.Chtimes(localPath, time.Now(), stat.ModTime())
 	}
@@ -611,6 +661,32 @@ func (e *Engine) downloadFile(remotePath, localPath string) error {
 }
 
 func (e *Engine) uploadFile(localPath, remotePath string) error {
+	// 1. Verifica se o local é um link simbólico
+	stat, err := os.Lstat(localPath)
+	if err == nil && stat.Mode()&os.ModeSymlink != 0 {
+		target, err := os.Readlink(localPath)
+		if err != nil {
+			return err
+		}
+		
+		// Traduz target se for caminho absoluto contendo o base local
+		localBase := filepath.ToSlash(e.LocalDir)
+		remoteBase := filepath.ToSlash(e.RemoteDir)
+		if strings.HasPrefix(filepath.ToSlash(target), localBase) {
+			target = strings.Replace(filepath.ToSlash(target), localBase, remoteBase, 1)
+			target = filepath.ToSlash(target)
+		}
+
+		// Limpa colisão remota usando rm -rf via SSH
+		_, _, _ = e.sshClient.RunCommand("rm -rf " + shellQuote(remotePath))
+		return e.sftpClient.Symlink(target, remotePath)
+	}
+
+	// 2. Se for arquivo regular, primeiro limpa colisão remota
+	if _, err := e.sftpClient.Lstat(remotePath); err == nil {
+		_, _, _ = e.sshClient.RunCommand("rm -rf " + shellQuote(remotePath))
+	}
+
 	localFile, err := os.Open(localPath)
 	if err != nil {
 		return err
@@ -623,19 +699,63 @@ func (e *Engine) uploadFile(localPath, remotePath string) error {
 	}
 	defer remoteFile.Close()
 
-	_, err = io.Copy(remoteFile, localFile)
-	if err != nil {
-		return err
+	relPath, errRel := filepath.Rel(e.LocalDir, localPath)
+	if errRel == nil && e.shouldRewriteGitPath(relPath) {
+		content, err := io.ReadAll(localFile)
+		if err != nil {
+			return err
+		}
+		rewritten := e.rewriteGitContent(content, "upload")
+		_, err = remoteFile.Write(rewritten)
+		if err != nil {
+			return err
+		}
+	} else {
+		_, err = io.Copy(remoteFile, localFile)
+		if err != nil {
+			return err
+		}
 	}
 
 	// Preserva ModTime e permissões
-	stat, err := localFile.Stat()
-	if err == nil {
+	if stat, err := localFile.Stat(); err == nil {
 		_ = e.sftpClient.Chmod(remotePath, stat.Mode())
 		_ = e.sftpClient.Chtimes(remotePath, time.Now(), stat.ModTime())
 	}
 
 	return nil
+}
+
+// shouldRewriteGitPath retorna se o arquivo relativo necessita de tradução de caminho absoluto do Git
+func (e *Engine) shouldRewriteGitPath(relPath string) bool {
+	path := filepath.ToSlash(relPath)
+	
+	// Caso 1: arquivo de texto ".git" de uma worktree (geralmente tem prefixo gitdir: )
+	if filepath.Base(path) == ".git" {
+		return true
+	}
+	
+	// Caso 2: arquivo "gitdir" em metadados de worktrees (.git/worktrees/<name>/gitdir)
+	parts := strings.Split(path, "/")
+	n := len(parts)
+	if n >= 4 && parts[n-1] == "gitdir" && parts[n-3] == "worktrees" && parts[n-4] == ".git" {
+		return true
+	}
+	return false
+}
+
+// rewriteGitContent traduz as referências de caminhos absolutos do conteúdo do arquivo Git
+func (e *Engine) rewriteGitContent(content []byte, direction string) []byte {
+	str := string(content)
+	localBase := filepath.ToSlash(e.LocalDir)
+	remoteBase := filepath.ToSlash(e.RemoteDir)
+	
+	if direction == "upload" {
+		str = strings.ReplaceAll(str, localBase, remoteBase)
+	} else {
+		str = strings.ReplaceAll(str, remoteBase, localBase)
+	}
+	return []byte(str)
 }
 
 func (e *Engine) loadLastState() {
@@ -662,4 +782,8 @@ func (e *Engine) saveLastState() {
 // IgnoreMatcher retorna o matcher de ignores associado a esta engine
 func (e *Engine) IgnoreMatcher() *IgnoreMatcher {
 	return e.matcher
+}
+
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
 }

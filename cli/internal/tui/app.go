@@ -177,6 +177,7 @@ type AppModel struct {
 	gitInfo        map[string]git.RemoteGitInfo // chave: RemotePath/RemoteDir do projeto
 	gitAlerts      map[string]string            // chave: syncID ou RemotePath -> motivo do bloqueio
 	gitTickCounter int
+	syncTickCounter int
 
 	// Hosts cujos syncs persistidos já foram religados nesta execução da TUI
 	restoredHosts map[string]bool
@@ -267,6 +268,7 @@ func NewAppModel() (*AppModel, error) {
 		gitInfo:          make(map[string]git.RemoteGitInfo),
 		gitAlerts:        make(map[string]string),
 		gitTickCounter:   0,
+		syncTickCounter:  0,
 		restoredHosts:    make(map[string]bool),
 		isOnboarding:     isOnboarding,
 		onboardingStep: 0,
@@ -456,6 +458,21 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 
+			m.syncTickCounter++
+			if m.syncTickCounter >= 15 {
+				m.syncTickCounter = 0
+				// Dispara reconciliação de consistência periódica para todas as sessões de sync ativas em background
+				for _, hostSyncs := range m.syncSessions {
+					for _, s := range hostSyncs {
+						if s.engine != nil {
+							go func(engine *internalsync.Engine) {
+								_, _ = engine.SyncExec()
+							}(s.engine)
+						}
+					}
+				}
+			}
+
 			// Religa, de forma invisível, os syncs persistidos do host ativo assim
 			// que ele é visto pela primeira vez nesta execução (cobre tanto o
 			// boot da TUI quanto a troca de host ativo).
@@ -492,8 +509,13 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.selectedProjectRow = 0
 		}
 
-	case projectsMsg:
-		m.projects = msg
+	case projectsGitMsg:
+		m.projects = msg.projects
+		// Mescla as informações Git ricas coletadas
+		for path, info := range msg.gitInfos {
+			m.gitInfo[path] = info
+		}
+
 		// Projetos com sync ativo sobem para o topo — "ativos" separados do
 		// resto sem precisar de um passo extra de curadoria manual.
 		if sess, ok := m.sessMgr.GetSession(m.activeHost); ok {
@@ -515,7 +537,9 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.addLog("Retornou do terminal SSH.")
 		}
+		m.tmuxSessions = nil
 		cmds = append(cmds, m.checkTmuxCmd())
+		cmds = append(cmds, m.checkProjectsCmd())
 
 	case syncStartedMsg:
 		m.handleSyncStarted(msg)
@@ -772,6 +796,10 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "c":
+			if !m.sidebarFocus && m.activeTab == tabDashboard && m.tmuxSessions == nil {
+				m.addLog("Aguarde o carregamento das sessões Tmux...")
+				return m, nil
+			}
 			// Atalho para abrir terminal interativo SSH (usando Tmux por padrão)
 			sessionName := "unlarp"
 			cwd := ""
@@ -1641,6 +1669,7 @@ func (m *AppModel) handleDeleteSelection() tea.Cmd {
 		} else if item.Session != nil {
 			name := item.Session.Name
 			m.addLog(fmt.Sprintf("Finalizando sessão Tmux %s...", name))
+			m.tmuxSessions = nil
 			return m.killTmuxSessionCmd(name)
 		}
 	}
@@ -1654,6 +1683,7 @@ func (m *AppModel) handleDeleteSelection() tea.Cmd {
 		name := m.tmuxSessions[m.selectedTmuxRow].Name
 		m.addLog(fmt.Sprintf("Finalizando sessão Tmux %s...", name))
 		m.selectedTmuxRow = 0
+		m.tmuxSessions = nil
 		return m.killTmuxSessionCmd(name)
 	}
 
@@ -1815,37 +1845,94 @@ func (m *AppModel) checkTmuxCmd() tea.Cmd {
 	}
 }
 
-// checkProjectsCmd retorna um comando assíncrono que atualiza a branch atual
-// de cada projeto já cadastrado (config.Host.Projects) no host ativo.
+// checkProjectsCmd retorna um comando assíncrono que atualiza o status rico do Git
+// de cada projeto já cadastrado (config.Host.Projects) no host ativo de uma só vez.
 func (m *AppModel) checkProjectsCmd() tea.Cmd {
 	return func() tea.Msg {
 		hostCfg, ok := m.cfg.Hosts[m.activeHost]
 		if !ok || len(hostCfg.Projects) == 0 {
-			return projectsMsg(nil)
+			return projectsGitMsg{projects: nil, gitInfos: nil}
 		}
 
-		// Branca é best-effort: se a conexão ou o comando falharem, os projetos
-		// cadastrados ainda devem aparecer (só sem a branch preenchida) — um
-		// projeto não deixa de existir por não ser repositório git ou por um
-		// hiccup de rede.
+		gitInfos := make(map[string]git.RemoteGitInfo)
 		branches := make(map[string]string)
+		
 		if client, err := m.getOrCreateSSHClient(m.activeHost, &hostCfg); err == nil {
 			var paths strings.Builder
 			for _, p := range hostCfg.Projects {
 				paths.WriteString(shellQuote(p.RemotePath))
 				paths.WriteString(" ")
 			}
-			branchCmd := fmt.Sprintf(
-				`for p in %s; do echo "$p|$(git -C "$p" rev-parse --abbrev-ref HEAD 2>/dev/null)"; done`,
+			
+			gitCmd := fmt.Sprintf(
+				`for p in %s; do `+
+					`echo "PROJ|$p" && `+
+					`cd "$p" 2>/dev/null && git rev-parse --is-inside-work-tree >/dev/null 2>&1 && `+
+					`echo "REPO|true" && `+
+					`echo "BRANCH|$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" && `+
+					`echo "HASH|$(git rev-parse --short HEAD 2>/dev/null)" && `+
+					`echo "MSG|$(git log -1 --format=%%%%s 2>/dev/null)" && `+
+					`echo "TIME|$(git log -1 --format=%%%%aI 2>/dev/null)" && `+
+					`echo "DIRTY|$(git status --porcelain 2>/dev/null | head -1)" && `+
+					`echo "URL|$(git remote get-url origin 2>/dev/null)" && `+
+					`echo "AB|$(git rev-list --left-right --count HEAD...origin/$(git rev-parse --abbrev-ref HEAD) 2>/dev/null)" || `+
+					`echo "REPO|false"; `+
+				`done`,
 				strings.TrimSpace(paths.String()),
 			)
 
-			if stdout, _, err := client.RunCommand(branchCmd); err == nil {
-				for _, line := range strings.Split(strings.TrimSpace(stdout), "\n") {
-					parts := strings.SplitN(strings.TrimSpace(line), "|", 2)
-					if len(parts) == 2 {
-						branches[parts[0]] = strings.TrimSpace(parts[1])
+			if stdout, _, err := client.RunCommand(gitCmd); err == nil {
+				var currentProj string
+				var currentInfo git.RemoteGitInfo
+				
+				for _, line := range strings.Split(stdout, "\n") {
+					line = strings.TrimSpace(line)
+					if line == "" {
+						continue
 					}
+					
+					parts := strings.SplitN(line, "|", 2)
+					if len(parts) != 2 {
+						continue
+					}
+					
+					key := parts[0]
+					val := strings.TrimSpace(parts[1])
+					
+					switch key {
+					case "PROJ":
+						if currentProj != "" {
+							gitInfos[currentProj] = currentInfo
+						}
+						currentProj = val
+						currentInfo = git.RemoteGitInfo{}
+					case "REPO":
+						currentInfo.IsGitRepo = val == "true"
+					case "BRANCH":
+						currentInfo.Branch = val
+						branches[currentProj] = val
+					case "HASH":
+						currentInfo.CommitHash = val
+					case "MSG":
+						currentInfo.CommitMessage = val
+					case "TIME":
+						if t, err := time.Parse(time.RFC3339, val); err == nil {
+							currentInfo.CommitTime = t
+						}
+					case "DIRTY":
+						currentInfo.IsDirty = val != ""
+					case "URL":
+						currentInfo.RemoteURL = val
+					case "AB":
+						abParts := strings.Fields(val)
+						if len(abParts) == 2 {
+							currentInfo.AheadBehind.Ahead, _ = strconv.Atoi(abParts[0])
+							currentInfo.AheadBehind.Behind, _ = strconv.Atoi(abParts[1])
+						}
+					}
+				}
+				if currentProj != "" {
+					gitInfos[currentProj] = currentInfo
 				}
 			}
 		}
@@ -1859,7 +1946,7 @@ func (m *AppModel) checkProjectsCmd() tea.Cmd {
 				LocalDir: p.LocalDir,
 			})
 		}
-		return projectsMsg(projects)
+		return projectsGitMsg{projects: projects, gitInfos: gitInfos}
 	}
 }
 
@@ -2233,6 +2320,11 @@ type gitResolvedMsg struct {
 	syncID string
 	err    error
 	action string
+}
+
+type projectsGitMsg struct {
+	projects []Project
+	gitInfos map[string]git.RemoteGitInfo
 }
 
 func (m *AppModel) checkGitCmd() tea.Cmd {
