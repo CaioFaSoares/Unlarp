@@ -170,11 +170,10 @@ A aba **Dashboard** da TUI mostra a lista de sessões virtuais Tmux ativas no se
    - `workspace-nix-store` -> `/nix`
    - `workspace-home` -> `/root` (persiste chaves SSH, preferências de terminal, login de agentes e histórico)
    - `workspace-docker` -> `/var/lib/docker`
-4. Deploy a aplicação.
+4. **Adicione a Variável de Ambiente (Bootstrap Seguro)**:
+   - Vá no painel **Environment Variables** da aplicação no Coolify.
+   - Adicione uma nova variável chamada **`SSH_PUBLIC_KEY`**.
+   - No valor, cole o conteúdo da sua chave pública local do Mac (geralmente o conteúdo de `~/.ssh/id_ed25519.pub`).
+5. Deploy a aplicação.
 
-### 2. Configurar Chave SSH Remota
-Após iniciar o container no Coolify, execute o assistente de setup na sua máquina:
-```bash
-unlarp setup coolify-prod
-```
-E você estará pronto para conectar via TUI ou CLI normal.
+O container inicializará e injetará sua chave automaticamente no primeiro boot com as permissões corretas. E você estará pronto para conectar via TUI ou CLI normal de forma imediata!
