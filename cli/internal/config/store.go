@@ -22,13 +22,21 @@ type Config struct {
 
 // Host representa um workspace remoto configurado
 type Host struct {
-	Host      string `yaml:"host"`
-	Port      int    `yaml:"port"`
-	User      string `yaml:"user"`
-	Key       string `yaml:"key"`
-	Workspace string `yaml:"workspace"`
-	Container string `yaml:"container,omitempty"` // Para operações Docker diretas (local only)
-	Password  string `yaml:"-"`                   // Usado apenas em memória para bootstrap/setup
+	Host      string    `yaml:"host"`
+	Port      int       `yaml:"port"`
+	User      string    `yaml:"user"`
+	Key       string    `yaml:"key"`
+	Workspace string    `yaml:"workspace"`
+	Container string    `yaml:"container,omitempty"` // Para operações Docker diretas (local only)
+	Password  string    `yaml:"-"`                   // Usado apenas em memória para bootstrap/setup
+	Projects  []Project `yaml:"projects,omitempty"`
+}
+
+// Project representa um projeto (pasta remota) cadastrado manualmente dentro de um host
+type Project struct {
+	Name       string `yaml:"name"`
+	RemotePath string `yaml:"remote_path"`
+	LocalDir   string `yaml:"local_dir,omitempty"` // pasta local vinculada, se um sync foi criado no cadastro
 }
 
 // SyncConfig contém as configurações globais de sincronização
@@ -228,6 +236,54 @@ func (s *Store) UpdateHost(name string, host Host) error {
 	}
 
 	cfg.Hosts[name] = host
+	return s.Save(cfg)
+}
+
+// AddProject cadastra um projeto num host e salva. Dedupe por RemotePath.
+func (s *Store) AddProject(hostName string, p Project) error {
+	cfg, err := s.Load()
+	if err != nil {
+		return err
+	}
+
+	host, exists := cfg.Hosts[hostName]
+	if !exists {
+		return fmt.Errorf("host '%s' não encontrado", hostName)
+	}
+
+	for _, existing := range host.Projects {
+		if existing.RemotePath == p.RemotePath {
+			return fmt.Errorf("projeto em '%s' já cadastrado neste host", p.RemotePath)
+		}
+	}
+
+	host.Projects = append(host.Projects, p)
+	cfg.Hosts[hostName] = host
+
+	return s.Save(cfg)
+}
+
+// RemoveProject remove um projeto cadastrado de um host (pelo caminho remoto) e salva
+func (s *Store) RemoveProject(hostName, remotePath string) error {
+	cfg, err := s.Load()
+	if err != nil {
+		return err
+	}
+
+	host, exists := cfg.Hosts[hostName]
+	if !exists {
+		return fmt.Errorf("host '%s' não encontrado", hostName)
+	}
+
+	filtered := make([]Project, 0, len(host.Projects))
+	for _, p := range host.Projects {
+		if p.RemotePath != remotePath {
+			filtered = append(filtered, p)
+		}
+	}
+	host.Projects = filtered
+	cfg.Hosts[hostName] = host
+
 	return s.Save(cfg)
 }
 
