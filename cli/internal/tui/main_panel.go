@@ -11,7 +11,7 @@ import (
 
 // renderMainPanel desenha a barra de abas e o conteúdo da aba selecionada
 func (m AppModel) renderMainPanel(width, height int) string {
-	tabs := []string{"Dashboard", "Syncs", "Túneis", "Logs"}
+	tabs := []string{"Dashboard", "Syncs", "Túneis", "Logs", "Projetos"}
 	var renderedTabs []string
 
 	for i, t := range tabs {
@@ -79,6 +79,8 @@ func (m AppModel) renderMainPanel(width, height int) string {
 		content = m.renderTunnels(width, contentHeight)
 	case 3:
 		content = m.renderLogs(width, contentHeight)
+	case 4:
+		content = m.renderProjects(width, contentHeight)
 	default:
 		content = "Aba desconhecida"
 	}

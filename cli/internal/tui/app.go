@@ -53,6 +53,21 @@ type TmuxSession struct {
 
 type tmuxSessionsMsg []TmuxSession
 
+// Project representa um monorepo (raiz de repositório git) descoberto no workspace do host
+type Project struct {
+	Path   string
+	Name   string
+	Branch string
+}
+
+type projectsMsg []Project
+
+// projectOutputMsg carrega o tail do pane Tmux de um projeto (tmux capture-pane)
+type projectOutputMsg struct {
+	name   string
+	output string
+}
+
 type resumeTuiMsg struct {
 	err error
 }
@@ -75,6 +90,7 @@ type syncStartedMsg struct {
 	engine        *internalsync.Engine
 	localWatcher  *watcher.LocalWatcher
 	remoteWatcher *watcher.RemoteWatcher
+	restored      bool // true quando religado automaticamente a partir do state persistido, não criado pelo usuário agora
 }
 
 // AppModel é o modelo central do Bubble Tea
@@ -115,6 +131,14 @@ type AppModel struct {
 
 	// Sessões Tmux
 	tmuxSessions []TmuxSession
+
+	// Projetos (monorepos descobertos automaticamente no workspace do host)
+	projects           []Project
+	selectedProjectRow int
+	projectOutput      map[string]string
+
+	// Hosts cujos syncs persistidos já foram religados nesta execução da TUI
+	restoredHosts map[string]bool
 
 	// Componentes e Sub-sistemas
 	spinner spinner.Model
@@ -194,6 +218,8 @@ func NewAppModel() (*AppModel, error) {
 		sftpClients:    make(map[string]*sftp.Client),
 		tunnelManagers: make(map[string]*tunnel.Manager),
 		syncSessions:   make(map[string]map[string]*liveSyncSession),
+		projectOutput:  make(map[string]string),
+		restoredHosts:  make(map[string]bool),
 		isOnboarding:   isOnboarding,
 		onboardingStep: 0,
 		obProfileName:  "",
@@ -311,6 +337,25 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, tickCmd())
 		if !m.isOnboarding {
 			cmds = append(cmds, m.checkTmuxCmd())
+			cmds = append(cmds, m.checkProjectsCmd())
+
+			// Religa, de forma invisível, os syncs persistidos do host ativo assim
+			// que ele é visto pela primeira vez nesta execução (cobre tanto o
+			// boot da TUI quanto a troca de host ativo).
+			if m.activeHost != "" && !m.restoredHosts[m.activeHost] {
+				m.restoredHosts[m.activeHost] = true
+				if restoreCmd := m.restoreSyncsCmd(m.activeHost); restoreCmd != nil {
+					cmds = append(cmds, restoreCmd)
+				}
+			}
+
+			if m.activeTab == 4 && len(m.projects) > 0 {
+				idx := m.selectedProjectRow
+				if idx >= len(m.projects) {
+					idx = 0
+				}
+				cmds = append(cmds, m.captureProjectCmd(m.projects[idx].Name))
+			}
 		}
 
 	case tmuxSessionsMsg:
@@ -318,6 +363,15 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.selectedTmuxRow >= len(m.tmuxSessions) {
 			m.selectedTmuxRow = 0
 		}
+
+	case projectsMsg:
+		m.projects = msg
+		if m.selectedProjectRow >= len(m.projects) {
+			m.selectedProjectRow = 0
+		}
+
+	case projectOutputMsg:
+		m.projectOutput[msg.name] = msg.output
 
 	case resumeTuiMsg:
 		if msg.err != nil {
@@ -409,12 +463,13 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "left", "right":
 			if !m.sidebarFocus {
 				if msg.String() == "left" {
-					m.activeTab = (m.activeTab - 1 + 4) % 4
+					m.activeTab = (m.activeTab - 1 + 5) % 5
 				} else {
-					m.activeTab = (m.activeTab + 1) % 4
+					m.activeTab = (m.activeTab + 1) % 5
 				}
 				m.selectedSyncRow = 0
 				m.selectedTunnelRow = 0
+				m.selectedProjectRow = 0
 			}
 
 		case "up", "k":
@@ -501,8 +556,15 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "c":
 			// Atalho para abrir terminal interativo SSH (usando Tmux por padrão)
 			sessionName := "unlarp"
-			if !m.sidebarFocus && m.activeTab == 0 && len(m.tmuxSessions) > 0 {
-				sessionName = m.tmuxSessions[m.selectedTmuxRow].Name
+			cwd := ""
+			if !m.sidebarFocus {
+				if m.activeTab == 0 && len(m.tmuxSessions) > 0 {
+					sessionName = m.tmuxSessions[m.selectedTmuxRow].Name
+				} else if m.activeTab == 4 && len(m.projects) > 0 {
+					proj := m.projects[m.selectedProjectRow]
+					sessionName = proj.Name
+					cwd = proj.Path
+				}
 			}
 
 			exe, err := os.Executable()
@@ -510,7 +572,12 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				exe = "unlarp"
 			}
 
-			c := exec.Command(exe, "connect", m.activeHost, "--tmux", "--tmux-session", sessionName)
+			connectArgs := []string{"connect", m.activeHost, "--tmux", "--tmux-session", sessionName}
+			if cwd != "" {
+				connectArgs = append(connectArgs, "--cwd", cwd)
+			}
+
+			c := exec.Command(exe, connectArgs...)
 			return m, tea.ExecProcess(c, func(err error) tea.Msg {
 				return resumeTuiMsg{err: err}
 			})
@@ -752,6 +819,14 @@ func (m AppModel) renderFooter() string {
 					styles.KeyStyle.Render("Tab"),
 					styles.KeyStyle.Render("q"),
 				}
+			} else if m.activeTab == 4 {
+				actions = "%s Navegar | %s Abrir Sessão no Projeto | %s Mudar Foco | %s Sair"
+				keys = []string{
+					styles.KeyStyle.Render("↑/↓/j/k"),
+					styles.KeyStyle.Render("c"),
+					styles.KeyStyle.Render("Tab"),
+					styles.KeyStyle.Render("q"),
+				}
 			}
 		}
 
@@ -769,6 +844,13 @@ func (m AppModel) renderFooter() string {
 }
 
 func (m *AppModel) handleMainPanelUp() {
+	if m.activeTab == 4 {
+		if len(m.projects) > 0 {
+			m.selectedProjectRow = (m.selectedProjectRow - 1 + len(m.projects)) % len(m.projects)
+		}
+		return
+	}
+
 	sess, ok := m.sessMgr.GetSession(m.activeHost)
 	if !ok {
 		return
@@ -784,6 +866,13 @@ func (m *AppModel) handleMainPanelUp() {
 }
 
 func (m *AppModel) handleMainPanelDown() {
+	if m.activeTab == 4 {
+		if len(m.projects) > 0 {
+			m.selectedProjectRow = (m.selectedProjectRow + 1) % len(m.projects)
+		}
+		return
+	}
+
 	sess, ok := m.sessMgr.GetSession(m.activeHost)
 	if !ok {
 		return
@@ -928,52 +1017,10 @@ func (m *AppModel) createSyncLiveCmd(val string) tea.Cmd {
 
 		syncID := "s-" + generateRandomString(6)
 
-		// Cria Engine
-		engine, err := internalsync.NewEngine(
-			syncID,
-			absLocal,
-			remoteDir,
-			host,
-			m.cfg.Sync.IgnorePatterns,
-			internalsync.ConflictStrategy(m.cfg.Sync.ConflictStrategy),
-			client,
-			sftpCli,
-		)
+		engine, localWatcher, remoteWatcher, err := m.startSyncEngine(host, syncID, absLocal, remoteDir, client, sftpCli)
 		if err != nil {
-			return syncStartedMsg{err: fmt.Errorf("erro ao iniciar engine de sync: %w", err), host: host}
+			return syncStartedMsg{err: err, host: host}
 		}
-
-		// Watcher local. onWarn vai para m.addLog (aba Logs) em vez de
-		// os.Stderr, que corromperia visualmente a TUI em alt-screen.
-		localWatcher, err := watcher.NewLocalWatcher(absLocal, 200*time.Millisecond, engine.IgnoreMatcher(), m.addLog, func() {
-			go func() {
-				_, err := engine.SyncExec()
-				if err != nil {
-					m.addLog(fmt.Sprintf("[%s] Erro ao sincronizar local: %v", syncID, err))
-				}
-			}()
-		})
-		if err != nil {
-			return syncStartedMsg{err: fmt.Errorf("erro ao criar watcher local: %w", err), host: host}
-		}
-
-		if err := localWatcher.Start(); err != nil {
-			return syncStartedMsg{err: fmt.Errorf("erro ao iniciar watcher local: %w", err), host: host}
-		}
-
-		// Watcher remoto: Start() faz uma varredura SFTP completa e síncrona
-		// do diretório remoto (é por isso que esta função inteira roda fora
-		// do Update()).
-		pollInterval := m.cfg.Sync.PollIntervalDuration()
-		remoteWatcher := watcher.NewRemoteWatcher(remoteDir, sftpCli, pollInterval, engine.IgnoreMatcher(), func() {
-			go func() {
-				_, err := engine.SyncExec()
-				if err != nil {
-					m.addLog(fmt.Sprintf("[%s] Erro ao sincronizar remoto: %v", syncID, err))
-				}
-			}()
-		})
-		remoteWatcher.Start()
 
 		return syncStartedMsg{
 			host:          host,
@@ -987,20 +1034,136 @@ func (m *AppModel) createSyncLiveCmd(val string) tea.Cmd {
 	}
 }
 
-// handleSyncStarted processa o resultado assíncrono de createSyncLiveCmd:
-// registra a sessão viva, persiste no session manager e dispara a
-// reconciliação inicial de arquivos.
+// startSyncEngine cria a engine de sync e liga os watchers local/remoto para
+// um (host, syncID, dirs) já resolvidos. Usado tanto para sincronizações
+// novas (createSyncLiveCmd) quanto para religar as já persistidas no boot
+// (restoreSyncsCmd).
+func (m *AppModel) startSyncEngine(host, syncID, absLocal, remoteDir string, client *internalssh.Client, sftpCli *sftp.Client) (*internalsync.Engine, *watcher.LocalWatcher, *watcher.RemoteWatcher, error) {
+	engine, err := internalsync.NewEngine(
+		syncID,
+		absLocal,
+		remoteDir,
+		host,
+		m.cfg.Sync.IgnorePatterns,
+		internalsync.ConflictStrategy(m.cfg.Sync.ConflictStrategy),
+		client,
+		sftpCli,
+	)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("erro ao iniciar engine de sync: %w", err)
+	}
+
+	// Watcher local. onWarn vai para m.addLog (aba Logs) em vez de
+	// os.Stderr, que corromperia visualmente a TUI em alt-screen.
+	localWatcher, err := watcher.NewLocalWatcher(absLocal, 200*time.Millisecond, engine.IgnoreMatcher(), m.addLog, func() {
+		go func() {
+			_, err := engine.SyncExec()
+			if err != nil {
+				m.addLog(fmt.Sprintf("[%s] Erro ao sincronizar local: %v", syncID, err))
+			}
+		}()
+	})
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("erro ao criar watcher local: %w", err)
+	}
+
+	if err := localWatcher.Start(); err != nil {
+		return nil, nil, nil, fmt.Errorf("erro ao iniciar watcher local: %w", err)
+	}
+
+	// Watcher remoto: Start() faz uma varredura SFTP completa e síncrona do
+	// diretório remoto — por isso esta função sempre deve rodar fora de
+	// Update() (dentro de um tea.Cmd), nunca no goroutine principal da TUI.
+	pollInterval := m.cfg.Sync.PollIntervalDuration()
+	remoteWatcher := watcher.NewRemoteWatcher(remoteDir, sftpCli, pollInterval, engine.IgnoreMatcher(), func() {
+		go func() {
+			_, err := engine.SyncExec()
+			if err != nil {
+				m.addLog(fmt.Sprintf("[%s] Erro ao sincronizar remoto: %v", syncID, err))
+			}
+		}()
+	})
+	remoteWatcher.Start()
+
+	return engine, localWatcher, remoteWatcher, nil
+}
+
+// restoreSyncsCmd religa, de forma automática e invisível, os syncs
+// persistidos de um host (session.SyncEntry em ~/.unlarp/state.json) que
+// ainda não têm engine/watchers vivos nesta execução da TUI — cobre tanto o
+// boot do app quanto a troca para um host que não tinha sido ativado ainda.
+func (m *AppModel) restoreSyncsCmd(host string) tea.Cmd {
+	sess, ok := m.sessMgr.GetSession(host)
+	if !ok || len(sess.Syncs) == 0 {
+		return nil
+	}
+
+	var cmds []tea.Cmd
+	for _, entry := range sess.Syncs {
+		if hostSyncs, exists := m.syncSessions[host]; exists {
+			if _, alreadyLive := hostSyncs[entry.ID]; alreadyLive {
+				continue
+			}
+		}
+
+		cmds = append(cmds, func() tea.Msg {
+			hostCfg, ok := m.cfg.Hosts[host]
+			if !ok {
+				return syncStartedMsg{err: fmt.Errorf("host '%s' não configurado", host), host: host, restored: true}
+			}
+
+			client, err := m.getOrCreateSSHClient(host, &hostCfg)
+			if err != nil {
+				return syncStartedMsg{err: fmt.Errorf("erro SSH ao restaurar sync %s: %w", entry.ID, err), host: host, restored: true}
+			}
+
+			sftpCli, err := m.getOrCreateSFTPClient(host, client)
+			if err != nil {
+				return syncStartedMsg{err: fmt.Errorf("erro SFTP ao restaurar sync %s: %w", entry.ID, err), host: host, restored: true}
+			}
+
+			engine, localWatcher, remoteWatcher, err := m.startSyncEngine(host, entry.ID, entry.LocalDir, entry.RemoteDir, client, sftpCli)
+			if err != nil {
+				return syncStartedMsg{err: err, host: host, restored: true}
+			}
+
+			return syncStartedMsg{
+				host:          host,
+				syncID:        entry.ID,
+				localDir:      entry.LocalDir,
+				remoteDir:     entry.RemoteDir,
+				engine:        engine,
+				localWatcher:  localWatcher,
+				remoteWatcher: remoteWatcher,
+				restored:      true,
+			}
+		})
+	}
+
+	if len(cmds) == 0 {
+		return nil
+	}
+	return tea.Batch(cmds...)
+}
+
+// handleSyncStarted processa o resultado assíncrono de createSyncLiveCmd ou
+// restoreSyncsCmd: registra a sessão viva, persiste no session manager
+// (exceto quando restaurado — já está persistido) e dispara a reconciliação
+// inicial de arquivos.
 func (m *AppModel) handleSyncStarted(msg syncStartedMsg) {
 	if msg.err != nil {
 		m.addLog(fmt.Sprintf("Erro ao criar sincronização: %v", msg.err))
 		return
 	}
 
-	stopChan := make(chan struct{})
-
 	if _, exists := m.syncSessions[msg.host]; !exists {
 		m.syncSessions[msg.host] = make(map[string]*liveSyncSession)
 	}
+	if _, alreadyLive := m.syncSessions[msg.host][msg.syncID]; alreadyLive {
+		return
+	}
+
+	stopChan := make(chan struct{})
 	m.syncSessions[msg.host][msg.syncID] = &liveSyncSession{
 		id:            msg.syncID,
 		engine:        msg.engine,
@@ -1009,17 +1172,20 @@ func (m *AppModel) handleSyncStarted(msg syncStartedMsg) {
 		stopChan:      stopChan,
 	}
 
-	if err := m.sessMgr.AddSync(msg.host, session.SyncEntry{
-		ID:        msg.syncID,
-		LocalDir:  msg.localDir,
-		RemoteDir: msg.remoteDir,
-		Mode:      "bidirectional",
-		LastSync:  time.Now(),
-	}); err != nil {
-		m.addLog(fmt.Sprintf("Erro ao salvar registro de sync: %v", err))
+	if msg.restored {
+		m.addLog(fmt.Sprintf("Sincronização %s restaurada automaticamente em %s.", msg.syncID, msg.host))
+	} else {
+		if err := m.sessMgr.AddSync(msg.host, session.SyncEntry{
+			ID:        msg.syncID,
+			LocalDir:  msg.localDir,
+			RemoteDir: msg.remoteDir,
+			Mode:      "bidirectional",
+			LastSync:  time.Now(),
+		}); err != nil {
+			m.addLog(fmt.Sprintf("Erro ao salvar registro de sync: %v", err))
+		}
+		m.addLog(fmt.Sprintf("Sincronização %s iniciada com sucesso em %s.", msg.syncID, msg.host))
 	}
-
-	m.addLog(fmt.Sprintf("Sincronização %s iniciada com sucesso em %s.", msg.syncID, msg.host))
 
 	engine := msg.engine
 	syncID := msg.syncID
@@ -1181,6 +1347,93 @@ func (m *AppModel) checkTmuxCmd() tea.Cmd {
 		}
 		return tmuxSessionsMsg(sessions)
 	}
+}
+
+// checkProjectsCmd retorna um comando assíncrono que descobre monorepos
+// (raízes de repositório git) no workspace do host ativo.
+func (m *AppModel) checkProjectsCmd() tea.Cmd {
+	return func() tea.Msg {
+		hostCfg, ok := m.cfg.Hosts[m.activeHost]
+		if !ok {
+			return projectsMsg(nil)
+		}
+
+		client, err := m.getOrCreateSSHClient(m.activeHost, &hostCfg)
+		if err != nil {
+			return projectsMsg(nil)
+		}
+
+		ws := hostCfg.Workspace
+		if ws == "" {
+			ws = "."
+		}
+
+		// maxdepth 2 cobre tanto um monorepo na raiz do workspace quanto vários
+		// monorepos organizados em subpastas dele.
+		discoverCmd := fmt.Sprintf(
+			`for d in $(find %s -maxdepth 2 -type d -name .git -prune -print 2>/dev/null); do `+
+				`p=$(dirname "$d"); echo "$p|$(git -C "$p" rev-parse --abbrev-ref HEAD 2>/dev/null)"; done`,
+			shellQuote(ws),
+		)
+
+		stdout, _, err := client.RunCommand(discoverCmd)
+		if err != nil {
+			return projectsMsg(nil)
+		}
+
+		var projects []Project
+		lines := strings.Split(strings.TrimSpace(stdout), "\n")
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			parts := strings.SplitN(line, "|", 2)
+			path := strings.TrimSpace(parts[0])
+			if path == "" {
+				continue
+			}
+			branch := ""
+			if len(parts) == 2 {
+				branch = strings.TrimSpace(parts[1])
+			}
+			projects = append(projects, Project{
+				Path:   path,
+				Name:   filepath.Base(path),
+				Branch: branch,
+			})
+		}
+		return projectsMsg(projects)
+	}
+}
+
+// captureProjectCmd busca o tail recente do pane Tmux de um projeto (a sessão
+// tmux é nomeada igual ao projeto — ver o atalho "c" na aba Projetos).
+func (m *AppModel) captureProjectCmd(name string) tea.Cmd {
+	host := m.activeHost
+	return func() tea.Msg {
+		hostCfg, ok := m.cfg.Hosts[host]
+		if !ok {
+			return nil
+		}
+
+		client, err := m.getOrCreateSSHClient(host, &hostCfg)
+		if err != nil {
+			return nil
+		}
+
+		stdout, _, err := client.RunCommand(fmt.Sprintf("tmux capture-pane -pt %s -S -200 2>/dev/null", shellQuote(name)))
+		if err != nil {
+			return nil
+		}
+
+		return projectOutputMsg{name: name, output: stdout}
+	}
+}
+
+// shellQuote coloca uma string entre aspas simples seguras para uso em shell POSIX
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // handleOnboardingSubmit processa a etapa do assistente de onboarding
