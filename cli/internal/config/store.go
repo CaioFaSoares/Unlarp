@@ -28,6 +28,7 @@ type Host struct {
 	Key       string `yaml:"key"`
 	Workspace string `yaml:"workspace"`
 	Container string `yaml:"container,omitempty"` // Para operações Docker diretas (local only)
+	Password  string `yaml:"-"`                   // Usado apenas em memória para bootstrap/setup
 }
 
 // SyncConfig contém as configurações globais de sincronização

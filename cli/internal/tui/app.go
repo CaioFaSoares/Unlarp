@@ -59,9 +59,7 @@ type obSetupFinishedMsg struct {
 	err error
 }
 
-type obSetupFinishedMsgType struct {
-	err error
-}
+type obVpsPasswordRequiredMsg struct{}
 
 // AppModel é o modelo central do Bubble Tea
 type AppModel struct {
@@ -110,6 +108,7 @@ type AppModel struct {
 	obUser         string
 	obWorkspace    string
 	obSetupKey     bool
+	obPassword     string
 
 	// Logs
 	logs []string
@@ -243,11 +242,20 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case obSetupFinishedMsg:
 		if msg.err != nil {
 			m.addLog(fmt.Sprintf("Erro de setup: %v", msg.err))
+			m.onboardingStep = 8 // se falhou feio mesmo com senha, vai pro fim (mas mostrando erro na TUI)
 		} else {
 			m.addLog("Chave SSH pública injetada com sucesso.")
+			m.onboardingStep = 8
 		}
-		m.onboardingStep = 8
 		m.textInput.Blur()
+
+	case obVpsPasswordRequiredMsg:
+		m.onboardingStep = 9
+		m.textInput.SetValue("")
+		m.textInput.Placeholder = "Senha SSH da VPS"
+		m.textInput.EchoMode = textinput.EchoPassword
+		m.textInput.Focus()
+		cmds = append(cmds, textinput.Blink)
 
 	case spinner.TickMsg:
 		var cmd tea.Cmd
@@ -1128,6 +1136,12 @@ func (m *AppModel) handleOnboardingSubmit() tea.Cmd {
 		_ = m.finalizeOnboarding()
 		m.sessMgr.SetActive(m.activeHost)
 		m.isOnboarding = false
+	case 9: // VPS Password submitted
+		m.obPassword = val
+		m.onboardingStep = 7 // Voltar para processando spinner
+		m.textInput.Blur()
+		m.textInput.EchoMode = textinput.EchoNormal // restaurar
+		return m.runSSHKeySetupCmd()
 	}
 	return nil
 }
@@ -1207,6 +1221,7 @@ func (m *AppModel) runSSHKeySetupCmd() tea.Cmd {
 			Port:      22,
 			User:      m.obUser,
 			Workspace: m.obWorkspace,
+			Password:  m.obPassword,
 		}
 
 		vpsClient, err := internalssh.NewClient(&vpsHost)
@@ -1224,6 +1239,12 @@ func (m *AppModel) runSSHKeySetupCmd() tea.Cmd {
 					err = nil
 				}
 			}
+
+			// Se ainda assim falhou e não temos senha fornecida, solicita a senha interativamente na TUI
+			if err != nil && m.obPassword == "" {
+				return obVpsPasswordRequiredMsg{}
+			}
+
 			if err != nil {
 				return obSetupFinishedMsg{err: fmt.Errorf("conexão direta falhou e não foi possível conectar ao host VPS (porta 22): %w", err)}
 			}
