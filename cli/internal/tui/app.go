@@ -358,6 +358,47 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 
+		case "d":
+			// Atalho alternativo para deletar host selecionado na barra lateral
+			if m.sidebarFocus && len(m.hostNames) > 0 {
+				hostToDelete := m.hostNames[m.selectedHost]
+				store := config.NewStore()
+				if err := store.RemoveHost(hostToDelete); err == nil {
+					m.addLog(fmt.Sprintf("Host '%s' deletado com sucesso.", hostToDelete))
+					
+					cfg, errCfg := store.Load()
+					if errCfg == nil {
+						m.cfg = cfg
+						var hostNames []string
+						for name := range cfg.Hosts {
+							hostNames = append(hostNames, name)
+						}
+						m.hostNames = hostNames
+						
+						if len(hostNames) == 0 {
+							m.isOnboarding = true
+							m.onboardingStep = 0
+							m.obProfileName = ""
+							m.obHost = ""
+							m.obPort = 2222
+							m.obUser = "root"
+							m.obWorkspace = "/workspace"
+							m.textInput.SetValue("")
+							m.textInput.Placeholder = ""
+							m.textInput.Blur()
+						} else {
+							m.selectedHost = 0
+							m.activeHost = m.hostNames[0]
+							m.sessMgr.SetActive(m.activeHost)
+							_ = store.SetDefault(m.activeHost)
+						}
+					}
+				} else {
+					m.addLog(fmt.Sprintf("Erro ao deletar host: %v", err))
+				}
+				return m, nil
+			}
+
 		case "c":
 			// Atalho para abrir terminal interativo SSH (usando Tmux por padrão)
 			sessionName := "unlarp"
@@ -409,11 +450,50 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "x":
-			// Atalho para excluir item selecionado na aba atual
+			// Atalho para excluir item selecionado na aba atual ou deletar host na barra lateral
 			if !m.sidebarFocus {
 				cmd := m.handleDeleteSelection()
 				if cmd != nil {
 					cmds = append(cmds, cmd)
+				}
+			} else {
+				// Deleta o host selecionado na barra lateral
+				if len(m.hostNames) > 0 {
+					hostToDelete := m.hostNames[m.selectedHost]
+					store := config.NewStore()
+					if err := store.RemoveHost(hostToDelete); err == nil {
+						m.addLog(fmt.Sprintf("Host '%s' deletado com sucesso.", hostToDelete))
+						
+						cfg, errCfg := store.Load()
+						if errCfg == nil {
+							m.cfg = cfg
+							var hostNames []string
+							for name := range cfg.Hosts {
+								hostNames = append(hostNames, name)
+							}
+							m.hostNames = hostNames
+							
+							if len(hostNames) == 0 {
+								m.isOnboarding = true
+								m.onboardingStep = 0
+								m.obProfileName = ""
+								m.obHost = ""
+								m.obPort = 2222
+								m.obUser = "root"
+								m.obWorkspace = "/workspace"
+								m.textInput.SetValue("")
+								m.textInput.Placeholder = ""
+								m.textInput.Blur()
+							} else {
+								m.selectedHost = 0
+								m.activeHost = m.hostNames[0]
+								m.sessMgr.SetActive(m.activeHost)
+								_ = store.SetDefault(m.activeHost)
+							}
+						}
+					} else {
+						m.addLog(fmt.Sprintf("Erro ao deletar host: %v", err))
+					}
 				}
 			}
 		}
@@ -535,10 +615,12 @@ func (m AppModel) renderFooter() string {
 		))
 	} else {
 		// Footer contextualizado
-		actions := "%s Navegar | %s Confirmar | %s Mudar Foco | %s Sair"
+		actions := "%s Navegar | %s Confirmar | %s Adicionar Host | %s Deletar Host | %s Mudar Foco | %s Sair"
 		keys := []string{
 			styles.KeyStyle.Render("↑/↓/j/k"),
 			styles.KeyStyle.Render("Enter"),
+			styles.KeyStyle.Render("a"),
+			styles.KeyStyle.Render("x/d"),
 			styles.KeyStyle.Render("Tab"),
 			styles.KeyStyle.Render("q"),
 		}

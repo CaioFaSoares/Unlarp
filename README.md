@@ -150,6 +150,8 @@ A aba **Dashboard** da TUI mostra a lista de sessões virtuais Tmux ativas no se
   - Na barra lateral: Seleciona um host diferente.
   - No painel principal: Navega pelas tabelas de **Syncs**, **Túneis** e lista de **Sessões Tmux** (na aba Dashboard).
 - **`Enter`**: Define o host selecionado como a sessão ativa no CLI.
+- **`a`**: Adiciona um novo host remotamente chamando o Onboarding Wizard.
+- **`x` ou `d`**: Deleta o host selecionado na barra lateral, ou encerra o item selecionado (sync, túnel ou sessão Tmux remota) na aba ativa do painel principal.
 - **`Setas Esquerda/Direita`**: Navega entre as abas do painel principal (Dashboard ↔ Syncs ↔ Túneis ↔ Logs).
 - **`c`**: Conecta/anexa (attach) na sessão Tmux selecionada no Dashboard.
 - **`n`**: Abre o prompt na aba Dashboard para criar uma nova sessão Tmux remota nomeada.
