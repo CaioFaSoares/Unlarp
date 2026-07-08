@@ -1236,7 +1236,22 @@ func (m *AppModel) startSyncEngine(host, syncID, absLocal, remoteDir string, cli
 	// diretório remoto — por isso esta função sempre deve rodar fora de
 	// Update() (dentro de um tea.Cmd), nunca no goroutine principal da TUI.
 	pollInterval := m.cfg.Sync.PollIntervalDuration()
-	remoteWatcher := watcher.NewRemoteWatcher(remoteDir, sftpCli, pollInterval, engine.IgnoreMatcher(), func() {
+	remoteWatcher := watcher.NewRemoteWatcher(remoteDir, sftpCli, pollInterval, engine.IgnoreMatcher(), m.addLog, func() (*sftp.Client, error) {
+		hostCfg, ok := m.cfg.Hosts[host]
+		if !ok {
+			return nil, fmt.Errorf("host '%s' não configurado", host)
+		}
+		newClient, err := m.getOrCreateSSHClient(host, &hostCfg)
+		if err != nil {
+			return nil, err
+		}
+		newSFTP, err := m.getOrCreateSFTPClient(host, newClient)
+		if err != nil {
+			return nil, err
+		}
+		engine.UpdateSFTPClient(newSFTP)
+		return newSFTP, nil
+	}, func() {
 		go func() {
 			_, err := engine.SyncExec()
 			if err != nil {
@@ -1459,6 +1474,9 @@ func (m *AppModel) getOrCreateSSHClient(hostName string, hostCfg *config.Host) (
 	}
 
 	m.sshClients[hostName] = newClient
+	// A conexão SSH foi recriada, então qualquer *sftp.Client em cache está
+	// preso à conexão morta anterior — descarta para forçar a recriação.
+	delete(m.sftpClients, hostName)
 	return newClient, nil
 }
 

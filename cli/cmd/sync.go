@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/olekukonko/tablewriter"
+	"github.com/pkg/sftp"
 	"github.com/spf13/cobra"
 
 	"github.com/CaioFaSoares/unlarp/internal/config"
@@ -261,7 +262,27 @@ func runSyncStart(cmd *cobra.Command, args []string) error {
 
 	// Inicia o Remote Watcher (SFTP poll)
 	// Como precisamos de um ignore matcher que seja gerado localmente, passamos o matcher da engine
-	remoteWatcher := watcher.NewRemoteWatcher(remoteDir, sftpClient.Inner(), pollInterval, engine.IgnoreMatcher(), func() {
+	remoteWatcher := watcher.NewRemoteWatcher(remoteDir, sftpClient.Inner(), pollInterval, engine.IgnoreMatcher(), func(msg string) {
+		ui.Warn("%s", msg)
+	}, func() (*sftp.Client, error) {
+		newSSH, err := internalssh.NewClient(hostCfg)
+		if err != nil {
+			return nil, err
+		}
+		if err := newSSH.Connect(); err != nil {
+			return nil, err
+		}
+		newSFTP, err := internalssh.NewSFTPClient(newSSH)
+		if err != nil {
+			newSSH.Close()
+			return nil, err
+		}
+		sshClient.Close()
+		sshClient = newSSH
+		sftpClient = newSFTP
+		engine.UpdateSFTPClient(newSFTP.Inner())
+		return newSFTP.Inner(), nil
+	}, func() {
 		select {
 		case triggerSync <- "mudança remota":
 		default:

@@ -69,6 +69,14 @@ func NewEngine(id string, localDir, remoteDir, hostName string, globalIgnores []
 	return e, nil
 }
 
+// UpdateSFTPClient troca o cliente SFTP usado pela engine (ex: após uma
+// reconexão SSH invalidar o cliente anterior).
+func (e *Engine) UpdateSFTPClient(client *sftp.Client) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.sftpClient = client
+}
+
 // SyncExec executa um ciclo completo de sincronização de três vias
 func (e *Engine) SyncExec() (int, error) {
 	e.mu.Lock()
