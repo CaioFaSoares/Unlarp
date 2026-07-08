@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -66,11 +67,12 @@ type TmuxSession struct {
 
 type tmuxSessionsMsg []TmuxSession
 
-// Project representa um monorepo (raiz de repositório git) descoberto no workspace do host
+// Project representa um projeto cadastrado manualmente no host (ver config.Project)
 type Project struct {
-	Path   string
-	Name   string
-	Branch string
+	Path     string
+	Name     string
+	Branch   string
+	LocalDir string // pasta local vinculada, se um sync foi criado no cadastro
 }
 
 type projectsMsg []Project
@@ -106,6 +108,17 @@ type syncStartedMsg struct {
 	restored      bool // true quando religado automaticamente a partir do state persistido, não criado pelo usuário agora
 }
 
+// Índices das abas do painel principal — Dashboard e Projetos ficam lado a lado
+// por serem as mais usadas no dia a dia.
+const (
+	tabDashboard = iota
+	tabProjects
+	tabSyncs
+	tabTunnels
+	tabLogs
+	tabCount
+)
+
 // AppModel é o modelo central do Bubble Tea
 type AppModel struct {
 	width  int
@@ -118,7 +131,7 @@ type AppModel struct {
 	activeHost   string
 
 	// Abas e Foco
-	activeTab    int  // 0: Dashboard, 1: Syncs, 2: Tunnels, 3: Logs
+	activeTab    int  // ver consts tabDashboard/tabProjects/tabSyncs/tabTunnels/tabLogs
 	sidebarFocus bool // true: foco na barra lateral, false: no painel principal
 
 	// Seleção de linhas nas abas
@@ -150,7 +163,7 @@ type AppModel struct {
 	// Sessões Tmux
 	tmuxSessions []TmuxSession
 
-	// Projetos (monorepos descobertos automaticamente no workspace do host)
+	// Projetos (cadastrados manualmente por host, ver config.Project)
 	projects           []Project
 	selectedProjectRow int
 	projectOutput      map[string]string
@@ -227,7 +240,7 @@ func NewAppModel() (*AppModel, error) {
 		hostNames:      hostNames,
 		selectedHost:   selected,
 		activeHost:     active,
-		activeTab:      0,
+		activeTab:      tabDashboard,
 		sidebarFocus:   true,
 		promptActive:   false,
 		textInput:      ti,
@@ -298,7 +311,8 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, cmd)
 
 		if m.dirPicker.Confirmed {
-			if m.pickerStage == "local" {
+			switch m.pickerStage {
+			case "local":
 				m.chosenLocal = m.dirPicker.SelectedPath
 				m.pickerStage = "remote"
 				m.addLog(fmt.Sprintf("Diretório local selecionado: %s. Conectando a %s para escolher o remoto...", m.chosenLocal, m.activeHost))
@@ -329,7 +343,8 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 				// Inicia picker remoto no diretório workspace configurado do host
 				m.dirPicker = ui.NewDirPicker(true, sftpCli, hostCfg.Workspace)
-			} else {
+
+			case "remote":
 				// Confirmado remoto!
 				m.chosenRemote = m.dirPicker.SelectedPath
 				m.pickerActive = false
@@ -346,6 +361,28 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 				// Inicia o sync em tempo real em background, sem travar a TUI
 				cmds = append(cmds, m.createSyncLiveCmd(syncID, fmt.Sprintf("%s:%s", m.chosenLocal, m.chosenRemote)))
+
+			case "project_remote":
+				// Cadastro de projeto: pasta remota escolhida, pergunta se já
+				// quer vincular um sync antes de gravar no config.
+				m.chosenRemote = m.dirPicker.SelectedPath
+				m.pickerActive = false
+				m.addLog(fmt.Sprintf("Pasta do projeto selecionada: %s", m.chosenRemote))
+
+				m.promptActive = true
+				m.promptType = "project_sync_confirm"
+				m.textInput.SetValue("s") // Enter direto já confirma "sim", igual ao onboarding
+				m.textInput.Placeholder = "s/n"
+				m.textInput.Focus()
+				cmds = append(cmds, textinput.Blink)
+
+			case "project_local":
+				// Cadastro de projeto com sync: pasta local escolhida, grava o
+				// projeto e inicia o sync no mesmo fluxo já usado pela aba Syncs.
+				m.chosenLocal = m.dirPicker.SelectedPath
+				m.pickerActive = false
+				m.registerProject(m.chosenRemote, m.chosenLocal)
+				cmds = append(cmds, m.createSyncLiveCmd("s-"+generateRandomString(6), fmt.Sprintf("%s:%s", m.chosenLocal, m.chosenRemote)))
 			}
 		} else if m.dirPicker.Cancelled {
 			m.pickerActive = false
@@ -377,7 +414,7 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 
-			if m.activeTab == 4 && len(m.projects) > 0 {
+			if m.activeTab == tabProjects && len(m.projects) > 0 {
 				idx := m.selectedProjectRow
 				if idx >= len(m.projects) {
 					idx = 0
@@ -394,6 +431,14 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case projectsMsg:
 		m.projects = msg
+		// Projetos com sync ativo sobem para o topo — "ativos" separados do
+		// resto sem precisar de um passo extra de curadoria manual.
+		if sess, ok := m.sessMgr.GetSession(m.activeHost); ok {
+			sort.SliceStable(m.projects, func(i, j int) bool {
+				return matchProjectSync(sess.Syncs, m.projects[i].Path) != nil &&
+					matchProjectSync(sess.Syncs, m.projects[j].Path) == nil
+			})
+		}
 		if m.selectedProjectRow >= len(m.projects) {
 			m.selectedProjectRow = 0
 		}
@@ -496,9 +541,9 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "left", "right":
 			if !m.sidebarFocus {
 				if msg.String() == "left" {
-					m.activeTab = (m.activeTab - 1 + 5) % 5
+					m.activeTab = (m.activeTab - 1 + tabCount) % tabCount
 				} else {
-					m.activeTab = (m.activeTab + 1) % 5
+					m.activeTab = (m.activeTab + 1) % tabCount
 				}
 				m.selectedSyncRow = 0
 				m.selectedTunnelRow = 0
@@ -542,6 +587,34 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.textInput.SetValue("")
 				m.textInput.Placeholder = ""
 				m.textInput.Blur()
+				return m, nil
+			}
+
+			// Atalho para cadastrar um projeto (aba Projetos): abre o navegador
+			// remoto na workspace do host para escolher a pasta do projeto.
+			if !m.sidebarFocus && m.activeTab == tabProjects {
+				hostCfg, ok := m.cfg.Hosts[m.activeHost]
+				if !ok {
+					m.addLog("Erro: Host ativo não configurado.")
+					return m, nil
+				}
+
+				client, err := m.getOrCreateSSHClient(m.activeHost, &hostCfg)
+				if err != nil {
+					m.addLog(fmt.Sprintf("Erro SSH ao conectar em %s: %v", m.activeHost, err))
+					return m, nil
+				}
+
+				sftpCli, err := m.getOrCreateSFTPClient(m.activeHost, client)
+				if err != nil {
+					m.addLog(fmt.Sprintf("Erro SFTP ao conectar em %s: %v", m.activeHost, err))
+					return m, nil
+				}
+
+				m.addLog(fmt.Sprintf("Navegue até a pasta do projeto em %s e confirme (Tab/s).", m.activeHost))
+				m.pickerActive = true
+				m.pickerStage = "project_remote"
+				m.dirPicker = ui.NewDirPicker(true, sftpCli, hostCfg.Workspace)
 				return m, nil
 			}
 
@@ -591,9 +664,9 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			sessionName := "unlarp"
 			cwd := ""
 			if !m.sidebarFocus {
-				if m.activeTab == 0 && len(m.tmuxSessions) > 0 {
+				if m.activeTab == tabDashboard && len(m.tmuxSessions) > 0 {
 					sessionName = m.tmuxSessions[m.selectedTmuxRow].Name
-				} else if m.activeTab == 4 && len(m.projects) > 0 {
+				} else if m.activeTab == tabProjects && len(m.projects) > 0 {
 					proj := m.projects[m.selectedProjectRow]
 					sessionName = proj.Name
 					cwd = proj.Path
@@ -617,7 +690,7 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case "n":
 			// Atalho para criar nova sessão Tmux remota (somente na aba Dashboard e fora da barra lateral)
-			if !m.sidebarFocus && m.activeTab == 0 {
+			if !m.sidebarFocus && m.activeTab == tabDashboard {
 				m.promptType = "new_tmux_session"
 				m.promptActive = true
 				m.textInput.SetValue("")
@@ -825,7 +898,7 @@ func (m AppModel) renderFooter() string {
 		}
 
 		if !m.sidebarFocus {
-			if m.activeTab == 0 {
+			if m.activeTab == tabDashboard {
 				actions = "%s Navegar | %s SSH Attach | %s Nova Sessão | %s Destruir Sessão | %s Mudar Foco | %s Sair"
 				keys = []string{
 					styles.KeyStyle.Render("↑/↓/j/k"),
@@ -835,7 +908,7 @@ func (m AppModel) renderFooter() string {
 					styles.KeyStyle.Render("Tab"),
 					styles.KeyStyle.Render("q"),
 				}
-			} else if m.activeTab == 1 {
+			} else if m.activeTab == tabSyncs {
 				actions = "%s Navegar | %s Novo Sync | %s Parar Sync | %s Mudar Foco | %s Sair"
 				keys = []string{
 					styles.KeyStyle.Render("↑/↓/j/k"),
@@ -844,7 +917,7 @@ func (m AppModel) renderFooter() string {
 					styles.KeyStyle.Render("Tab"),
 					styles.KeyStyle.Render("q"),
 				}
-			} else if m.activeTab == 2 {
+			} else if m.activeTab == tabTunnels {
 				actions = "%s Navegar | %s Novo Túnel | %s Parar Túnel | %s Mudar Foco | %s Sair"
 				keys = []string{
 					styles.KeyStyle.Render("↑/↓/j/k"),
@@ -853,11 +926,13 @@ func (m AppModel) renderFooter() string {
 					styles.KeyStyle.Render("Tab"),
 					styles.KeyStyle.Render("q"),
 				}
-			} else if m.activeTab == 4 {
-				actions = "%s Navegar | %s Abrir Sessão no Projeto | %s Mudar Foco | %s Sair"
+			} else if m.activeTab == tabProjects {
+				actions = "%s Navegar | %s Cadastrar Projeto | %s Abrir Sessão | %s Remover | %s Mudar Foco | %s Sair"
 				keys = []string{
 					styles.KeyStyle.Render("↑/↓/j/k"),
+					styles.KeyStyle.Render("a"),
 					styles.KeyStyle.Render("c"),
+					styles.KeyStyle.Render("x"),
 					styles.KeyStyle.Render("Tab"),
 					styles.KeyStyle.Render("q"),
 				}
@@ -878,7 +953,7 @@ func (m AppModel) renderFooter() string {
 }
 
 func (m *AppModel) handleMainPanelUp() {
-	if m.activeTab == 4 {
+	if m.activeTab == tabProjects {
 		if len(m.projects) > 0 {
 			m.selectedProjectRow = (m.selectedProjectRow - 1 + len(m.projects)) % len(m.projects)
 		}
@@ -890,17 +965,17 @@ func (m *AppModel) handleMainPanelUp() {
 		return
 	}
 
-	if m.activeTab == 0 && len(m.tmuxSessions) > 0 {
+	if m.activeTab == tabDashboard && len(m.tmuxSessions) > 0 {
 		m.selectedTmuxRow = (m.selectedTmuxRow - 1 + len(m.tmuxSessions)) % len(m.tmuxSessions)
-	} else if m.activeTab == 1 && len(sess.Syncs) > 0 {
+	} else if m.activeTab == tabSyncs && len(sess.Syncs) > 0 {
 		m.selectedSyncRow = (m.selectedSyncRow - 1 + len(sess.Syncs)) % len(sess.Syncs)
-	} else if m.activeTab == 2 && len(sess.Tunnels) > 0 {
+	} else if m.activeTab == tabTunnels && len(sess.Tunnels) > 0 {
 		m.selectedTunnelRow = (m.selectedTunnelRow - 1 + len(sess.Tunnels)) % len(sess.Tunnels)
 	}
 }
 
 func (m *AppModel) handleMainPanelDown() {
-	if m.activeTab == 4 {
+	if m.activeTab == tabProjects {
 		if len(m.projects) > 0 {
 			m.selectedProjectRow = (m.selectedProjectRow + 1) % len(m.projects)
 		}
@@ -912,11 +987,11 @@ func (m *AppModel) handleMainPanelDown() {
 		return
 	}
 
-	if m.activeTab == 0 && len(m.tmuxSessions) > 0 {
+	if m.activeTab == tabDashboard && len(m.tmuxSessions) > 0 {
 		m.selectedTmuxRow = (m.selectedTmuxRow + 1) % len(m.tmuxSessions)
-	} else if m.activeTab == 1 && len(sess.Syncs) > 0 {
+	} else if m.activeTab == tabSyncs && len(sess.Syncs) > 0 {
 		m.selectedSyncRow = (m.selectedSyncRow + 1) % len(sess.Syncs)
-	} else if m.activeTab == 2 && len(sess.Tunnels) > 0 {
+	} else if m.activeTab == tabTunnels && len(sess.Tunnels) > 0 {
 		m.selectedTunnelRow = (m.selectedTunnelRow + 1) % len(sess.Tunnels)
 	}
 }
@@ -950,8 +1025,39 @@ func (m *AppModel) handlePromptSubmit() tea.Cmd {
 		return m.createSyncLiveCmd("s-"+generateRandomString(6), val)
 	case "new_tmux_session":
 		return m.createTmuxSessionCmd(val)
+	case "project_sync_confirm":
+		if strings.HasPrefix(strings.ToLower(val), "s") {
+			// Quer sync junto: abre o picker local para escolher a pasta que
+			// vai sincronizar com o projeto (fluxo ideal do cadastro).
+			m.pickerActive = true
+			m.pickerStage = "project_local"
+			m.dirPicker = ui.NewDirPicker(false, nil, ".")
+		} else {
+			m.registerProject(m.chosenRemote, "")
+		}
 	}
 	return nil
+}
+
+// registerProject cadastra um projeto (pasta remota, opcionalmente vinculada a
+// uma pasta local sincronizada) no host ativo e recarrega a config em memória.
+func (m *AppModel) registerProject(remotePath, localDir string) {
+	name := filepath.Base(remotePath)
+	store := config.NewStore()
+	if err := store.AddProject(m.activeHost, config.Project{
+		Name:       name,
+		RemotePath: remotePath,
+		LocalDir:   localDir,
+	}); err != nil {
+		m.addLog(fmt.Sprintf("Erro ao cadastrar projeto: %v", err))
+		return
+	}
+
+	if cfg, err := store.Load(); err == nil {
+		m.cfg = cfg
+	}
+
+	m.addLog(fmt.Sprintf("Projeto '%s' cadastrado em %s.", name, m.activeHost))
 }
 
 // createTunnelLive inicializa o túnel em background na TUI
@@ -1259,19 +1365,41 @@ func (m *AppModel) handleSyncStarted(msg syncStartedMsg) {
 
 // handleDeleteSelection deleta o item que está selecionado na view ativa
 func (m *AppModel) handleDeleteSelection() tea.Cmd {
+	if m.activeTab == tabProjects && len(m.projects) > 0 {
+		// Remove só o cadastro do projeto — o sync vinculado (se houver)
+		// continua rodando e gerenciável normalmente pela aba Syncs.
+		proj := m.projects[m.selectedProjectRow]
+		store := config.NewStore()
+		if err := store.RemoveProject(m.activeHost, proj.Path); err != nil {
+			m.addLog(fmt.Sprintf("Erro ao remover projeto: %v", err))
+		} else {
+			if cfg, err := store.Load(); err == nil {
+				m.cfg = cfg
+			}
+			// Remove da lista em memória imediatamente — sem isso a linha só
+			// sumiria no próximo tick do checkProjectsCmd (até 1s depois).
+			m.projects = append(m.projects[:m.selectedProjectRow], m.projects[m.selectedProjectRow+1:]...)
+			if m.selectedProjectRow >= len(m.projects) {
+				m.selectedProjectRow = 0
+			}
+			m.addLog(fmt.Sprintf("Projeto '%s' removido.", proj.Name))
+		}
+		return nil
+	}
+
 	sess, ok := m.sessMgr.GetSession(m.activeHost)
 	if !ok {
 		return nil
 	}
 
-	if m.activeTab == 0 && len(m.tmuxSessions) > 0 {
+	if m.activeTab == tabDashboard && len(m.tmuxSessions) > 0 {
 		name := m.tmuxSessions[m.selectedTmuxRow].Name
 		m.addLog(fmt.Sprintf("Finalizando sessão Tmux %s...", name))
 		m.selectedTmuxRow = 0
 		return m.killTmuxSessionCmd(name)
 	}
 
-	if m.activeTab == 1 && len(sess.Syncs) > 0 {
+	if m.activeTab == tabSyncs && len(sess.Syncs) > 0 {
 		// Para o sync selecionado
 		s := sess.Syncs[m.selectedSyncRow]
 		
@@ -1295,7 +1423,7 @@ func (m *AppModel) handleDeleteSelection() tea.Cmd {
 		m.addLog(fmt.Sprintf("Sessão de sync %s parada e removida.", s.ID))
 		m.selectedSyncRow = 0
 
-	} else if m.activeTab == 2 && len(sess.Tunnels) > 0 {
+	} else if m.activeTab == tabTunnels && len(sess.Tunnels) > 0 {
 		// Para o túnel selecionado
 		t := sess.Tunnels[m.selectedTunnelRow]
 
@@ -1426,58 +1554,48 @@ func (m *AppModel) checkTmuxCmd() tea.Cmd {
 	}
 }
 
-// checkProjectsCmd retorna um comando assíncrono que descobre monorepos
-// (raízes de repositório git) no workspace do host ativo.
+// checkProjectsCmd retorna um comando assíncrono que atualiza a branch atual
+// de cada projeto já cadastrado (config.Host.Projects) no host ativo.
 func (m *AppModel) checkProjectsCmd() tea.Cmd {
 	return func() tea.Msg {
 		hostCfg, ok := m.cfg.Hosts[m.activeHost]
-		if !ok {
+		if !ok || len(hostCfg.Projects) == 0 {
 			return projectsMsg(nil)
 		}
 
-		client, err := m.getOrCreateSSHClient(m.activeHost, &hostCfg)
-		if err != nil {
-			return projectsMsg(nil)
+		// Branca é best-effort: se a conexão ou o comando falharem, os projetos
+		// cadastrados ainda devem aparecer (só sem a branch preenchida) — um
+		// projeto não deixa de existir por não ser repositório git ou por um
+		// hiccup de rede.
+		branches := make(map[string]string)
+		if client, err := m.getOrCreateSSHClient(m.activeHost, &hostCfg); err == nil {
+			var paths strings.Builder
+			for _, p := range hostCfg.Projects {
+				paths.WriteString(shellQuote(p.RemotePath))
+				paths.WriteString(" ")
+			}
+			branchCmd := fmt.Sprintf(
+				`for p in %s; do echo "$p|$(git -C "$p" rev-parse --abbrev-ref HEAD 2>/dev/null)"; done`,
+				strings.TrimSpace(paths.String()),
+			)
+
+			if stdout, _, err := client.RunCommand(branchCmd); err == nil {
+				for _, line := range strings.Split(strings.TrimSpace(stdout), "\n") {
+					parts := strings.SplitN(strings.TrimSpace(line), "|", 2)
+					if len(parts) == 2 {
+						branches[parts[0]] = strings.TrimSpace(parts[1])
+					}
+				}
+			}
 		}
 
-		ws := hostCfg.Workspace
-		if ws == "" {
-			ws = "."
-		}
-
-		// maxdepth 2 cobre tanto um monorepo na raiz do workspace quanto vários
-		// monorepos organizados em subpastas dele.
-		discoverCmd := fmt.Sprintf(
-			`for d in $(find %s -maxdepth 2 -type d -name .git -prune -print 2>/dev/null); do `+
-				`p=$(dirname "$d"); echo "$p|$(git -C "$p" rev-parse --abbrev-ref HEAD 2>/dev/null)"; done`,
-			shellQuote(ws),
-		)
-
-		stdout, _, err := client.RunCommand(discoverCmd)
-		if err != nil {
-			return projectsMsg(nil)
-		}
-
-		var projects []Project
-		lines := strings.Split(strings.TrimSpace(stdout), "\n")
-		for _, line := range lines {
-			line = strings.TrimSpace(line)
-			if line == "" {
-				continue
-			}
-			parts := strings.SplitN(line, "|", 2)
-			path := strings.TrimSpace(parts[0])
-			if path == "" {
-				continue
-			}
-			branch := ""
-			if len(parts) == 2 {
-				branch = strings.TrimSpace(parts[1])
-			}
+		projects := make([]Project, 0, len(hostCfg.Projects))
+		for _, p := range hostCfg.Projects {
 			projects = append(projects, Project{
-				Path:   path,
-				Name:   filepath.Base(path),
-				Branch: branch,
+				Path:     p.RemotePath,
+				Name:     p.Name,
+				Branch:   branches[p.RemotePath],
+				LocalDir: p.LocalDir,
 			})
 		}
 		return projectsMsg(projects)
