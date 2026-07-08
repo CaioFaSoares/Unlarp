@@ -18,20 +18,26 @@ func (m AppModel) renderSyncs(width, height int) string {
 	}
 
 	sb.WriteString(styles.TableHeaderStyle.Width(width).Render(
-		fmt.Sprintf("  %-8s %-20s %-20s %-8s", "SESSION", "LOCAL DIR", "REMOTE DIR", "MODE"),
+		fmt.Sprintf("  %-8s %-18s %-18s %-8s %-14s", "SESSION", "LOCAL DIR", "REMOTE DIR", "MODE", "PROJECT"),
 	))
 	sb.WriteString("\n")
 
 	for i, s := range sess.Syncs {
 		// Trunca caminhos longos para caber na TUI
-		localDir := truncatePath(s.LocalDir, 20)
-		remoteDir := truncatePath(s.RemoteDir, 20)
+		localDir := truncatePath(s.LocalDir, 18)
+		remoteDir := truncatePath(s.RemoteDir, 18)
 
-		line := fmt.Sprintf("  %-8s %-20s %-20s %-8s",
+		projectName := matchProjectName(m.projects, s.RemoteDir)
+		if projectName == "" {
+			projectName = "—"
+		}
+
+		line := fmt.Sprintf("  %-8s %-18s %-18s %-8s %-14s",
 			s.ID,
 			localDir,
 			remoteDir,
 			s.Mode,
+			projectName,
 		)
 
 		if i == m.selectedSyncRow && !m.sidebarFocus {
