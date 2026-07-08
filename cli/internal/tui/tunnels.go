@@ -7,7 +7,7 @@ import (
 	"github.com/CaioFaSoares/unlarp/internal/tui/styles"
 )
 
-func (m AppModel) renderTunnels(width, height int) string {
+func (m *AppModel) renderTunnels(width, height int) string {
 	var sb strings.Builder
 
 	sess, ok := m.sessMgr.GetSession(m.activeHost)

@@ -10,7 +10,7 @@ import (
 )
 
 // renderOnboarding desenha a tela de onboarding sequencial
-func (m AppModel) renderOnboarding(width, height int) string {
+func (m *AppModel) renderOnboarding(width, height int) string {
 	var sb strings.Builder
 
 	// Centralização

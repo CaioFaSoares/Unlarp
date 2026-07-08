@@ -55,11 +55,11 @@ func (s *Spinner) Stop() {
 // StopWithSuccess para o spinner e mostra mensagem de sucesso
 func (s *Spinner) StopWithSuccess(message string) {
 	s.Stop()
-	Success(message)
+	Success("%s", message)
 }
 
 // StopWithError para o spinner e mostra mensagem de erro
 func (s *Spinner) StopWithError(message string) {
 	s.Stop()
-	Error(message)
+	Error("%s", message)
 }

@@ -10,7 +10,7 @@ import (
 )
 
 // renderMainPanel desenha a barra de abas e o conteúdo da aba selecionada
-func (m AppModel) renderMainPanel(width, height int) string {
+func (m *AppModel) renderMainPanel(width, height int) string {
 	tabs := []string{"Dashboard", "Projetos", "Syncs", "Túneis", "Logs"}
 	var renderedTabs []string
 
@@ -29,7 +29,7 @@ func (m AppModel) renderMainPanel(width, height int) string {
 	)
 
 	// Altura restante para o conteúdo da aba
-	contentHeight := height - lipgloss.Height(tabRow) - 1
+	contentHeight := height - lipgloss.Height(tabRow) - 2
 	var content string
 
 	if m.pickerActive {
@@ -92,7 +92,7 @@ func (m AppModel) renderMainPanel(width, height int) string {
 	return lipgloss.JoinVertical(lipgloss.Left, tabRow, content)
 }
 
-func (m AppModel) renderDashboard(width, height int) string {
+func (m *AppModel) renderDashboard(width, height int) string {
 	var sb strings.Builder
 
 	host, ok := m.cfg.Hosts[m.activeHost]

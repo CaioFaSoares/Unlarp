@@ -2,6 +2,7 @@ package sync
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -13,6 +14,9 @@ import (
 
 	internalssh "github.com/CaioFaSoares/unlarp/internal/ssh"
 )
+
+// ErrSyncPaused é retornado por SyncExec quando o GitGuard pausou o sync
+var ErrSyncPaused = errors.New("sync pausado pelo GitGuard — resolva a divergência na aba Projects")
 
 // Engine coordena a sincronização bidirecional
 type Engine struct {
@@ -30,6 +34,59 @@ type Engine struct {
 
 	// Último estado conhecido compartilhado (A na reconciliação de 3 vias)
 	lastState Snapshot
+
+	progressMu sync.RWMutex
+	progress   SyncProgress
+
+	guardMu  sync.RWMutex
+	gitGuard GitGuard
+}
+
+// GitGuard protege contra sobrescrita quando o remote mudou via Git
+type GitGuard struct {
+	Enabled         bool   `json:"enabled"`
+	LastKnownCommit string `json:"last_known_commit"`
+	LastKnownBranch string `json:"last_known_branch"`
+	Paused          bool   `json:"paused"`
+	PauseReason     string `json:"pause_reason"`
+}
+
+type FileSyncStatus string
+
+const (
+	StatusPending   FileSyncStatus = "pending"
+	StatusSyncing   FileSyncStatus = "syncing"
+	StatusCompleted FileSyncStatus = "completed"
+	StatusFailed    FileSyncStatus = "failed"
+)
+
+type FileProgress struct {
+	Path   string         `json:"path"`
+	Action string         `json:"action"` // "upload" | "download" | "local_delete" | "remote_delete"
+	Status FileSyncStatus `json:"status"`
+	Error  error          `json:"error,omitempty"`
+}
+
+type SyncProgress struct {
+	IsSyncing      bool           `json:"is_syncing"`
+	TotalItems     int            `json:"total_items"`
+	DoneItems      int            `json:"done_items"`
+	CurrentFile    string         `json:"current_file"`
+	SyncingFiles   []FileProgress `json:"syncing_files"`
+	PendingFiles   []FileProgress `json:"pending_files"`
+	CompletedFiles []FileProgress `json:"completed_files"`
+
+	// Estatísticas
+	Case              int     `json:"case"`
+	Percent           float64 `json:"percent"`
+	TotalLocal        int     `json:"total_local"`
+	TotalRemote       int     `json:"total_remote"`
+	InitialUploadsNew int     `json:"initial_uploads_new"`
+	InitialUploadsMod int     `json:"initial_uploads_mod"`
+	InitialDownloads  int     `json:"initial_downloads"`
+	DoneUploadsNew    int     `json:"done_uploads_new"`
+	DoneUploadsMod    int     `json:"done_uploads_mod"`
+	DoneDownloads     int     `json:"done_downloads"`
 }
 
 // NewEngine cria uma nova instância da engine de sync
@@ -66,6 +123,9 @@ func NewEngine(id string, localDir, remoteDir, hostName string, globalIgnores []
 
 	e.loadLastState()
 
+	e.progress.Percent = 100
+	e.progress.Case = 1
+
 	return e, nil
 }
 
@@ -77,8 +137,187 @@ func (e *Engine) UpdateSFTPClient(client *sftp.Client) {
 	e.sftpClient = client
 }
 
+// GetProgress retorna uma cópia segura do progresso atual
+func (e *Engine) GetProgress() SyncProgress {
+	e.progressMu.RLock()
+	defer e.progressMu.RUnlock()
+	return e.progress
+}
+
+func (e *Engine) startFileProgress(path string, action string) {
+	e.progressMu.Lock()
+	defer e.progressMu.Unlock()
+
+	// Encontra o arquivo nas pendências e remove de lá
+	newPending := make([]FileProgress, 0, len(e.progress.PendingFiles))
+	var found *FileProgress
+	for _, fp := range e.progress.PendingFiles {
+		if fp.Path == path && fp.Action == action {
+			fp.Status = StatusSyncing
+			found = &fp
+		} else {
+			newPending = append(newPending, fp)
+		}
+	}
+	e.progress.PendingFiles = newPending
+
+	if found == nil {
+		found = &FileProgress{
+			Path:   path,
+			Action: action,
+			Status: StatusSyncing,
+		}
+	}
+
+	e.progress.CurrentFile = path
+	e.progress.SyncingFiles = append(e.progress.SyncingFiles, *found)
+}
+
+func (e *Engine) finishFileProgress(path string, action string, isNew bool, err error) {
+	e.progressMu.Lock()
+	defer e.progressMu.Unlock()
+
+	// Remove das ativas
+	newSyncing := make([]FileProgress, 0, len(e.progress.SyncingFiles))
+	var found *FileProgress
+	for _, fp := range e.progress.SyncingFiles {
+		if fp.Path == path && fp.Action == action {
+			if err != nil {
+				fp.Status = StatusFailed
+				fp.Error = err
+			} else {
+				fp.Status = StatusCompleted
+			}
+			found = &fp
+		} else {
+			newSyncing = append(newSyncing, fp)
+		}
+	}
+	e.progress.SyncingFiles = newSyncing
+
+	if found == nil {
+		status := StatusCompleted
+		if err != nil {
+			status = StatusFailed
+		}
+		found = &FileProgress{
+			Path:   path,
+			Action: action,
+			Status: status,
+			Error:  err,
+		}
+	}
+
+	e.progress.DoneItems++
+
+	if err == nil {
+		if action == "upload" {
+			if isNew {
+				e.progress.DoneUploadsNew++
+			} else {
+				e.progress.DoneUploadsMod++
+			}
+		} else if action == "download" {
+			e.progress.DoneDownloads++
+		}
+	}
+
+	e.progress.CompletedFiles = append(e.progress.CompletedFiles, *found)
+	if len(e.progress.CompletedFiles) > 10 {
+		e.progress.CompletedFiles = e.progress.CompletedFiles[len(e.progress.CompletedFiles)-10:]
+	}
+
+	e.recalculatePercentLocked()
+}
+
+func (e *Engine) recalculatePercentLocked() {
+	switch e.progress.Case {
+	case 1:
+		pct := float64(e.progress.TotalRemote+e.progress.DoneUploadsNew) / float64(e.progress.TotalLocal) * 100
+		if pct > 100 {
+			pct = 100
+		}
+		e.progress.Percent = pct
+	case 2:
+		remUploadsMod := e.progress.InitialUploadsMod - e.progress.DoneUploadsMod
+		if remUploadsMod < 0 {
+			remUploadsMod = 0
+		}
+		pct := float64(remUploadsMod) / float64(e.progress.TotalLocal) * 100
+		if pct > 100 {
+			pct = 100
+		}
+		e.progress.Percent = pct
+	case 3:
+		remDownloads := e.progress.InitialDownloads - e.progress.DoneDownloads
+		if remDownloads < 0 {
+			remDownloads = 0
+		}
+		pct := float64(remDownloads) / float64(e.progress.TotalRemote) * 100
+		if pct > 100 {
+			pct = 100
+		}
+		e.progress.Percent = pct
+	default:
+		e.progress.Percent = 100
+	}
+}
+
+// Pause pausa o sync por divergência Git
+func (e *Engine) Pause(reason string) {
+	e.guardMu.Lock()
+	defer e.guardMu.Unlock()
+	e.gitGuard.Paused = true
+	e.gitGuard.PauseReason = reason
+}
+
+// Resume retoma o sync após resolução da divergência
+func (e *Engine) Resume() {
+	e.guardMu.Lock()
+	defer e.guardMu.Unlock()
+	e.gitGuard.Paused = false
+	e.gitGuard.PauseReason = ""
+}
+
+// IsPaused retorna se o sync está pausado e o motivo
+func (e *Engine) IsPaused() (bool, string) {
+	e.guardMu.RLock()
+	defer e.guardMu.RUnlock()
+	return e.gitGuard.Paused, e.gitGuard.PauseReason
+}
+
+// UpdateGitState atualiza o estado Git conhecido pelo guard
+func (e *Engine) UpdateGitState(commit, branch string) {
+	e.guardMu.Lock()
+	defer e.guardMu.Unlock()
+	e.gitGuard.LastKnownCommit = commit
+	e.gitGuard.LastKnownBranch = branch
+}
+
+// GetGitGuard retorna uma cópia do estado atual do guard
+func (e *Engine) GetGitGuard() GitGuard {
+	e.guardMu.RLock()
+	defer e.guardMu.RUnlock()
+	return e.gitGuard
+}
+
+// SetGitGuardEnabled habilita ou desabilita o guard
+func (e *Engine) SetGitGuardEnabled(enabled bool) {
+	e.guardMu.Lock()
+	defer e.guardMu.Unlock()
+	e.gitGuard.Enabled = enabled
+}
+
 // SyncExec executa um ciclo completo de sincronização de três vias
 func (e *Engine) SyncExec() (int, error) {
+	// Verifica se o sync está pausado pelo GitGuard antes de tudo
+	e.guardMu.RLock()
+	paused := e.gitGuard.Paused
+	e.guardMu.RUnlock()
+	if paused {
+		return 0, ErrSyncPaused
+	}
+
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -187,18 +426,114 @@ func (e *Engine) SyncExec() (int, error) {
 		return 0, nil
 	}
 
+	// Inicializa progresso no início de um ciclo ativo
+	e.progressMu.Lock()
+	totalLocal := len(L)
+	totalRemote := len(R)
+	if totalLocal == 0 {
+		totalLocal = 1
+	}
+	if totalRemote == 0 {
+		totalRemote = 1
+	}
+
+	e.progress.IsSyncing = true
+	e.progress.TotalItems = totalActions
+	e.progress.DoneItems = 0
+	e.progress.TotalLocal = totalLocal
+	e.progress.TotalRemote = totalRemote
+	e.progress.CurrentFile = ""
+	e.progress.SyncingFiles = nil
+	e.progress.PendingFiles = nil
+	e.progress.CompletedFiles = nil
+
+	// Constrói lista de PendingFiles
+	for _, path := range localDeletes {
+		e.progress.PendingFiles = append(e.progress.PendingFiles, FileProgress{
+			Path:   path,
+			Action: "local_delete",
+			Status: StatusPending,
+		})
+	}
+	for _, path := range remoteDeletes {
+		e.progress.PendingFiles = append(e.progress.PendingFiles, FileProgress{
+			Path:   path,
+			Action: "remote_delete",
+			Status: StatusPending,
+		})
+	}
+	for _, path := range downloads {
+		e.progress.PendingFiles = append(e.progress.PendingFiles, FileProgress{
+			Path:   path,
+			Action: "download",
+			Status: StatusPending,
+		})
+	}
+	for _, path := range uploads {
+		e.progress.PendingFiles = append(e.progress.PendingFiles, FileProgress{
+			Path:   path,
+			Action: "upload",
+			Status: StatusPending,
+		})
+	}
+
+	e.progress.InitialUploadsNew = 0
+	e.progress.InitialUploadsMod = 0
+	e.progress.InitialDownloads = len(downloads)
+	e.progress.DoneUploadsNew = 0
+	e.progress.DoneUploadsMod = 0
+	e.progress.DoneDownloads = 0
+
+	for _, path := range uploads {
+		_, inR := R[path]
+		if inR {
+			e.progress.InitialUploadsMod++
+		} else {
+			e.progress.InitialUploadsNew++
+		}
+	}
+
+	// Classificação do Caso
+	if len(downloads) > 0 {
+		e.progress.Case = 3
+	} else if e.progress.InitialUploadsMod > 0 {
+		e.progress.Case = 2
+	} else if e.progress.InitialUploadsNew > 0 || totalLocal > totalRemote {
+		e.progress.Case = 1
+	} else {
+		e.progress.Case = 1
+	}
+
+	e.recalculatePercentLocked()
+	e.progressMu.Unlock()
+
+	defer func() {
+		e.progressMu.Lock()
+		e.progress.IsSyncing = false
+		e.progress.Percent = 100
+		e.progress.Case = 1
+		e.progress.CurrentFile = ""
+		e.progress.SyncingFiles = nil
+		e.progress.PendingFiles = nil
+		e.progressMu.Unlock()
+	}()
+
 	// Executa ações
 
 	// 1. Deleta localmente
 	for _, path := range localDeletes {
+		e.startFileProgress(path, "local_delete")
 		localPath := filepath.Join(e.LocalDir, path)
-		_ = os.RemoveAll(localPath)
+		err := os.RemoveAll(localPath)
+		e.finishFileProgress(path, "local_delete", false, err)
 	}
 
 	// 2. Deleta remotamente
 	for _, path := range remoteDeletes {
+		e.startFileProgress(path, "remote_delete")
 		remotePath := filepath.ToSlash(filepath.Join(e.RemoteDir, path))
-		_ = e.sftpClient.Remove(remotePath)
+		err := e.sftpClient.Remove(remotePath)
+		e.finishFileProgress(path, "remote_delete", false, err)
 	}
 
 	// 3. Executa Downloads (Remoto -> Local)
@@ -209,7 +544,9 @@ func (e *Engine) SyncExec() (int, error) {
 		// Garante diretório pai local
 		_ = os.MkdirAll(filepath.Dir(localPath), 0755)
 
+		e.startFileProgress(path, "download")
 		err := e.downloadFile(remotePath, localPath)
+		e.finishFileProgress(path, "download", false, err)
 		if err != nil {
 			return 0, fmt.Errorf("falha ao baixar %s: %w", path, err)
 		}
@@ -224,7 +561,11 @@ func (e *Engine) SyncExec() (int, error) {
 		remoteDir := filepath.ToSlash(filepath.Dir(remotePath))
 		_ = e.sftpClient.MkdirAll(remoteDir)
 
+		e.startFileProgress(path, "upload")
 		err := e.uploadFile(localPath, remotePath)
+		_, inR := R[path]
+		isNew := !inR
+		e.finishFileProgress(path, "upload", isNew, err)
 		if err != nil {
 			return 0, fmt.Errorf("falha ao enviar %s: %w", path, err)
 		}

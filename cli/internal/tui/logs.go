@@ -4,7 +4,7 @@ import (
 	"strings"
 )
 
-func (m AppModel) renderLogs(width, height int) string {
+func (m *AppModel) renderLogs(width, height int) string {
 	if len(m.logs) == 0 {
 		return "Nenhum log registrado."
 	}
