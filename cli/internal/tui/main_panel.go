@@ -11,7 +11,7 @@ import (
 
 // renderMainPanel desenha a barra de abas e o conteúdo da aba selecionada
 func (m AppModel) renderMainPanel(width, height int) string {
-	tabs := []string{"Dashboard", "Syncs", "Túneis", "Logs", "Projetos"}
+	tabs := []string{"Dashboard", "Projetos", "Syncs", "Túneis", "Logs"}
 	var renderedTabs []string
 
 	for i, t := range tabs {
@@ -54,6 +54,8 @@ func (m AppModel) renderMainPanel(width, height int) string {
 			promptTitle = "Configurar Novo Túnel SSH"
 		case "new_tmux_session":
 			promptTitle = "Criar Nova Sessão Tmux Remota"
+		case "project_sync_confirm":
+			promptTitle = "Cadastrar Projeto — Sincronizar Agora?"
 		}
 
 		promptBox := lipgloss.NewStyle().
@@ -73,16 +75,16 @@ func (m AppModel) renderMainPanel(width, height int) string {
 	}
 
 	switch m.activeTab {
-	case 0:
+	case tabDashboard:
 		content = m.renderDashboard(width, contentHeight)
-	case 1:
-		content = m.renderSyncs(width, contentHeight)
-	case 2:
-		content = m.renderTunnels(width, contentHeight)
-	case 3:
-		content = m.renderLogs(width, contentHeight)
-	case 4:
+	case tabProjects:
 		content = m.renderProjects(width, contentHeight)
+	case tabSyncs:
+		content = m.renderSyncs(width, contentHeight)
+	case tabTunnels:
+		content = m.renderTunnels(width, contentHeight)
+	case tabLogs:
+		content = m.renderLogs(width, contentHeight)
 	default:
 		content = "Aba desconhecida"
 	}
@@ -157,7 +159,7 @@ func (m AppModel) renderDashboard(width, height int) string {
 	sb.WriteString("\nAtalhos Rápidos:\n")
 	sb.WriteString(fmt.Sprintf("  %s - Conectar / Atachar à sessão selecionada\n", styles.KeyStyle.Render("c")))
 	sb.WriteString(fmt.Sprintf("  %s - Navegar pelas sessões / hosts\n", styles.KeyStyle.Render("↑/↓ / j/k")))
-	sb.WriteString(fmt.Sprintf("  %s - Mudar aba (Dashboard/Syncs/Túneis/Logs)\n", styles.KeyStyle.Render("←/→")))
+	sb.WriteString(fmt.Sprintf("  %s - Mudar aba (Dashboard/Projetos/Syncs/Túneis/Logs)\n", styles.KeyStyle.Render("←/→")))
 
 	return sb.String()
 }
