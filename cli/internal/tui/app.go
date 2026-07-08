@@ -381,8 +381,9 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// projeto e inicia o sync no mesmo fluxo já usado pela aba Syncs.
 				m.chosenLocal = m.dirPicker.SelectedPath
 				m.pickerActive = false
-				m.registerProject(m.chosenRemote, m.chosenLocal)
-				cmds = append(cmds, m.createSyncLiveCmd("s-"+generateRandomString(6), fmt.Sprintf("%s:%s", m.chosenLocal, m.chosenRemote)))
+				if err := m.registerProject(m.chosenRemote, m.chosenLocal); err == nil {
+					cmds = append(cmds, m.createSyncLiveCmd("s-"+generateRandomString(6), fmt.Sprintf("%s:%s", m.chosenLocal, m.chosenRemote)))
+				}
 			}
 		} else if m.dirPicker.Cancelled {
 			m.pickerActive = false
@@ -1041,7 +1042,10 @@ func (m *AppModel) handlePromptSubmit() tea.Cmd {
 
 // registerProject cadastra um projeto (pasta remota, opcionalmente vinculada a
 // uma pasta local sincronizada) no host ativo e recarrega a config em memória.
-func (m *AppModel) registerProject(remotePath, localDir string) {
+// Retorna erro se o cadastro falhar (ex: projeto duplicado), para que quem
+// chama possa evitar disparar ações subsequentes (como iniciar um sync) para
+// um projeto que não foi de fato gravado.
+func (m *AppModel) registerProject(remotePath, localDir string) error {
 	name := filepath.Base(remotePath)
 	store := config.NewStore()
 	if err := store.AddProject(m.activeHost, config.Project{
@@ -1050,14 +1054,24 @@ func (m *AppModel) registerProject(remotePath, localDir string) {
 		LocalDir:   localDir,
 	}); err != nil {
 		m.addLog(fmt.Sprintf("Erro ao cadastrar projeto: %v", err))
-		return
+		return err
 	}
 
 	if cfg, err := store.Load(); err == nil {
 		m.cfg = cfg
 	}
 
+	// Adiciona à lista em memória imediatamente — sem isso o projeto só
+	// apareceria na aba Projetos (e vinculado a um sync na aba Syncs) no
+	// próximo tick do checkProjectsCmd, até 1s depois do cadastro.
+	m.projects = append(m.projects, Project{
+		Path:     remotePath,
+		Name:     name,
+		LocalDir: localDir,
+	})
+
 	m.addLog(fmt.Sprintf("Projeto '%s' cadastrado em %s.", name, m.activeHost))
+	return nil
 }
 
 // createTunnelLive inicializa o túnel em background na TUI
