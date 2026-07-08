@@ -1,13 +1,23 @@
 #!/bin/bash
 
+# Garante a criação do diretório .ssh
+mkdir -p /root/.ssh
+chmod 700 /root/.ssh
+
+# Injeta a chave pública se fornecida via variável de ambiente (útil para Coolify/bootstrap)
+if [ -n "$SSH_PUBLIC_KEY" ]; then
+    echo "Injetando SSH_PUBLIC_KEY das variáveis de ambiente..."
+    if ! grep -qxf "$SSH_PUBLIC_KEY" /root/.ssh/authorized_keys 2>/dev/null; then
+        echo "$SSH_PUBLIC_KEY" >> /root/.ssh/authorized_keys
+    fi
+fi
+
 # Garante permissões corretas no diretório home do root (evita erros do sshd com volumes montados)
 chown -R root:root /root
 chmod 700 /root
-if [ -d /root/.ssh ]; then
-    chmod 700 /root/.ssh
-    if [ -f /root/.ssh/authorized_keys ]; then
-        chmod 600 /root/.ssh/authorized_keys
-    fi
+chmod 700 /root/.ssh 2>/dev/null
+if [ -f /root/.ssh/authorized_keys ]; then
+    chmod 600 /root/.ssh/authorized_keys
 fi
 
 echo "Iniciando Docker Daemon interno (DinD)..."
