@@ -52,6 +52,65 @@ ssh root@localhost -p 2222
 
 ---
 
+## 🔌 Conectando sua IDE (VSCode, Antigravity)
+
+Para programar nos projetos dentro da pasta `/workspace` do container utilizando a sua IDE instalada localmente na sua máquina física:
+
+### Opção A: VSCode (Remote - SSH)
+1. Instale a extensão oficial **Remote - SSH** no VSCode.
+2. Adicione o host no seu arquivo `~/.ssh/config` local:
+   ```text
+   Host unlarp
+       HostName localhost
+       User root
+       Port 2222
+       IdentityFile ~/.ssh/id_rsa # ou caminho para sua chave privada correspondente
+   ```
+3. Abra a paleta de comandos do VSCode (`Ctrl+Shift+P` ou `Cmd+Shift+P`), digite `Remote-SSH: Connect to Host...` e selecione `unlarp`.
+4. Uma vez conectado, abra a pasta `/workspace`.
+
+### Opção B: Montagem via SSHFS (Antigravity e outras IDEs locais)
+Se você usa o Antigravity ou qualquer outra IDE que lê arquivos locais da sua máquina física, você pode montar a pasta `/workspace` do container diretamente em uma pasta local do seu computador via SSHFS:
+1. Crie uma pasta vazia na sua máquina local:
+   ```bash
+   mkdir -p ~/Projects/unlarp-workspace
+   ```
+2. Monte a pasta do container usando o SSHFS:
+   ```bash
+   sshfs -p 2222 root@localhost:/workspace ~/Projects/unlarp-workspace -o cache=no,allow_other
+   ```
+3. Abra a pasta `~/Projects/unlarp-workspace` no Antigravity ou em sua IDE local de preferência. Todas as alterações serão sincronizadas em tempo real.
+4. Para desmontar quando terminar:
+   ```bash
+   umount ~/Projects/unlarp-workspace
+   ```
+
+---
+
+## 🔀 Acesso a Portas do DinD (Túnel SSH)
+
+Ao rodar bancos de dados ou servidores web dentro do Docker interno (DinD) do workspace, eles escutam em portas internas do container. Para acessar esses serviços de volta na sua máquina física (como acessar o Postgres na porta 5432 usando o DBeaver local), use o script `shs/tunnel.sh`.
+
+### Como usar o túnel:
+```bash
+./shs/tunnel.sh <porta_no_DinD> <porta_na_sua_maquina> [host_ip_ou_nome] [porta_ssh]
+```
+
+- **Exemplo 1 (Postgres rodando localmente no DinD na 5432)**:
+  Para acessar o banco na porta 5432 da sua máquina local:
+  ```bash
+  ./shs/tunnel.sh 5432 5432
+  ```
+- **Exemplo 2 (Servidor Web na porta 3000 do DinD remoto rodando na porta 8080 local)**:
+  Para criar um túnel com um servidor remoto do Coolify:
+  ```bash
+  ./shs/tunnel.sh 3000 8080 IP_DO_SEU_SERVIDOR
+  ```
+
+Pressione `Ctrl+C` no terminal para encerrar o túnel quando terminar.
+
+---
+
 ## 🌐 Deploy no Coolify (Servidor Remoto)
 
 ### 1. Criar Aplicação no Coolify

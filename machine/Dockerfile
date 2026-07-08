@@ -50,7 +50,7 @@ ENV PATH="/root/.nix-profile/bin:/nix/var/nix/profiles/default/bin:$PATH"
 RUN echo "if [ -e /root/.nix-profile/etc/profile.d/nix.sh ]; then . /root/.nix-profile/etc/profile.d/nix.sh; fi" >> /root/.bashrc
 
 # 6. Configurar o Servidor SSH
-RUN mkdir /var/run/sshd \
+RUN mkdir -p /var/run/sshd \
     && mkdir -p /root/.ssh && chmod 700 /root/.ssh \
     && sed -i 's/#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config \
     && sed -i 's/#PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
