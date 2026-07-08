@@ -18,15 +18,20 @@ func (m AppModel) renderTunnels(width, height int) string {
 	}
 
 	sb.WriteString(styles.TableHeaderStyle.Width(width).Render(
-		fmt.Sprintf("  %-8s %-12s %-12s %-10s", "TUNNEL ID", "REMOTE PORT", "LOCAL PORT", "STATUS"),
+		fmt.Sprintf("  %-8s %-12s %-12s %-10s %-10s", "TUNNEL ID", "REMOTE PORT", "LOCAL PORT", "DIRECTION", "STATUS"),
 	))
 	sb.WriteString("\n")
 
 	for i, t := range sess.Tunnels {
-		line := fmt.Sprintf("  %-8s %-12d %-12d %-10s",
+		direction := t.Direction
+		if direction == "" {
+			direction = "remote"
+		}
+		line := fmt.Sprintf("  %-8s %-12d %-12d %-10s %-10s",
 			t.ID,
 			t.RemotePort,
 			t.LocalPort,
+			direction,
 			"Active",
 		)
 

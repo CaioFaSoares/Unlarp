@@ -115,8 +115,12 @@ type AppModel struct {
 
 	// Prompts interativos para criação interna
 	promptActive bool
-	promptType   string // "sync" | "tunnel"
+	promptType   string // "sync" | "tunnel_direction" | "tunnel"
 	textInput    textinput.Model
+
+	// Direção escolhida no prompt "tunnel_direction", usada ao criar o túnel
+	// no prompt "tunnel" subsequente (padrão: tunnel.DirectionRemote)
+	pendingTunnelDirection tunnel.Direction
 
 	// Clientes e Managers ativos por HostName. sshMu protege sshClients e
 	// sftpClients, que são lidos/escritos tanto no goroutine principal do
@@ -441,7 +445,12 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.textInput.Blur()
 				return m, nil
 			case "enter":
+				prevPromptType := m.promptType
 				cmd := m.handlePromptSubmit()
+				if prevPromptType == "tunnel_direction" {
+					// Avança para o prompt de portas em vez de fechar o prompt
+					return m, cmd
+				}
 				m.promptActive = false
 				m.textInput.Blur()
 				return m, cmd
@@ -604,12 +613,13 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "t":
-			// Atalho para iniciar túnel (somente se não estiver na barra lateral)
+			// Atalho para iniciar túnel (somente se não estiver na barra lateral).
+			// Primeiro pergunta a direção, depois as portas.
 			if !m.sidebarFocus {
-				m.promptType = "tunnel"
+				m.promptType = "tunnel_direction"
 				m.promptActive = true
 				m.textInput.SetValue("")
-				m.textInput.Placeholder = "porta_remota[:porta_local] (ex: 5432 ou 3000:8080)"
+				m.textInput.Placeholder = "r=remoto→local, padrão / l=local→remoto (Enter = r)"
 				m.textInput.Focus()
 				return m, textinput.Blink
 			}
@@ -890,13 +900,28 @@ func (m *AppModel) handleMainPanelDown() {
 // handlePromptSubmit executa a ação de criação no background baseado no input
 func (m *AppModel) handlePromptSubmit() tea.Cmd {
 	val := strings.TrimSpace(m.textInput.Value())
-	if val == "" {
+
+	// "tunnel_direction" aceita Enter vazio (usa o padrão remote), diferente
+	// dos demais prompts que exigem valor.
+	if val == "" && m.promptType != "tunnel_direction" {
 		return nil
 	}
 
 	switch m.promptType {
+	case "tunnel_direction":
+		m.pendingTunnelDirection = tunnel.DirectionRemote
+		if v := strings.ToLower(val); v == "l" || v == "local" {
+			m.pendingTunnelDirection = tunnel.DirectionLocal
+		}
+
+		// Avança para o prompt de portas, mantendo o mesmo fluxo de input
+		m.promptType = "tunnel"
+		m.textInput.SetValue("")
+		m.textInput.Placeholder = "porta_remota[:porta_local] (ex: 5432 ou 3000:8080)"
+		m.textInput.Focus()
+		return textinput.Blink
 	case "tunnel":
-		m.createTunnelLive(val)
+		m.createTunnelLive(val, m.pendingTunnelDirection)
 	case "sync":
 		return m.createSyncLiveCmd(val)
 	case "new_tmux_session":
@@ -906,7 +931,7 @@ func (m *AppModel) handlePromptSubmit() tea.Cmd {
 }
 
 // createTunnelLive inicializa o túnel em background na TUI
-func (m *AppModel) createTunnelLive(val string) {
+func (m *AppModel) createTunnelLive(val string, direction tunnel.Direction) {
 	hostCfg, ok := m.cfg.Hosts[m.activeHost]
 	if !ok {
 		m.addLog("Erro: Config de host ativa não encontrada")
@@ -953,7 +978,7 @@ func (m *AppModel) createTunnelLive(val string) {
 	}
 
 	// Inicia túnel
-	id, err := mgr.Add(localPort, remotePort)
+	id, err := mgr.Add(localPort, remotePort, direction)
 	if err != nil {
 		m.addLog(fmt.Sprintf("Erro ao iniciar túnel: %v", err))
 		return
@@ -964,9 +989,14 @@ func (m *AppModel) createTunnelLive(val string) {
 		ID:         id,
 		RemotePort: remotePort,
 		LocalPort:  localPort,
+		Direction:  direction.String(),
 	})
 
-	m.addLog(fmt.Sprintf("Túnel %s criado com sucesso: local:%d -> remoto:%d", id, localPort, remotePort))
+	if direction == tunnel.DirectionLocal {
+		m.addLog(fmt.Sprintf("Túnel %s criado com sucesso: local:%d -> remoto:%d", id, localPort, remotePort))
+	} else {
+		m.addLog(fmt.Sprintf("Túnel %s criado com sucesso: remoto:%d -> local:%d", id, remotePort, localPort))
+	}
 }
 
 // createSyncLiveCmd prepara a conexão, a engine e os watchers de uma nova
