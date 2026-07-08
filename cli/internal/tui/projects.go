@@ -34,8 +34,9 @@ func (m AppModel) renderProjects(width, height int) string {
 	var sb strings.Builder
 
 	if len(m.projects) == 0 {
-		sb.WriteString("Nenhum monorepo (repositório git) encontrado no workspace deste host.\n\n")
-		sb.WriteString("Projetos são descobertos automaticamente — nada para configurar aqui.")
+		sb.WriteString("Nenhum projeto cadastrado neste host.\n\n")
+		sb.WriteString(fmt.Sprintf("Pressione %s para navegar até a pasta do projeto na workspace remota e cadastrá-la\n", styles.KeyStyle.Render("a")))
+		sb.WriteString("(você pode já vincular uma sincronização no mesmo passo).")
 		return sb.String()
 	}
 
@@ -50,13 +51,17 @@ func (m AppModel) renderProjects(width, height int) string {
 	))
 	sb.WriteString("\n")
 
+	// m.projects já vem com os projetos com sync ativo no topo (ver o handler
+	// de projectsMsg em app.go) — aqui só marcamos com ★ quem está sincronizando.
 	for i, p := range m.projects {
+		marker := " "
 		syncState := "—"
 		if s := matchProjectSync(syncs, p.Path); s != nil {
+			marker = "★"
 			syncState = s.ID
 		}
 
-		line := fmt.Sprintf("  %-24s %-16s %-10s", p.Name, p.Branch, syncState)
+		line := fmt.Sprintf("%s %-24s %-16s %-10s", marker, p.Name, p.Branch, syncState)
 
 		if i == m.selectedProjectRow && !m.sidebarFocus {
 			sb.WriteString(styles.HostSelectedStyle.Render(line))
@@ -86,6 +91,8 @@ func (m AppModel) renderProjectDetail(width int, syncs []session.SyncEntry) stri
 
 	if s := matchProjectSync(syncs, proj.Path); s != nil {
 		sb.WriteString(fmt.Sprintf(" %s %s -> %s\n", styles.StatusLabelStyle.Render("Sync:"), s.ID, truncatePath(s.LocalDir, 30)))
+	} else if proj.LocalDir != "" {
+		sb.WriteString(fmt.Sprintf(" %s pasta local vinculada (%s), sem sync ativo no momento\n", styles.StatusLabelStyle.Render("Sync:"), truncatePath(proj.LocalDir, 30)))
 	} else {
 		sb.WriteString(fmt.Sprintf(" %s nenhuma sincronização ativa\n", styles.StatusLabelStyle.Render("Sync:")))
 	}
