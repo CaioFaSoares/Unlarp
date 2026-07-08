@@ -22,6 +22,7 @@ import (
 	internalsync "github.com/CaioFaSoares/unlarp/internal/sync"
 	"github.com/CaioFaSoares/unlarp/internal/tui/styles"
 	"github.com/CaioFaSoares/unlarp/internal/tunnel"
+	"github.com/CaioFaSoares/unlarp/internal/ui"
 	"github.com/CaioFaSoares/unlarp/internal/watcher"
 )
 
@@ -109,6 +110,13 @@ type AppModel struct {
 	obWorkspace    string
 	obSetupKey     bool
 	obPassword     string
+
+	// DirPicker
+	dirPicker      *ui.DirPicker
+	pickerActive   bool
+	pickerStage    string // "local" | "remote"
+	chosenLocal    string
+	chosenRemote   string
 
 	// Logs
 	logs []string
@@ -212,6 +220,57 @@ func (m *AppModel) Cleanup() {
 // Update gerencia mensagens e entrada do usuário
 func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
+
+	if m.pickerActive {
+		var cmd tea.Cmd
+		var newModel tea.Model
+		newModel, cmd = m.dirPicker.Update(msg)
+		m.dirPicker = newModel.(*ui.DirPicker)
+		cmds = append(cmds, cmd)
+
+		if m.dirPicker.Confirmed {
+			if m.pickerStage == "local" {
+				m.chosenLocal = m.dirPicker.SelectedPath
+				m.pickerStage = "remote"
+
+				// Obter cliente SFTP para o host ativo
+				hostCfg, ok := m.cfg.Hosts[m.activeHost]
+				if !ok {
+					m.addLog("Erro: Host ativo não configurado.")
+					m.pickerActive = false
+					return m, nil
+				}
+
+				client, err := m.getOrCreateSSHClient(m.activeHost, &hostCfg)
+				if err != nil {
+					m.addLog(fmt.Sprintf("Erro SSH: %v", err))
+					m.pickerActive = false
+					return m, nil
+				}
+
+				sftpCli, err := m.getOrCreateSFTPClient(m.activeHost, client)
+				if err != nil {
+					m.addLog(fmt.Sprintf("Erro SFTP: %v", err))
+					m.pickerActive = false
+					return m, nil
+				}
+
+				// Inicia picker remoto no diretório workspace configurado do host
+				m.dirPicker = ui.NewDirPicker(true, sftpCli, hostCfg.Workspace)
+			} else {
+				// Confirmado remoto!
+				m.chosenRemote = m.dirPicker.SelectedPath
+				m.pickerActive = false
+
+				// Inicia o sync em tempo real em background
+				m.createSyncLive(fmt.Sprintf("%s:%s", m.chosenLocal, m.chosenRemote))
+			}
+		} else if m.dirPicker.Cancelled {
+			m.pickerActive = false
+		}
+
+		return m, tea.Batch(cmds...)
+	}
 
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -438,12 +497,10 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "s":
 			// Atalho para iniciar sync (somente se não estiver na barra lateral)
 			if !m.sidebarFocus {
-				m.promptType = "sync"
-				m.promptActive = true
-				m.textInput.SetValue("")
-				m.textInput.Placeholder = "local_dir:remote_dir (ex: .:/workspace/app)"
-				m.textInput.Focus()
-				return m, textinput.Blink
+				m.pickerActive = true
+				m.pickerStage = "local"
+				m.dirPicker = ui.NewDirPicker(false, nil, ".")
+				return m, nil
 			}
 
 		case "t":
