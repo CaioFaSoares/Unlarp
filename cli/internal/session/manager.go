@@ -25,11 +25,14 @@ type Session struct {
 
 // SyncEntry representa uma sessão de sync ativa
 type SyncEntry struct {
-	ID        string    `json:"id"`
-	LocalDir  string    `json:"local_dir"`
-	RemoteDir string    `json:"remote_dir"`
-	Mode      string    `json:"mode"` // "bidirectional" | "push" | "pull"
-	LastSync  time.Time `json:"last_sync"`
+	ID             string    `json:"id"`
+	LocalDir       string    `json:"local_dir"`
+	RemoteDir      string    `json:"remote_dir"`
+	Mode           string    `json:"mode"` // "bidirectional" | "push" | "pull"
+	LastSync       time.Time `json:"last_sync"`
+	GitBranch      string    `json:"git_branch,omitempty"`
+	GitCommit      string    `json:"git_commit,omitempty"`
+	GitGuardActive bool      `json:"git_guard_active,omitempty"`
 }
 
 // TunnelEntry representa um túnel ativo

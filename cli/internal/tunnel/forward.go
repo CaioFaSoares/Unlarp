@@ -100,7 +100,7 @@ func (f *Forwarder) Start() error {
 	var err error
 
 	if f.Direction == DirectionLocal {
-		listener, err = net.Listen("tcp", fmt.Sprintf("localhost:%d", f.LocalPort))
+		listener, err = net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", f.LocalPort))
 		if err != nil {
 			f.setStatus(StatusError)
 			f.lastError = fmt.Errorf("erro ao abrir porta local %d: %w", f.LocalPort, err)
@@ -229,7 +229,7 @@ func (f *Forwarder) dialPeer() (net.Conn, string, error) {
 		return conn, addr, err
 	}
 
-	addr := fmt.Sprintf("localhost:%d", f.LocalPort)
+	addr := fmt.Sprintf("127.0.0.1:%d", f.LocalPort)
 	conn, err := net.Dial("tcp", addr)
 	return conn, addr, err
 }

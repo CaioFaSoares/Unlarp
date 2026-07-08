@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -19,6 +20,7 @@ import (
 	"github.com/pkg/sftp"
 
 	"github.com/CaioFaSoares/unlarp/internal/config"
+	"github.com/CaioFaSoares/unlarp/internal/git"
 	"github.com/CaioFaSoares/unlarp/internal/session"
 	internalssh "github.com/CaioFaSoares/unlarp/internal/ssh"
 	internalsync "github.com/CaioFaSoares/unlarp/internal/sync"
@@ -123,6 +125,7 @@ const (
 type AppModel struct {
 	width  int
 	height int
+	isExiting bool
 
 	// Configs e Estado
 	cfg          *config.Config
@@ -145,7 +148,7 @@ type AppModel struct {
 	textInput    textinput.Model
 
 	// Direção escolhida no prompt "tunnel_direction", usada ao criar o túnel
-	// no prompt "tunnel" subsequente (padrão: tunnel.DirectionRemote)
+	// no prompt "tunnel" subsequente (padrão: tunnel.DirectionLocal)
 	pendingTunnelDirection tunnel.Direction
 
 	// Clientes e Managers ativos por HostName. sshMu protege sshClients e
@@ -167,6 +170,13 @@ type AppModel struct {
 	projects           []Project
 	selectedProjectRow int
 	projectOutput      map[string]string
+	expandedProjects   map[string]bool
+	expandedSyncs      map[string]bool
+	pendingProject     Project
+
+	gitInfo        map[string]git.RemoteGitInfo // chave: RemotePath/RemoteDir do projeto
+	gitAlerts      map[string]string            // chave: syncID ou RemotePath -> motivo do bloqueio
+	gitTickCounter int
 
 	// Hosts cujos syncs persistidos já foram religados nesta execução da TUI
 	restoredHosts map[string]bool
@@ -242,17 +252,23 @@ func NewAppModel() (*AppModel, error) {
 		activeHost:     active,
 		activeTab:      tabDashboard,
 		sidebarFocus:   true,
-		promptActive:   false,
-		textInput:      ti,
+		promptActive:           false,
+		pendingTunnelDirection: tunnel.DirectionLocal,
+		textInput:              ti,
 		sshMu:          &sync.Mutex{},
 		sshClients:     make(map[string]*internalssh.Client),
 		sftpClients:    make(map[string]*sftp.Client),
 		tunnelManagers: make(map[string]*tunnel.Manager),
 		syncSessions:   make(map[string]map[string]*liveSyncSession),
 		pendingSyncs:   make(map[string][]pendingSync),
-		projectOutput:  make(map[string]string),
-		restoredHosts:  make(map[string]bool),
-		isOnboarding:   isOnboarding,
+		projectOutput:    make(map[string]string),
+		expandedProjects: make(map[string]bool),
+		expandedSyncs:    make(map[string]bool),
+		gitInfo:          make(map[string]git.RemoteGitInfo),
+		gitAlerts:        make(map[string]string),
+		gitTickCounter:   0,
+		restoredHosts:    make(map[string]bool),
+		isOnboarding:     isOnboarding,
 		onboardingStep: 0,
 		obProfileName:  "",
 		obPort:         2222,
@@ -268,8 +284,18 @@ func NewAppModel() (*AppModel, error) {
 	}, nil
 }
 
+// cleanupFinishedMsg é enviada quando a limpeza em background é concluída
+type cleanupFinishedMsg struct{}
+
+func (m *AppModel) cleanupCmd() tea.Cmd {
+	return func() tea.Msg {
+		m.Cleanup()
+		return cleanupFinishedMsg{}
+	}
+}
+
 // Init inicializa a aplicação Bubble Tea
-func (m AppModel) Init() tea.Cmd {
+func (m *AppModel) Init() tea.Cmd {
 	return tea.Batch(m.spinner.Tick, tickCmd())
 }
 
@@ -300,7 +326,21 @@ func (m *AppModel) Cleanup() {
 }
 
 // Update gerencia mensagens e entrada do usuário
-func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	// Intercepta ctrl+c globalmente para desligamento gracioso
+	if keyMsg, ok := msg.(tea.KeyMsg); ok && keyMsg.String() == "ctrl+c" {
+		m.isExiting = true
+		return m, m.cleanupCmd()
+	}
+
+	if m.isExiting {
+		// Se estiver desligando, ignora qualquer outra mensagem exceto cleanupFinishedMsg que efetiva a saída
+		if _, ok := msg.(cleanupFinishedMsg); ok {
+			return m, tea.Quit
+		}
+		return m, nil
+	}
+
 	var cmds []tea.Cmd
 
 	if m.pickerActive {
@@ -394,6 +434,9 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	switch msg := msg.(type) {
+	case cleanupFinishedMsg:
+		return m, tea.Quit
+
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
@@ -405,6 +448,14 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, m.checkTmuxCmd())
 			cmds = append(cmds, m.checkProjectsCmd())
 
+			m.gitTickCounter++
+			if m.gitTickCounter >= 5 {
+				m.gitTickCounter = 0
+				if cmd := m.checkGitCmd(); cmd != nil {
+					cmds = append(cmds, cmd)
+				}
+			}
+
 			// Religa, de forma invisível, os syncs persistidos do host ativo assim
 			// que ele é visto pela primeira vez nesta execução (cobre tanto o
 			// boot da TUI quanto a troca de host ativo).
@@ -415,12 +466,20 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 
-			if m.activeTab == tabProjects && len(m.projects) > 0 {
-				idx := m.selectedProjectRow
-				if idx >= len(m.projects) {
-					idx = 0
+			if m.activeTab == tabProjects {
+				items := m.buildProjectTree()
+				if len(items) > 0 {
+					idx := m.selectedProjectRow
+					if idx >= len(items) {
+						idx = 0
+					}
+					item := items[idx]
+					sessionName := item.Project.Name
+					if !item.IsProject && item.Session != nil {
+						sessionName = item.Session.Name
+					}
+					cmds = append(cmds, m.captureProjectCmd(sessionName))
 				}
-				cmds = append(cmds, m.captureProjectCmd(m.projects[idx].Name))
 			}
 		}
 
@@ -428,6 +487,9 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.tmuxSessions = msg
 		if m.selectedTmuxRow >= len(m.tmuxSessions) {
 			m.selectedTmuxRow = 0
+		}
+		if items := m.buildProjectTree(); len(items) > 0 && m.selectedProjectRow >= len(items) {
+			m.selectedProjectRow = 0
 		}
 
 	case projectsMsg:
@@ -440,7 +502,7 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					matchProjectSync(sess.Syncs, m.projects[j].Path) == nil
 			})
 		}
-		if m.selectedProjectRow >= len(m.projects) {
+		if items := m.buildProjectTree(); len(items) > 0 && m.selectedProjectRow >= len(items) {
 			m.selectedProjectRow = 0
 		}
 
@@ -457,6 +519,31 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case syncStartedMsg:
 		m.handleSyncStarted(msg)
+
+	case gitCheckResultMsg:
+		m.gitInfo[msg.projectPath] = msg.info
+		if msg.diverged {
+			m.gitAlerts[msg.syncID] = msg.reason
+			m.addLog(fmt.Sprintf("ALERTA: Sincronização %s bloqueada: %s", msg.syncID, msg.reason))
+		} else {
+			if _, hasAlert := m.gitAlerts[msg.syncID]; hasAlert {
+				delete(m.gitAlerts, msg.syncID)
+				m.addLog(fmt.Sprintf("Sincronização %s liberada (alinhada com o Git).", msg.syncID))
+				if activeHostSyncs, exists := m.syncSessions[m.activeHost]; exists {
+					if sessCtx, exists := activeHostSyncs[msg.syncID]; exists && sessCtx.engine != nil {
+						sessCtx.engine.Resume()
+					}
+				}
+			}
+		}
+
+	case gitResolvedMsg:
+		if msg.err != nil {
+			m.addLog(fmt.Sprintf("Erro ao resolver divergência Git via %s: %v", msg.action, msg.err))
+		} else {
+			delete(m.gitAlerts, msg.syncID)
+			m.addLog(fmt.Sprintf("Divergência Git no sync %s resolvida via %s com sucesso.", msg.syncID, msg.action))
+		}
 
 	case obSetupFinishedMsg:
 		if msg.err != nil {
@@ -532,9 +619,9 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		switch msg.String() {
-		case "q", "ctrl+c":
-			m.Cleanup()
-			return m, tea.Quit
+		case "q":
+			m.isExiting = true
+			return m, m.cleanupCmd()
 
 		case "tab":
 			m.sidebarFocus = !m.sidebarFocus
@@ -573,6 +660,35 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				store := config.NewStore()
 				_ = store.SetDefault(m.activeHost)
 				m.addLog(fmt.Sprintf("Sessão ativa alterada para: %s", m.activeHost))
+			} else if !m.sidebarFocus && m.activeTab == tabProjects {
+				items := m.buildProjectTree()
+				if len(items) > 0 && m.selectedProjectRow < len(items) {
+					item := items[m.selectedProjectRow]
+					if item.IsProject {
+						m.expandedProjects[item.Project.Path] = !m.expandedProjects[item.Project.Path]
+					} else if item.Session != nil {
+						exe, err := os.Executable()
+						if err != nil {
+							exe = "unlarp"
+						}
+						connectArgs := []string{"connect", m.activeHost, "--tmux", "--tmux-session", item.Session.Name}
+						if item.Project.Path != "" {
+							connectArgs = append(connectArgs, "--cwd", item.Project.Path)
+						}
+						c := exec.Command(exe, connectArgs...)
+						return m, tea.ExecProcess(c, func(err error) tea.Msg {
+							return resumeTuiMsg{err: err}
+						})
+					}
+				}
+			} else if !m.sidebarFocus && m.activeTab == tabSyncs {
+				items := m.buildSyncTree()
+				if len(items) > 0 && m.selectedSyncRow < len(items) {
+					item := items[m.selectedSyncRow]
+					if item.IsSync && item.PendingSync == nil {
+						m.expandedSyncs[item.Sync.ID] = !m.expandedSyncs[item.Sync.ID]
+					}
+				}
 			}
 
 		case "a":
@@ -620,44 +736,39 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "d":
-			// Atalho alternativo para deletar host selecionado na barra lateral
-			if m.sidebarFocus && len(m.hostNames) > 0 {
-				hostToDelete := m.hostNames[m.selectedHost]
-				store := config.NewStore()
-				if err := store.RemoveHost(hostToDelete); err == nil {
-					m.addLog(fmt.Sprintf("Host '%s' deletado com sucesso.", hostToDelete))
-					
-					cfg, errCfg := store.Load()
-					if errCfg == nil {
-						m.cfg = cfg
-						var hostNames []string
-						for name := range cfg.Hosts {
-							hostNames = append(hostNames, name)
-						}
-						m.hostNames = hostNames
-						
-						if len(hostNames) == 0 {
-							m.isOnboarding = true
-							m.onboardingStep = 0
-							m.obProfileName = ""
-							m.obHost = ""
-							m.obPort = 2222
-							m.obUser = "root"
-							m.obWorkspace = "/workspace"
-							m.textInput.SetValue("")
-							m.textInput.Placeholder = ""
-							m.textInput.Blur()
-						} else {
-							m.selectedHost = 0
-							m.activeHost = m.hostNames[0]
-							m.sessMgr.SetActive(m.activeHost)
-							_ = store.SetDefault(m.activeHost)
+			// Desanexa do tmux local mantendo o processo rodando no background
+			if os.Getenv("TMUX") != "" {
+				_ = exec.Command("tmux", "detach-client").Run()
+				return m, nil
+			} else {
+				m.addLog("Não está rodando sob uma sessão do Tmux.")
+			}
+			return m, nil
+
+		case "p", "f":
+			if !m.sidebarFocus && m.activeTab == tabProjects {
+				items := m.buildProjectTree()
+				if len(items) > 0 && m.selectedProjectRow < len(items) {
+					item := items[m.selectedProjectRow]
+					if item.IsProject {
+						sess, sessOk := m.sessMgr.GetSession(m.activeHost)
+						if sessOk {
+							syncEntry := matchProjectSync(sess.Syncs, item.Project.Path)
+							if syncEntry != nil {
+								if _, hasAlert := m.gitAlerts[syncEntry.ID]; hasAlert {
+									switch msg.String() {
+									case "p":
+										m.addLog(fmt.Sprintf("Executando git pull no repositório local %s...", syncEntry.LocalDir))
+										return m, m.resolveGitCmd(syncEntry.ID, "pull", syncEntry.LocalDir, syncEntry.RemoteDir, syncEntry.GitBranch)
+									case "f":
+										m.addLog(fmt.Sprintf("Forçando alinhamento do sync %s com o remote...", syncEntry.ID))
+										return m, m.resolveGitCmd(syncEntry.ID, "force", syncEntry.LocalDir, syncEntry.RemoteDir, "")
+									}
+								}
+							}
 						}
 					}
-				} else {
-					m.addLog(fmt.Sprintf("Erro ao deletar host: %v", err))
 				}
-				return m, nil
 			}
 
 		case "c":
@@ -667,10 +778,18 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if !m.sidebarFocus {
 				if m.activeTab == tabDashboard && len(m.tmuxSessions) > 0 {
 					sessionName = m.tmuxSessions[m.selectedTmuxRow].Name
-				} else if m.activeTab == tabProjects && len(m.projects) > 0 {
-					proj := m.projects[m.selectedProjectRow]
-					sessionName = proj.Name
-					cwd = proj.Path
+				} else if m.activeTab == tabProjects {
+					items := m.buildProjectTree()
+					if len(items) > 0 && m.selectedProjectRow < len(items) {
+						item := items[m.selectedProjectRow]
+						if item.IsProject {
+							sessionName = item.Project.Name
+							cwd = item.Project.Path
+						} else if item.Session != nil {
+							sessionName = item.Session.Name
+							cwd = item.Project.Path
+						}
+					}
 				}
 			}
 
@@ -690,14 +809,27 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			})
 
 		case "n":
-			// Atalho para criar nova sessão Tmux remota (somente na aba Dashboard e fora da barra lateral)
-			if !m.sidebarFocus && m.activeTab == tabDashboard {
-				m.promptType = "new_tmux_session"
-				m.promptActive = true
-				m.textInput.SetValue("")
-				m.textInput.Placeholder = "nome-da-sessao (ex: api-worker)"
-				m.textInput.Focus()
-				return m, textinput.Blink
+			if !m.sidebarFocus {
+				if m.activeTab == tabDashboard {
+					m.promptType = "new_tmux_session"
+					m.promptActive = true
+					m.textInput.SetValue("")
+					m.textInput.Placeholder = "nome-da-sessao (ex: api-worker)"
+					m.textInput.Focus()
+					return m, textinput.Blink
+				} else if m.activeTab == tabProjects {
+					items := m.buildProjectTree()
+					if len(items) > 0 && m.selectedProjectRow < len(items) {
+						proj := items[m.selectedProjectRow].Project
+						m.pendingProject = proj
+						m.promptType = "new_project_session"
+						m.promptActive = true
+						m.textInput.SetValue("")
+						m.textInput.Placeholder = "sufixo/nome da sessão (ex: backend, worker)"
+						m.textInput.Focus()
+						return m, textinput.Blink
+					}
+				}
 			}
 
 		case "s":
@@ -717,9 +849,44 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.promptType = "tunnel_direction"
 				m.promptActive = true
 				m.textInput.SetValue("")
-				m.textInput.Placeholder = "r=remoto→local, padrão / l=local→remoto (Enter = r)"
+				m.textInput.Placeholder = "l=local→remoto, padrão / r=remoto→local (Enter = l)"
 				m.textInput.Focus()
 				return m, textinput.Blink
+			}
+
+		case "o":
+			if !m.sidebarFocus && m.activeTab == tabProjects {
+				items := m.buildProjectTree()
+				if len(items) > 0 && m.selectedProjectRow < len(items) {
+					item := items[m.selectedProjectRow]
+					if item.IsProject {
+						sess, sessOk := m.sessMgr.GetSession(m.activeHost)
+						if sessOk {
+							syncEntry := matchProjectSync(sess.Syncs, item.Project.Path)
+							if syncEntry != nil {
+								if _, hasAlert := m.gitAlerts[syncEntry.ID]; hasAlert {
+									m.addLog(fmt.Sprintf("Definindo sync %s para modo Download-Only temporário...", syncEntry.ID))
+									return m, m.resolveGitCmd(syncEntry.ID, "download-only", syncEntry.LocalDir, syncEntry.RemoteDir, "")
+								}
+							}
+						}
+					}
+				}
+				return m, nil
+			}
+
+			// Atalho para abrir túnel no navegador (somente se não estiver na barra lateral e na aba de túneis)
+			if !m.sidebarFocus && m.activeTab == tabTunnels {
+				sess, ok := m.sessMgr.GetSession(m.activeHost)
+				if ok && len(sess.Tunnels) > 0 && m.selectedTunnelRow < len(sess.Tunnels) {
+					t := sess.Tunnels[m.selectedTunnelRow]
+					url := fmt.Sprintf("http://localhost:%d", t.LocalPort)
+					m.addLog(fmt.Sprintf("Abrindo navegador em %s...", url))
+					go func() {
+						_ = openBrowser(url)
+					}()
+				}
+				return m, nil
 			}
 
 		case "x":
@@ -776,7 +943,7 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 // View desenha a TUI
-func (m AppModel) View() string {
+func (m *AppModel) View() string {
 	if m.width == 0 || m.height == 0 {
 		return "Inicializando terminal..."
 	}
@@ -787,8 +954,12 @@ func (m AppModel) View() string {
 
 	// Título do App
 	header := styles.TitleStyle.Render("UNLARP — Remote Workspace Manager")
+	exitingStr := ""
+	if m.isExiting {
+		exitingStr = lipgloss.NewStyle().Foreground(lipgloss.Color("#FF0000")).Bold(true).Render(" — exiting...")
+	}
 	spinnerStr := m.spinner.View()
-	headerRow := lipgloss.JoinHorizontal(lipgloss.Center, header, spinnerStr)
+	headerRow := lipgloss.JoinHorizontal(lipgloss.Center, header, exitingStr, spinnerStr)
 
 	// Sidebar
 	sidebarWidth := 25
@@ -836,7 +1007,7 @@ func (m *AppModel) addLog(msg string) {
 	}
 }
 
-func (m AppModel) renderSidebar(height int) string {
+func (m *AppModel) renderSidebar(height int) string {
 	var sb strings.Builder
 	sb.WriteString(styles.SidebarTitleStyle.Render("Sessões / Hosts"))
 	sb.WriteString("\n\n")
@@ -876,7 +1047,7 @@ func (m AppModel) renderSidebar(height int) string {
 	return sb.String()
 }
 
-func (m AppModel) renderFooter() string {
+func (m *AppModel) renderFooter() string {
 	var sb strings.Builder
 	if m.promptActive {
 		sb.WriteString(styles.HelpStyle.Render(
@@ -893,7 +1064,7 @@ func (m AppModel) renderFooter() string {
 			styles.KeyStyle.Render("↑/↓/j/k"),
 			styles.KeyStyle.Render("Enter"),
 			styles.KeyStyle.Render("a"),
-			styles.KeyStyle.Render("x/d"),
+			styles.KeyStyle.Render("x"),
 			styles.KeyStyle.Render("Tab"),
 			styles.KeyStyle.Render("q"),
 		}
@@ -919,24 +1090,36 @@ func (m AppModel) renderFooter() string {
 					styles.KeyStyle.Render("q"),
 				}
 			} else if m.activeTab == tabTunnels {
-				actions = "%s Navegar | %s Novo Túnel | %s Parar Túnel | %s Mudar Foco | %s Sair"
+				actions = "%s Navegar | %s Novo Túnel | %s Parar Túnel | %s Abrir no Navegador | %s Mudar Foco | %s Sair"
 				keys = []string{
 					styles.KeyStyle.Render("↑/↓/j/k"),
 					styles.KeyStyle.Render("t"),
 					styles.KeyStyle.Render("x"),
+					styles.KeyStyle.Render("o"),
 					styles.KeyStyle.Render("Tab"),
 					styles.KeyStyle.Render("q"),
 				}
 			} else if m.activeTab == tabProjects {
-				actions = "%s Navegar | %s Cadastrar Projeto | %s Abrir Sessão | %s Remover | %s Mudar Foco | %s Sair"
+				actions = "%s Navegar | %s Cadastrar | %s Expandir/Conectar | %s Nova Sessão | %s Remover/Kill | %s Sair"
 				keys = []string{
 					styles.KeyStyle.Render("↑/↓/j/k"),
 					styles.KeyStyle.Render("a"),
-					styles.KeyStyle.Render("c"),
+					styles.KeyStyle.Render("Enter/c"),
+					styles.KeyStyle.Render("n"),
 					styles.KeyStyle.Render("x"),
-					styles.KeyStyle.Render("Tab"),
 					styles.KeyStyle.Render("q"),
 				}
+			}
+		}
+
+		if os.Getenv("TMUX") != "" {
+			actions = strings.Replace(actions, "| %s Sair", "| %s Desanexar | %s Sair", 1)
+			if len(keys) > 0 {
+				lastIdx := len(keys) - 1
+				qKey := keys[lastIdx]
+				dKey := styles.KeyStyle.Render("d")
+				keys[lastIdx] = dKey
+				keys = append(keys, qKey)
 			}
 		}
 
@@ -955,8 +1138,15 @@ func (m AppModel) renderFooter() string {
 
 func (m *AppModel) handleMainPanelUp() {
 	if m.activeTab == tabProjects {
-		if len(m.projects) > 0 {
-			m.selectedProjectRow = (m.selectedProjectRow - 1 + len(m.projects)) % len(m.projects)
+		items := m.buildProjectTree()
+		if len(items) > 0 {
+			m.selectedProjectRow = (m.selectedProjectRow - 1 + len(items)) % len(items)
+		}
+		return
+	} else if m.activeTab == tabSyncs {
+		items := m.buildSyncTree()
+		if len(items) > 0 {
+			m.selectedSyncRow = (m.selectedSyncRow - 1 + len(items)) % len(items)
 		}
 		return
 	}
@@ -968,8 +1158,6 @@ func (m *AppModel) handleMainPanelUp() {
 
 	if m.activeTab == tabDashboard && len(m.tmuxSessions) > 0 {
 		m.selectedTmuxRow = (m.selectedTmuxRow - 1 + len(m.tmuxSessions)) % len(m.tmuxSessions)
-	} else if m.activeTab == tabSyncs && len(sess.Syncs) > 0 {
-		m.selectedSyncRow = (m.selectedSyncRow - 1 + len(sess.Syncs)) % len(sess.Syncs)
 	} else if m.activeTab == tabTunnels && len(sess.Tunnels) > 0 {
 		m.selectedTunnelRow = (m.selectedTunnelRow - 1 + len(sess.Tunnels)) % len(sess.Tunnels)
 	}
@@ -977,8 +1165,15 @@ func (m *AppModel) handleMainPanelUp() {
 
 func (m *AppModel) handleMainPanelDown() {
 	if m.activeTab == tabProjects {
-		if len(m.projects) > 0 {
-			m.selectedProjectRow = (m.selectedProjectRow + 1) % len(m.projects)
+		items := m.buildProjectTree()
+		if len(items) > 0 {
+			m.selectedProjectRow = (m.selectedProjectRow + 1) % len(items)
+		}
+		return
+	} else if m.activeTab == tabSyncs {
+		items := m.buildSyncTree()
+		if len(items) > 0 {
+			m.selectedSyncRow = (m.selectedSyncRow + 1) % len(items)
 		}
 		return
 	}
@@ -990,8 +1185,6 @@ func (m *AppModel) handleMainPanelDown() {
 
 	if m.activeTab == tabDashboard && len(m.tmuxSessions) > 0 {
 		m.selectedTmuxRow = (m.selectedTmuxRow + 1) % len(m.tmuxSessions)
-	} else if m.activeTab == tabSyncs && len(sess.Syncs) > 0 {
-		m.selectedSyncRow = (m.selectedSyncRow + 1) % len(sess.Syncs)
 	} else if m.activeTab == tabTunnels && len(sess.Tunnels) > 0 {
 		m.selectedTunnelRow = (m.selectedTunnelRow + 1) % len(sess.Tunnels)
 	}
@@ -1009,9 +1202,9 @@ func (m *AppModel) handlePromptSubmit() tea.Cmd {
 
 	switch m.promptType {
 	case "tunnel_direction":
-		m.pendingTunnelDirection = tunnel.DirectionRemote
-		if v := strings.ToLower(val); v == "l" || v == "local" {
-			m.pendingTunnelDirection = tunnel.DirectionLocal
+		m.pendingTunnelDirection = tunnel.DirectionLocal
+		if v := strings.ToLower(val); v == "r" || v == "remote" {
+			m.pendingTunnelDirection = tunnel.DirectionRemote
 		}
 
 		// Avança para o prompt de portas, mantendo o mesmo fluxo de input
@@ -1026,6 +1219,20 @@ func (m *AppModel) handlePromptSubmit() tea.Cmd {
 		return m.createSyncLiveCmd("s-"+generateRandomString(6), val)
 	case "new_tmux_session":
 		return m.createTmuxSessionCmd(val)
+	case "new_project_session":
+		suffix := strings.TrimSpace(val)
+		if suffix == "" {
+			m.addLog("Nome de sessão inválido.")
+			return nil
+		}
+		sessionName := m.pendingProject.Name
+		if !strings.HasPrefix(suffix, m.pendingProject.Name) {
+			sessionName = fmt.Sprintf("%s-%s", m.pendingProject.Name, suffix)
+		} else {
+			sessionName = suffix
+		}
+		m.expandedProjects[m.pendingProject.Path] = true
+		return m.createProjectSessionCmd(sessionName, m.pendingProject.Path)
 	case "project_sync_confirm":
 		if strings.HasPrefix(strings.ToLower(val), "s") {
 			// Quer sync junto: abre o picker local para escolher a pasta que
@@ -1394,26 +1601,48 @@ func (m *AppModel) handleSyncStarted(msg syncStartedMsg) {
 
 // handleDeleteSelection deleta o item que está selecionado na view ativa
 func (m *AppModel) handleDeleteSelection() tea.Cmd {
-	if m.activeTab == tabProjects && len(m.projects) > 0 {
-		// Remove só o cadastro do projeto — o sync vinculado (se houver)
-		// continua rodando e gerenciável normalmente pela aba Syncs.
-		proj := m.projects[m.selectedProjectRow]
-		store := config.NewStore()
-		if err := store.RemoveProject(m.activeHost, proj.Path); err != nil {
-			m.addLog(fmt.Sprintf("Erro ao remover projeto: %v", err))
-		} else {
-			if cfg, err := store.Load(); err == nil {
-				m.cfg = cfg
-			}
-			// Remove da lista em memória imediatamente — sem isso a linha só
-			// sumiria no próximo tick do checkProjectsCmd (até 1s depois).
-			m.projects = append(m.projects[:m.selectedProjectRow], m.projects[m.selectedProjectRow+1:]...)
-			if m.selectedProjectRow >= len(m.projects) {
-				m.selectedProjectRow = 0
-			}
-			m.addLog(fmt.Sprintf("Projeto '%s' removido.", proj.Name))
+	if m.activeTab == tabProjects {
+		items := m.buildProjectTree()
+		if len(items) == 0 || m.selectedProjectRow >= len(items) {
+			return nil
 		}
-		return nil
+		item := items[m.selectedProjectRow]
+		if item.IsProject {
+			proj := item.Project
+			store := config.NewStore()
+			if err := store.RemoveProject(m.activeHost, proj.Path); err != nil {
+				m.addLog(fmt.Sprintf("Erro ao remover projeto: %v", err))
+			} else {
+				if cfg, err := store.Load(); err == nil {
+					m.cfg = cfg
+				}
+				// Remove from memory list immediately
+				projIdx := -1
+				for i, p := range m.projects {
+					if p.Path == proj.Path {
+						projIdx = i
+						break
+					}
+				}
+				if projIdx != -1 {
+					m.projects = append(m.projects[:projIdx], m.projects[projIdx+1:]...)
+				}
+				
+				// Clamp selectedProjectRow
+				newItems := m.buildProjectTree()
+				if len(newItems) > 0 && m.selectedProjectRow >= len(newItems) {
+					m.selectedProjectRow = len(newItems) - 1
+				} else if len(newItems) == 0 {
+					m.selectedProjectRow = 0
+				}
+				m.addLog(fmt.Sprintf("Projeto '%s' removido.", proj.Name))
+			}
+			return nil
+		} else if item.Session != nil {
+			name := item.Session.Name
+			m.addLog(fmt.Sprintf("Finalizando sessão Tmux %s...", name))
+			return m.killTmuxSessionCmd(name)
+		}
 	}
 
 	sess, ok := m.sessMgr.GetSession(m.activeHost)
@@ -1950,5 +2179,187 @@ func (m *AppModel) createTmuxSessionCmd(name string) tea.Cmd {
 		m.addLog(fmt.Sprintf("Criando sessão Tmux remota %s...", name))
 		_, _, _ = client.RunCommand("export LANG=C.UTF-8; export LC_ALL=C.UTF-8; tmux -u new-session -d -s " + name)
 		return m.checkTmuxCmd()()
+	}
+}
+
+// createProjectSessionCmd cria uma sessão tmux remota com o diretório de trabalho especificado
+func (m *AppModel) createProjectSessionCmd(name, path string) tea.Cmd {
+	return func() tea.Msg {
+		hostCfg, ok := m.cfg.Hosts[m.activeHost]
+		if !ok {
+			return nil
+		}
+
+		client, err := m.getOrCreateSSHClient(m.activeHost, &hostCfg)
+		if err != nil {
+			return nil
+		}
+
+		m.addLog(fmt.Sprintf("Criando sessão Tmux '%s' no diretório '%s'...", name, path))
+		cmdStr := fmt.Sprintf("export LANG=C.UTF-8; export LC_ALL=C.UTF-8; tmux -u new-session -d -s %s -c %s", shellQuote(name), shellQuote(path))
+		_, _, _ = client.RunCommand(cmdStr)
+		return m.checkTmuxCmd()()
+	}
+}
+
+func openBrowser(url string) error {
+	var cmd string
+	var args []string
+
+	switch runtime.GOOS {
+	case "windows":
+		cmd = "cmd"
+		args = []string{"/c", "start", url}
+	case "darwin":
+		cmd = "open"
+		args = []string{url}
+	default: // "linux", "freebsd", etc.
+		cmd = "xdg-open"
+		args = []string{url}
+	}
+
+	return exec.Command(cmd, args...).Start()
+}
+
+type gitCheckResultMsg struct {
+	syncID      string
+	projectPath string
+	info        git.RemoteGitInfo
+	diverged    bool
+	reason      string
+}
+
+type gitResolvedMsg struct {
+	syncID string
+	err    error
+	action string
+}
+
+func (m *AppModel) checkGitCmd() tea.Cmd {
+	host := m.activeHost
+	hostCfg, ok := m.cfg.Hosts[host]
+	if !ok {
+		return nil
+	}
+
+	sess, ok := m.sessMgr.GetSession(host)
+	if !ok || len(sess.Syncs) == 0 {
+		return nil
+	}
+
+	var cmds []tea.Cmd
+	for _, s := range sess.Syncs {
+		syncEntry := s
+		cmds = append(cmds, func() tea.Msg {
+			client, err := m.getOrCreateSSHClient(host, &hostCfg)
+			if err != nil {
+				return nil
+			}
+
+			info, err := git.GetRemoteGitInfo(client, syncEntry.RemoteDir)
+			if err != nil {
+				return nil
+			}
+
+			if !info.IsGitRepo {
+				return nil
+			}
+
+			var diverged bool
+			var reason string
+
+			activeHostSyncs, exists := m.syncSessions[host]
+			if exists {
+				sessCtx, exists := activeHostSyncs[syncEntry.ID]
+				if exists && sessCtx.engine != nil {
+					guard := sessCtx.engine.GetGitGuard()
+					
+					if guard.LastKnownCommit == "" {
+						sessCtx.engine.UpdateGitState(info.CommitHash, info.Branch)
+					} else {
+						if guard.LastKnownBranch != info.Branch {
+							diverged = true
+							reason = fmt.Sprintf("branch mudou no remote (%s -> %s)", guard.LastKnownBranch, info.Branch)
+						} else if guard.LastKnownCommit != info.CommitHash {
+							diverged = true
+							reason = fmt.Sprintf("remote avançou (%s -> %s)", guard.LastKnownCommit, info.CommitHash)
+						}
+					}
+				}
+			}
+
+			if diverged {
+				if exists {
+					if sessCtx, exists := activeHostSyncs[syncEntry.ID]; exists && sessCtx.engine != nil {
+						sessCtx.engine.Pause(reason)
+					}
+				}
+			}
+
+			return gitCheckResultMsg{
+				syncID:      syncEntry.ID,
+				projectPath: syncEntry.RemoteDir,
+				info:        info,
+				diverged:    diverged,
+				reason:      reason,
+			}
+		})
+	}
+
+	return tea.Batch(cmds...)
+}
+
+func (m *AppModel) resolveGitCmd(syncID, action, localDir, remoteDir, branch string) tea.Cmd {
+	host := m.activeHost
+	return func() tea.Msg {
+		activeHostSyncs, exists := m.syncSessions[host]
+		if !exists {
+			return gitResolvedMsg{syncID: syncID, action: action, err: fmt.Errorf("sessão de sync ativa não encontrada")}
+		}
+		sessCtx, exists := activeHostSyncs[syncID]
+		if !exists || sessCtx.engine != nil {
+			// Se o engine existe, a gente manipula
+		}
+		if !exists || sessCtx.engine == nil {
+			return gitResolvedMsg{syncID: syncID, action: action, err: fmt.Errorf("engine de sync ativa não encontrada")}
+		}
+
+		switch action {
+		case "pull":
+			err := git.PullLocal(localDir, "origin", branch)
+			if err != nil {
+				return gitResolvedMsg{syncID: syncID, action: action, err: err}
+			}
+
+			hostCfg, ok := m.cfg.Hosts[host]
+			if ok {
+				client, err := m.getOrCreateSSHClient(host, &hostCfg)
+				if err == nil {
+					if info, err := git.GetRemoteGitInfo(client, remoteDir); err == nil && info.IsGitRepo {
+						sessCtx.engine.UpdateGitState(info.CommitHash, info.Branch)
+					}
+				}
+			}
+			
+			sessCtx.engine.Resume()
+			
+		case "force":
+			hostCfg, ok := m.cfg.Hosts[host]
+			if ok {
+				client, err := m.getOrCreateSSHClient(host, &hostCfg)
+				if err == nil {
+					if info, err := git.GetRemoteGitInfo(client, remoteDir); err == nil && info.IsGitRepo {
+						sessCtx.engine.UpdateGitState(info.CommitHash, info.Branch)
+					}
+				}
+			}
+			sessCtx.engine.Resume()
+
+		case "download-only":
+			sessCtx.engine.ConflictStrategy = internalsync.StrategyRemoteWins
+			sessCtx.engine.Resume()
+		}
+
+		return gitResolvedMsg{syncID: syncID, action: action}
 	}
 }

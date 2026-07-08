@@ -45,6 +45,17 @@ type SyncConfig struct {
 	ConflictStrategy string   `yaml:"conflict_strategy"`
 	InitialSync      string   `yaml:"initial_sync"`
 	IgnorePatterns   []string `yaml:"ignore_patterns"`
+	GitGuard         bool     `yaml:"git_guard"`
+	GitPollInterval  string   `yaml:"git_poll_interval"`
+}
+
+// GitPollIntervalDuration retorna o intervalo de polling Git como time.Duration
+func (s *SyncConfig) GitPollIntervalDuration() time.Duration {
+	d, err := time.ParseDuration(s.GitPollInterval)
+	if err != nil {
+		return 5 * time.Second
+	}
+	return d
 }
 
 // TunnelConfig contém as configurações de túneis SSH
@@ -310,6 +321,8 @@ func (s *Store) defaultConfig() *Config {
 			PollInterval:     "1s",
 			ConflictStrategy: "newest-wins",
 			InitialSync:      "full",
+			GitGuard:         true,
+			GitPollInterval:  "5s",
 			IgnorePatterns: []string{
 				".git/",
 				"node_modules/",
