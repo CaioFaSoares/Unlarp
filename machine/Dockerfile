@@ -18,6 +18,7 @@ RUN apt-get update && apt-get install -y \
     sudo \
     build-essential \
     xz-utils \
+    wget \
     && rm -rf /var/lib/apt/lists/*
 
 # 2. Instalar Docker (DinD)

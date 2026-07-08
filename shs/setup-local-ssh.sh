@@ -39,5 +39,4 @@ docker cp "$SSH_KEY" "$CONTAINER_NAME":/root/.ssh/authorized_keys
 docker exec -it "$CONTAINER_NAME" chmod 700 /root/.ssh
 docker exec -it "$CONTAINER_NAME" chmod 600 /root/.ssh/authorized_keys
 docker exec -it "$CONTAINER_NAME" chown -R root:root /root/.ssh
-
 echo "Sucesso! Chave SSH copiada e permissões configuradas no container."

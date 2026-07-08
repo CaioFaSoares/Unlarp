@@ -124,16 +124,61 @@ Pressione `Ctrl+C` no terminal para encerrar o túnel quando terminar.
 4. Deploy a aplicação.
 
 ### 2. Configurar Chave SSH Remota
-Após o Coolify iniciar o container, você precisará liberar sua chave física no servidor.
-1. Na sua máquina local, rode o gerador de comandos:
+Após o Coolify iniciar o container, você precisará liberar a chave pública do seu dispositivo (PC ou Celular) no servidor para autenticar a conexão.
+
+#### A) Se estiver conectando a partir do seu PC local:
+1. Na sua máquina física local, rode o gerador de comandos:
    ```bash
    ./shs/setup-remote-ssh.sh
    ```
 2. Copie o comando gerado (que contém a sua chave pública).
-3. Cole e execute no terminal do seu servidor remoto.
-4. Conecte-se remotamente:
+3. Conecte-se ao terminal do seu servidor principal (onde o Coolify está instalado) e execute o comando copiado.
+
+#### B) Se estiver conectando a partir do Celular (ex: Termius, Termux):
+1. Gere ou copie a chave pública SSH do seu celular.
+2. Acesse o terminal do seu servidor principal (onde o Coolify está instalado).
+3. Execute o comando abaixo substituindo `SUA_CHAVE_PUBLICA_DO_CELULAR` pelo texto da chave copiada:
    ```bash
-   ssh root@IP_DO_SEU_SERVIDOR -p 2222
+   docker exec -i workspace_machine sh -c "mkdir -p /root/.ssh && chmod 700 /root/.ssh && echo 'SUA_CHAVE_PUBLICA_DO_CELULAR' >> /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys && chown -R root:root /root/.ssh"
+   ```
+
+---
+
+## 📱 Conexão e Fluxo de Trabalho por Terminal SSH (Sem IDE)
+
+Se você estiver em trânsito ou quiser programar diretamente do celular ou de qualquer terminal de comando puro sem usar o VSCode/Antigravity:
+
+### 1. Conectando via Terminal
+No terminal do seu dispositivo, rode o comando especificando a porta `2222` e o IP do servidor:
+```bash
+ssh root@IP_DO_SEU_SERVIDOR -p 2222
+```
+*(Se estiver usando chaves SSH personalizadas ou no celular, lembre-se de selecionar a chave privada correspondente no aplicativo cliente SSH, como o Termius)*.
+
+### 2. Fluxo de Desenvolvimento Direto no Terminal:
+Uma vez logado dentro do container do workspace:
+
+1. **Navegue até o seu projeto**:
+   ```bash
+   cd /workspace/nome-do-seu-projeto
+   ```
+2. **Ative o ambiente do Flake**:
+   Caso o projeto possua um `flake.nix`, carregue todas as ferramentas dele executando:
+   ```bash
+   nix develop
+   ```
+   *Você será colocado dentro do shell isolado com todas as linguagens (Python, Go, Node, Rust, etc.) prontas.*
+3. **Programando com o Claude Code**:
+   Inicie o Claude Code diretamente no terminal para implementar features, consertar bugs ou rodar testes:
+   ```bash
+   claude
+   ```
+4. **Editar Arquivos Manualmente**:
+   Se precisar mexer em algum arquivo diretamente, use editores rápidos de terminal instalados no sistema (ex: `nano` ou `vim`).
+5. **Subir Serviços de Banco de Dados**:
+   Utilize o Docker interno (DinD) para gerenciar containers secundários do seu projeto:
+   ```bash
+   docker compose up -d
    ```
 
 ---
