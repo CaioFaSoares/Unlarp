@@ -1,0 +1,25 @@
+services:
+  workspace:
+    build:
+      context: ./machine
+      dockerfile: Dockerfile
+    container_name: workspace_machine
+    privileged: true
+    ports:
+      - "2222:22"
+    volumes:
+      - workspace-data:/workspace
+      - workspace-nix-store:/nix
+      - workspace-ssh:/root/.ssh
+      - workspace-docker:/var/lib/docker
+    restart: unless-stopped
+
+volumes:
+  workspace-data:
+    name: workspace-data
+  workspace-nix-store:
+    name: workspace-nix-store
+  workspace-ssh:
+    name: workspace-ssh
+  workspace-docker:
+    name: workspace-docker
