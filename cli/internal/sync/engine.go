@@ -28,10 +28,12 @@ type Engine struct {
 	ConflictStrategy ConflictStrategy `json:"conflict_strategy"`
 	StatePath        string           `json:"state_path"`
 
-	sshClient  *internalssh.Client
-	sftpClient *sftp.Client
-	matcher    *IgnoreMatcher
-	mu         sync.Mutex
+	sshClient      *internalssh.Client
+	sftpClient     *sftp.Client
+	matcher        *IgnoreMatcher
+	globalIgnores  []string
+	ignoreFilePath string
+	mu             sync.Mutex
 
 	// Último estado conhecido compartilhado (A na reconciliação de 3 vias)
 	lastState Snapshot
@@ -41,6 +43,8 @@ type Engine struct {
 
 	guardMu  sync.RWMutex
 	gitGuard GitGuard
+
+	OnFileSuccess func(path string, action string)
 }
 
 // GitGuard protege contra sobrescrita quando o remote mudou via Git
@@ -102,6 +106,10 @@ func NewEngine(id string, localDir, remoteDir, hostName string, globalIgnores []
 	if err != nil {
 		return nil, err
 	}
+	// Resolve links simbólicos no caminho local para garantir compatibilidade com watchers de filesystem
+	if resolved, err := filepath.EvalSymlinks(absLocal); err == nil {
+		absLocal = resolved
+	}
 
 	statePath := filepath.Join(home, ".unlarp", fmt.Sprintf("sync_state_%s_%s.json", hostName, id))
 
@@ -119,6 +127,8 @@ func NewEngine(id string, localDir, remoteDir, hostName string, globalIgnores []
 		sshClient:        sshClient,
 		sftpClient:       sftpClient,
 		matcher:          matcher,
+		globalIgnores:    globalIgnores,
+		ignoreFilePath:   ignoreFile,
 		lastState:        make(Snapshot),
 	}
 
@@ -176,7 +186,6 @@ func (e *Engine) startFileProgress(path string, action string) {
 
 func (e *Engine) finishFileProgress(path string, action string, isNew bool, err error) {
 	e.progressMu.Lock()
-	defer e.progressMu.Unlock()
 
 	// Remove das ativas
 	newSyncing := make([]FileProgress, 0, len(e.progress.SyncingFiles))
@@ -229,6 +238,12 @@ func (e *Engine) finishFileProgress(path string, action string, isNew bool, err 
 	}
 
 	e.recalculatePercentLocked()
+	cb := e.OnFileSuccess
+	e.progressMu.Unlock()
+
+	if err == nil && cb != nil {
+		cb(path, action)
+	}
 }
 
 func (e *Engine) recalculatePercentLocked() {
@@ -309,6 +324,95 @@ func (e *Engine) SetGitGuardEnabled(enabled bool) {
 	e.gitGuard.Enabled = enabled
 }
 
+// rebuildMatcher reconstrói o ignore matcher de forma limpa e lê todos os arquivos .gitignore no diretório local
+func (e *Engine) rebuildMatcher() {
+	// 1. Cria o matcher inicial apenas com as regras estáticas (globais + .unlarpignore)
+	newMatcher := NewIgnoreMatcher(e.globalIgnores, e.ignoreFilePath)
+
+	// Caminho absoluto da raiz local
+	absRoot := e.LocalDir
+
+	// Lista para acumular os arquivos .gitignore encontrados
+	type gitIgnoreFile struct {
+		relDir  string
+		absPath string
+	}
+	var gitignores []gitIgnoreFile
+
+	// Primeiro Passo: Varre a estrutura para encontrar arquivos .gitignore,
+	// respeitando APENAS os ignores estáticos compilados até agora (para evitar entrar em node_modules, .git, etc.)
+	_ = filepath.WalkDir(absRoot, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+
+		if path == absRoot {
+			return nil
+		}
+
+		relPath, err := filepath.Rel(absRoot, path)
+		if err != nil {
+			return nil
+		}
+		relPath = filepath.ToSlash(relPath)
+
+		// Usa o matcher temporário para ignorar pastas gigantescas (ex: node_modules)
+		if newMatcher.Matches(relPath, d.IsDir()) {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		if !d.IsDir() && filepath.Base(path) == ".gitignore" {
+			dir := filepath.Dir(relPath)
+			if dir == "." {
+				dir = ""
+			}
+			gitignores = append(gitignores, gitIgnoreFile{
+				relDir:  dir,
+				absPath: path,
+			})
+		}
+
+		return nil
+	})
+
+	// Segundo Passo: Carrega as regras de todos os arquivos .gitignore encontrados.
+	// Como todas as regras de todos os diretórios são carregadas antes de iniciar o sync,
+	// evitamos problemas de ordenação léxica na descoberta das regras.
+	for _, gf := range gitignores {
+		newMatcher.LoadGitIgnoreFile(gf.relDir, gf.absPath)
+	}
+
+	e.matcher = newMatcher
+}
+
+// hasParentTypeConflict verifica se qualquer pasta pai do caminho informado é um arquivo regular
+// no snapshot local (L) ou remoto (R). Isso detecta e previne colisões destrutivas onde uma pasta
+// foi convertida em arquivo ou vice-versa em um dos lados.
+func (e *Engine) hasParentTypeConflict(path string, L, R Snapshot) bool {
+	parts := strings.Split(path, "/")
+	prefix := ""
+	for i := 0; i < len(parts)-1; i++ {
+		if i == 0 {
+			prefix = parts[i]
+		} else {
+			prefix = prefix + "/" + parts[i]
+		}
+
+		// Se o prefixo pai existe em L como um arquivo regular
+		if _, existsInL := L[prefix]; existsInL {
+			return true
+		}
+		// Se o prefixo pai existe em R como um arquivo regular
+		if _, existsInR := R[prefix]; existsInR {
+			return true
+		}
+	}
+	return false
+}
+
 // SyncExec executa um ciclo completo de sincronização de três vias
 func (e *Engine) SyncExec() (int, error) {
 	// Verifica se o sync está pausado pelo GitGuard antes de tudo
@@ -321,6 +425,9 @@ func (e *Engine) SyncExec() (int, error) {
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
+
+	// Reconstrói o ignore matcher com todos os arquivos .gitignore locais dinamicamente
+	e.rebuildMatcher()
 
 	// 1. Gera Snapshot Local (L)
 	L, err := CreateLocalSnapshot(e.LocalDir, e.matcher)
@@ -344,6 +451,9 @@ func (e *Engine) SyncExec() (int, error) {
 
 	// Analisa mudanças locais e novos arquivos
 	for path, lEntry := range L {
+		if e.hasParentTypeConflict(path, L, R) {
+			continue
+		}
 		rEntry, inR := R[path]
 		aEntry, inA := A[path]
 
@@ -393,6 +503,9 @@ func (e *Engine) SyncExec() (int, error) {
 
 	// Analisa mudanças remotas, exclusões locais e novos arquivos remotos
 	for path, rEntry := range R {
+		if e.hasParentTypeConflict(path, L, R) {
+			continue
+		}
 		_, inL := L[path]
 		aEntry, inA := A[path]
 
@@ -414,16 +527,25 @@ func (e *Engine) SyncExec() (int, error) {
 	}
 
 	// Analisa deletados em ambos
+	stateChanged := false
 	for path := range A {
+		if e.hasParentTypeConflict(path, L, R) {
+			continue
+		}
 		_, inL := L[path]
 		_, inR := R[path]
 		if !inL && !inR {
 			// Deletado nos dois lados, nada a fazer além de limpar o histórico
+			delete(e.lastState, path)
+			stateChanged = true
 		}
 	}
 
 	totalActions := len(uploads) + len(downloads) + len(localDeletes) + len(remoteDeletes)
 	if totalActions == 0 {
+		if stateChanged {
+			e.saveLastState()
+		}
 		return 0, nil
 	}
 
@@ -522,25 +644,53 @@ func (e *Engine) SyncExec() (int, error) {
 	// Executa ações com acumulação de erros para resiliência
 	var errs []error
 
-	// 1. Deleta localmente
+	// 1. Deleta localmente (apenas se for arquivo/link regular, nunca diretório)
 	for _, path := range localDeletes {
 		e.startFileProgress(path, "local_delete")
 		localPath := filepath.Join(e.LocalDir, path)
-		err := os.RemoveAll(localPath)
+		
+		stat, err := os.Lstat(localPath)
+		if err == nil {
+			if stat.IsDir() {
+				err = fmt.Errorf("tentativa de deletar diretório local %s ignorada por segurança", path)
+			} else {
+				err = os.Remove(localPath)
+			}
+		} else if os.IsNotExist(err) {
+			err = nil // Já não existe
+		}
+		
 		e.finishFileProgress(path, "local_delete", false, err)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("falha ao deletar local %s: %w", path, err))
+		} else {
+			// Sucesso: remove da base de histórico
+			delete(e.lastState, path)
 		}
 	}
 
-	// 2. Deleta remotamente
+	// 2. Deleta remotamente (apenas se for arquivo/link regular, nunca diretório)
 	for _, path := range remoteDeletes {
 		e.startFileProgress(path, "remote_delete")
 		remotePath := filepath.ToSlash(filepath.Join(e.RemoteDir, path))
-		err := e.sftpClient.Remove(remotePath)
+		
+		stat, err := e.sftpClient.Lstat(remotePath)
+		if err == nil {
+			if stat.IsDir() {
+				err = fmt.Errorf("tentativa de deletar diretório remoto %s ignorada por segurança", path)
+			} else {
+				err = e.sftpClient.Remove(remotePath)
+			}
+		} else if os.IsNotExist(err) {
+			err = nil // Já não existe
+		}
+		
 		e.finishFileProgress(path, "remote_delete", false, err)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("falha ao deletar remoto %s: %w", path, err))
+		} else {
+			// Sucesso: remove da base de histórico
+			delete(e.lastState, path)
 		}
 	}
 
@@ -557,6 +707,17 @@ func (e *Engine) SyncExec() (int, error) {
 		e.finishFileProgress(path, "download", false, err)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("falha ao baixar %s: %w", path, err))
+		} else {
+			// Sucesso: atualiza o histórico com os metadados corretos locais
+			if statLocal, errStat := os.Lstat(localPath); errStat == nil {
+				e.lastState[path] = FileEntry{
+					RelPath: path,
+					Size:    statLocal.Size(),
+					ModTime: statLocal.ModTime().UTC().Truncate(time.Second),
+					Mode:    statLocal.Mode(),
+					IsDir:   statLocal.IsDir(),
+				}
+			}
 		}
 	}
 
@@ -576,16 +737,22 @@ func (e *Engine) SyncExec() (int, error) {
 		e.finishFileProgress(path, "upload", isNew, err)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("falha ao enviar %s: %w", path, err))
+		} else {
+			// Sucesso: atualiza o histórico com os metadados corretos locais
+			if statLocal, errStat := os.Lstat(localPath); errStat == nil {
+				e.lastState[path] = FileEntry{
+					RelPath: path,
+					Size:    statLocal.Size(),
+					ModTime: statLocal.ModTime().UTC().Truncate(time.Second),
+					Mode:    statLocal.Mode(),
+					IsDir:   statLocal.IsDir(),
+				}
+			}
 		}
 	}
 
-	// 5. Atualiza o histórico de estado salvo para o próximo ciclo
-	// Gera um novo snapshot local atualizado para salvar
-	newA, err := CreateLocalSnapshot(e.LocalDir, e.matcher)
-	if err == nil {
-		e.lastState = newA
-		e.saveLastState()
-	}
+	// Salva o histórico das alterações aplicadas com sucesso
+	e.saveLastState()
 
 	if len(errs) > 0 {
 		return totalActions - len(errs), fmt.Errorf("sync concluído com %d falha(s). Exemplo: %v", len(errs), errs[0])
@@ -617,8 +784,11 @@ func (e *Engine) downloadFile(remotePath, localPath string) error {
 	}
 
 	// 2. Se for arquivo regular, primeiro limpa colisão local (se existir diretório ou arquivo antigo no caminho)
-	if _, err := os.Lstat(localPath); err == nil {
-		_ = os.RemoveAll(localPath)
+	if statLocal, err := os.Lstat(localPath); err == nil {
+		if statLocal.IsDir() {
+			return fmt.Errorf("conflito de tipo: o caminho local %s é um diretório, não é possível baixar arquivo para ele", localPath)
+		}
+		_ = os.Remove(localPath)
 	}
 
 	remoteFile, err := e.sftpClient.Open(remotePath)
@@ -683,8 +853,11 @@ func (e *Engine) uploadFile(localPath, remotePath string) error {
 	}
 
 	// 2. Se for arquivo regular, primeiro limpa colisão remota
-	if _, err := e.sftpClient.Lstat(remotePath); err == nil {
-		_, _, _ = e.sshClient.RunCommand("rm -rf " + shellQuote(remotePath))
+	if statRemote, err := e.sftpClient.Lstat(remotePath); err == nil {
+		if statRemote.IsDir() {
+			return fmt.Errorf("conflito de tipo: o caminho remoto %s é um diretório, não é possível enviar arquivo para ele", remotePath)
+		}
+		_ = e.sftpClient.Remove(remotePath)
 	}
 
 	localFile, err := os.Open(localPath)
@@ -766,6 +939,12 @@ func (e *Engine) loadLastState() {
 
 	var state Snapshot
 	if err := json.Unmarshal(data, &state); err == nil {
+		// Trunca os timestamps carregados do estado anterior para garantir
+		// consistência em segundos, evitando falsos positivos com dados legados
+		for k, entry := range state {
+			entry.ModTime = entry.ModTime.UTC().Truncate(time.Second)
+			state[k] = entry
+		}
 		e.lastState = state
 	}
 }

@@ -59,6 +59,10 @@ func CreateLocalSnapshot(rootDir string, matcher *IgnoreMatcher) (Snapshot, erro
 			return nil
 		}
 
+		if d.IsDir() {
+			return nil // Não inclui diretórios no mapa de snapshot, apenas arquivos/symlinks
+		}
+
 		info, err := d.Info()
 		if err != nil {
 			return err
@@ -67,7 +71,7 @@ func CreateLocalSnapshot(rootDir string, matcher *IgnoreMatcher) (Snapshot, erro
 		entry := FileEntry{
 			RelPath: relPath,
 			Size:    info.Size(),
-			ModTime: info.ModTime().UTC(),
+			ModTime: info.ModTime().UTC().Truncate(time.Second),
 			Mode:    info.Mode(),
 			IsDir:   info.IsDir(),
 		}
@@ -120,10 +124,14 @@ func CreateRemoteSnapshot(client *sftp.Client, rootDir string, matcher *IgnoreMa
 			continue
 		}
 
+		if isDir {
+			continue // Não inclui diretórios no mapa de snapshot, apenas arquivos/symlinks
+		}
+
 		entry := FileEntry{
 			RelPath: relPath,
 			Size:    stat.Size(),
-			ModTime: stat.ModTime().UTC(),
+			ModTime: stat.ModTime().UTC().Truncate(time.Second),
 			Mode:    stat.Mode(),
 			IsDir:   isDir,
 		}

@@ -205,7 +205,9 @@ type AppModel struct {
 	chosenRemote   string
 
 	// Logs
-	logs []string
+	logs            []string
+	logScrollOffset int
+	logAutoScroll   bool
 }
 
 // NewAppModel inicializa o modelo do aplicativo
@@ -283,6 +285,8 @@ func NewAppModel() (*AppModel, error) {
 			"Configuração carregada de ~/.unlarp.yaml.",
 			"Abra a barra lateral (Tab) ou alterne abas (left/right).",
 		},
+		logScrollOffset: 0,
+		logAutoScroll:   true,
 	}, nil
 }
 
@@ -860,9 +864,40 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 
+		case "g", "G":
+			if !m.sidebarFocus && m.activeTab == tabLogs {
+				if msg.String() == "g" {
+					m.logAutoScroll = false
+					m.logScrollOffset = 0
+				} else {
+					m.logAutoScroll = true
+				}
+				return m, nil
+			}
+
+		case "pageup", "ctrl+u":
+			if !m.sidebarFocus && m.activeTab == tabLogs {
+				m.logAutoScroll = false
+				m.logScrollOffset -= 10
+				if m.logScrollOffset < 0 {
+					m.logScrollOffset = 0
+				}
+				return m, nil
+			}
+
+		case "pagedown", "ctrl+d":
+			if !m.sidebarFocus && m.activeTab == tabLogs {
+				m.logScrollOffset += 10
+				return m, nil
+			}
+
 		case "s":
 			// Atalho para iniciar sync (somente se não estiver na barra lateral)
 			if !m.sidebarFocus {
+				if m.activeTab == tabLogs {
+					m.logAutoScroll = !m.logAutoScroll
+					return m, nil
+				}
 				m.addLog(fmt.Sprintf("Abrindo seletor de diretório local para host %s...", m.activeHost))
 				m.pickerActive = true
 				m.pickerStage = "local"
@@ -1030,8 +1065,8 @@ func (m *AppModel) View() string {
 func (m *AppModel) addLog(msg string) {
 	timestamp := time.Now().Format("15:04:05")
 	m.logs = append(m.logs, fmt.Sprintf("[%s] %s", timestamp, msg))
-	if len(m.logs) > 100 {
-		m.logs = m.logs[1:] // Mantém cap de 100
+	if len(m.logs) > 500 {
+		m.logs = m.logs[1:] // Mantém cap de 500
 	}
 }
 
@@ -1137,6 +1172,14 @@ func (m *AppModel) renderFooter() string {
 					styles.KeyStyle.Render("x"),
 					styles.KeyStyle.Render("q"),
 				}
+			} else if m.activeTab == tabLogs {
+				actions = "%s Rolar | %s Auto-Scroll | %s Mudar Foco | %s Sair"
+				keys = []string{
+					styles.KeyStyle.Render("↑/↓/j/k/g/G"),
+					styles.KeyStyle.Render("s"),
+					styles.KeyStyle.Render("Tab"),
+					styles.KeyStyle.Render("q"),
+				}
 			}
 		}
 
@@ -1177,6 +1220,13 @@ func (m *AppModel) handleMainPanelUp() {
 			m.selectedSyncRow = (m.selectedSyncRow - 1 + len(items)) % len(items)
 		}
 		return
+	} else if m.activeTab == tabLogs {
+		m.logAutoScroll = false
+		m.logScrollOffset--
+		if m.logScrollOffset < 0 {
+			m.logScrollOffset = 0
+		}
+		return
 	}
 
 	sess, ok := m.sessMgr.GetSession(m.activeHost)
@@ -1203,6 +1253,9 @@ func (m *AppModel) handleMainPanelDown() {
 		if len(items) > 0 {
 			m.selectedSyncRow = (m.selectedSyncRow + 1) % len(items)
 		}
+		return
+	} else if m.activeTab == tabLogs {
+		m.logScrollOffset++
 		return
 	}
 
@@ -1463,9 +1516,20 @@ func (m *AppModel) startSyncEngine(host, syncID, absLocal, remoteDir string, cli
 		return nil, nil, nil, fmt.Errorf("erro ao iniciar engine de sync: %w", err)
 	}
 
+	engine.OnFileSuccess = func(path string, action string) {
+		var direction string
+		switch action {
+		case "upload", "remote_delete":
+			direction = "LOCAL -> REMOTE"
+		case "download", "local_delete":
+			direction = "REMOTE -> LOCAL"
+		}
+		m.addLog(fmt.Sprintf("[%s] %s: %s", syncID, direction, path))
+	}
+
 	// Watcher local. onWarn vai para m.addLog (aba Logs) em vez de
 	// os.Stderr, que corromperia visualmente a TUI em alt-screen.
-	localWatcher, err := watcher.NewLocalWatcher(absLocal, 200*time.Millisecond, engine.IgnoreMatcher(), m.addLog, func() {
+	localWatcher, err := watcher.NewLocalWatcher(engine.LocalDir, 200*time.Millisecond, engine.IgnoreMatcher(), m.addLog, func() {
 		go func() {
 			_, err := engine.SyncExec()
 			if err != nil {
@@ -1654,6 +1718,32 @@ func (m *AppModel) handleDeleteSelection() tea.Cmd {
 				}
 				if projIdx != -1 {
 					m.projects = append(m.projects[:projIdx], m.projects[projIdx+1:]...)
+				}
+
+				// Remove any sync sessions linked to this project
+				if sess, ok := m.sessMgr.GetSession(m.activeHost); ok && sess != nil {
+					for _, s := range sess.Syncs {
+						if s.RemoteDir == proj.Path || strings.HasPrefix(s.RemoteDir, proj.Path+"/") {
+							// Stop watchers if running in live session
+							if hostSyncs, exists := m.syncSessions[m.activeHost]; exists {
+								if live, exists := hostSyncs[s.ID]; exists {
+									if live.localWatcher != nil {
+										live.localWatcher.Stop()
+									}
+									if live.remoteWatcher != nil {
+										live.remoteWatcher.Stop()
+									}
+									if live.stopChan != nil {
+										close(live.stopChan)
+									}
+									delete(hostSyncs, s.ID)
+								}
+							}
+							_ = m.sessMgr.RemoveSync(m.activeHost, s.ID)
+							m.addLog(fmt.Sprintf("Sync %s atrelado ao projeto '%s' parado e removido.", s.ID, proj.Name))
+						}
+					}
+					m.selectedSyncRow = 0
 				}
 				
 				// Clamp selectedProjectRow
