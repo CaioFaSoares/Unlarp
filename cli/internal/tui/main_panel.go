@@ -56,6 +56,8 @@ func (m *AppModel) renderMainPanel(width, height int) string {
 			promptTitle = "Criar Nova Sessão Tmux Remota"
 		case "project_sync_confirm":
 			promptTitle = "Cadastrar Projeto — Sincronizar Agora?"
+		case "project_delete_confirm":
+			promptTitle = fmt.Sprintf("Confirmar exclusão do projeto '%s'? (s/n)", m.pendingProject.Name)
 		}
 
 		promptBox := lipgloss.NewStyle().

@@ -15,16 +15,54 @@ import (
 
 // FileEntry armazena os metadados de um único arquivo ou diretório
 type FileEntry struct {
-	RelPath string      `json:"rel_path"`
-	Size    int64       `json:"size"`
-	ModTime time.Time   `json:"mod_time"`
-	Mode    os.FileMode `json:"mode"`
-	IsDir   bool        `json:"is_dir"`
-	Hash    string      `json:"hash,omitempty"`
+	RelPath       string      `json:"rel_path"`
+	Size          int64       `json:"size"`
+	ModTime       time.Time   `json:"mod_time"`
+	Mode          os.FileMode `json:"mode"`
+	IsDir         bool        `json:"is_dir"`
+	Hash          string      `json:"hash,omitempty"`
+	SymlinkTarget string      `json:"symlink_target,omitempty"`
+}
+
+// Changed verifica se os metadados diferem significativamente dos de outra FileEntry
+func (fe FileEntry) Changed(other FileEntry) bool {
+	selfIsSym := fe.Mode&os.ModeSymlink != 0
+	otherIsSym := other.Mode&os.ModeSymlink != 0
+
+	if selfIsSym != otherIsSym {
+		return true
+	}
+	if selfIsSym {
+		return fe.SymlinkTarget != other.SymlinkTarget
+	}
+	return fe.Size != other.Size || !fe.ModTime.Equal(other.ModTime)
 }
 
 // Snapshot representa o estado completo de um diretório em um momento
 type Snapshot map[string]FileEntry
+
+// normalizeSymlinkTarget normaliza o destino do link simbólico para que seja comparável entre
+// ambientes locais e remotos, substituindo referências à raiz do sync por uma tag genérica "[root]".
+func normalizeSymlinkTarget(target string, rootDir string) string {
+	targetSlash := filepath.ToSlash(target)
+	rootSlash := filepath.ToSlash(rootDir)
+
+	if targetSlash == rootSlash {
+		return "[root]"
+	}
+
+	prefix := rootSlash
+	if !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
+
+	if strings.HasPrefix(targetSlash, prefix) {
+		rel := strings.TrimPrefix(targetSlash, prefix)
+		return "[root]/" + rel
+	}
+
+	return targetSlash
+}
 
 // CreateLocalSnapshot gera um snapshot de um diretório local
 func CreateLocalSnapshot(rootDir string, matcher *IgnoreMatcher) (Snapshot, error) {
@@ -68,12 +106,22 @@ func CreateLocalSnapshot(rootDir string, matcher *IgnoreMatcher) (Snapshot, erro
 			return err
 		}
 
+		var symlinkTarget string
+		if info.Mode()&os.ModeSymlink != 0 {
+			target, err := os.Readlink(path)
+			if err != nil {
+				return err
+			}
+			symlinkTarget = normalizeSymlinkTarget(target, absRoot)
+		}
+
 		entry := FileEntry{
-			RelPath: relPath,
-			Size:    info.Size(),
-			ModTime: info.ModTime().UTC().Truncate(time.Second),
-			Mode:    info.Mode(),
-			IsDir:   info.IsDir(),
+			RelPath:       relPath,
+			Size:          info.Size(),
+			ModTime:       info.ModTime().UTC().Truncate(time.Second),
+			Mode:          info.Mode(),
+			IsDir:         info.IsDir(),
+			SymlinkTarget: symlinkTarget,
 		}
 
 		snapshot[relPath] = entry
@@ -128,12 +176,22 @@ func CreateRemoteSnapshot(client *sftp.Client, rootDir string, matcher *IgnoreMa
 			continue // Não inclui diretórios no mapa de snapshot, apenas arquivos/symlinks
 		}
 
+		var symlinkTarget string
+		if stat.Mode()&os.ModeSymlink != 0 {
+			target, err := client.ReadLink(path)
+			if err != nil {
+				return nil, fmt.Errorf("erro ao ler link remoto %s: %w", path, err)
+			}
+			symlinkTarget = normalizeSymlinkTarget(target, cleanRoot)
+		}
+
 		entry := FileEntry{
-			RelPath: relPath,
-			Size:    stat.Size(),
-			ModTime: stat.ModTime().UTC().Truncate(time.Second),
-			Mode:    stat.Mode(),
-			IsDir:   isDir,
+			RelPath:       relPath,
+			Size:          stat.Size(),
+			ModTime:       stat.ModTime().UTC().Truncate(time.Second),
+			Mode:          stat.Mode(),
+			IsDir:         isDir,
+			SymlinkTarget: symlinkTarget,
 		}
 
 		snapshot[relPath] = entry
