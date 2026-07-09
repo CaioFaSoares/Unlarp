@@ -464,7 +464,7 @@ func (e *Engine) SyncExec() (int, error) {
 			}
 		} else if !inR && inA {
 			// Excluído no remoto (estava no histórico mas sumiu do remoto)
-			if lEntry.ModTime.After(aEntry.ModTime) {
+			if lEntry.Changed(aEntry) {
 				// Foi modificado localmente após a exclusão remota (conflito: recria remoto)
 				uploads = append(uploads, path)
 			} else {
@@ -473,7 +473,18 @@ func (e *Engine) SyncExec() (int, error) {
 			}
 		} else if inR && !inA {
 			// Existe local e remoto, mas não no histórico (novo em ambos)
-			if lEntry.Size != rEntry.Size || !lEntry.ModTime.Equal(rEntry.ModTime) {
+			var hasDifference bool
+			lIsSymlink := lEntry.Mode&os.ModeSymlink != 0
+			rIsSymlink := rEntry.Mode&os.ModeSymlink != 0
+			if lIsSymlink != rIsSymlink {
+				hasDifference = true
+			} else if lIsSymlink {
+				hasDifference = lEntry.SymlinkTarget != rEntry.SymlinkTarget
+			} else {
+				hasDifference = lEntry.Size != rEntry.Size || !lEntry.ModTime.Equal(rEntry.ModTime)
+			}
+
+			if hasDifference {
 				// Conflito
 				if ResolveConflict(lEntry, rEntry, e.ConflictStrategy) {
 					uploads = append(uploads, path)
@@ -483,8 +494,8 @@ func (e *Engine) SyncExec() (int, error) {
 			}
 		} else if inR && inA {
 			// Existe em todos
-			lChanged := lEntry.Size != aEntry.Size || !lEntry.ModTime.Equal(aEntry.ModTime)
-			rChanged := rEntry.Size != aEntry.Size || !rEntry.ModTime.Equal(aEntry.ModTime)
+			lChanged := lEntry.Changed(aEntry)
+			rChanged := rEntry.Changed(aEntry)
 
 			if lChanged && !rChanged {
 				uploads = append(uploads, path)
@@ -516,7 +527,7 @@ func (e *Engine) SyncExec() (int, error) {
 			}
 		} else if !inL && inA {
 			// Excluído localmente
-			if rEntry.ModTime.After(aEntry.ModTime) {
+			if rEntry.Changed(aEntry) {
 				// Modificado remoto após exclusão local -> recria local
 				downloads = append(downloads, path)
 			} else {
@@ -710,12 +721,19 @@ func (e *Engine) SyncExec() (int, error) {
 		} else {
 			// Sucesso: atualiza o histórico com os metadados corretos locais
 			if statLocal, errStat := os.Lstat(localPath); errStat == nil {
+				var symlinkTarget string
+				if statLocal.Mode()&os.ModeSymlink != 0 {
+					if t, errTarget := os.Readlink(localPath); errTarget == nil {
+						symlinkTarget = normalizeSymlinkTarget(t, e.LocalDir)
+					}
+				}
 				e.lastState[path] = FileEntry{
-					RelPath: path,
-					Size:    statLocal.Size(),
-					ModTime: statLocal.ModTime().UTC().Truncate(time.Second),
-					Mode:    statLocal.Mode(),
-					IsDir:   statLocal.IsDir(),
+					RelPath:       path,
+					Size:          statLocal.Size(),
+					ModTime:       statLocal.ModTime().UTC().Truncate(time.Second),
+					Mode:          statLocal.Mode(),
+					IsDir:         statLocal.IsDir(),
+					SymlinkTarget: symlinkTarget,
 				}
 			}
 		}
@@ -740,12 +758,19 @@ func (e *Engine) SyncExec() (int, error) {
 		} else {
 			// Sucesso: atualiza o histórico com os metadados corretos locais
 			if statLocal, errStat := os.Lstat(localPath); errStat == nil {
+				var symlinkTarget string
+				if statLocal.Mode()&os.ModeSymlink != 0 {
+					if t, errTarget := os.Readlink(localPath); errTarget == nil {
+						symlinkTarget = normalizeSymlinkTarget(t, e.LocalDir)
+					}
+				}
 				e.lastState[path] = FileEntry{
-					RelPath: path,
-					Size:    statLocal.Size(),
-					ModTime: statLocal.ModTime().UTC().Truncate(time.Second),
-					Mode:    statLocal.Mode(),
-					IsDir:   statLocal.IsDir(),
+					RelPath:       path,
+					Size:          statLocal.Size(),
+					ModTime:       statLocal.ModTime().UTC().Truncate(time.Second),
+					Mode:          statLocal.Mode(),
+					IsDir:         statLocal.IsDir(),
+					SymlinkTarget: symlinkTarget,
 				}
 			}
 		}

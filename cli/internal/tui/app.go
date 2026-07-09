@@ -1324,6 +1324,66 @@ func (m *AppModel) handlePromptSubmit() tea.Cmd {
 		} else {
 			m.registerProject(m.chosenRemote, "")
 		}
+	case "project_delete_confirm":
+		if strings.HasPrefix(strings.ToLower(val), "s") || strings.HasPrefix(strings.ToLower(val), "y") {
+			proj := m.pendingProject
+			store := config.NewStore()
+			if err := store.RemoveProject(m.activeHost, proj.Path); err != nil {
+				m.addLog(fmt.Sprintf("Erro ao remover projeto: %v", err))
+			} else {
+				if cfg, err := store.Load(); err == nil {
+					m.cfg = cfg
+				}
+				// Remove from memory list immediately
+				projIdx := -1
+				for i, p := range m.projects {
+					if p.Path == proj.Path {
+						projIdx = i
+						break
+					}
+				}
+				if projIdx != -1 {
+					m.projects = append(m.projects[:projIdx], m.projects[projIdx+1:]...)
+				}
+
+				// Remove any sync sessions linked to this project
+				if sess, ok := m.sessMgr.GetSession(m.activeHost); ok && sess != nil {
+					for _, s := range sess.Syncs {
+						if s.RemoteDir == proj.Path || strings.HasPrefix(s.RemoteDir, proj.Path+"/") {
+							// Stop watchers if running in live session
+							if hostSyncs, exists := m.syncSessions[m.activeHost]; exists {
+								if live, exists := hostSyncs[s.ID]; exists {
+									if live.localWatcher != nil {
+										live.localWatcher.Stop()
+									}
+									if live.remoteWatcher != nil {
+										live.remoteWatcher.Stop()
+									}
+									if live.stopChan != nil {
+										close(live.stopChan)
+									}
+									delete(hostSyncs, s.ID)
+								}
+							}
+							_ = m.sessMgr.RemoveSync(m.activeHost, s.ID)
+							m.addLog(fmt.Sprintf("Sync %s atrelado ao projeto '%s' parado e removido.", s.ID, proj.Name))
+						}
+					}
+					m.selectedSyncRow = 0
+				}
+
+				// Clamp selectedProjectRow
+				newItems := m.buildProjectTree()
+				if len(newItems) > 0 && m.selectedProjectRow >= len(newItems) {
+					m.selectedProjectRow = len(newItems) - 1
+				} else if len(newItems) == 0 {
+					m.selectedProjectRow = 0
+				}
+				m.addLog(fmt.Sprintf("Projeto '%s' removido.", proj.Name))
+			}
+		} else {
+			m.addLog("Exclusão do projeto cancelada.")
+		}
 	}
 	return nil
 }
@@ -1701,61 +1761,13 @@ func (m *AppModel) handleDeleteSelection() tea.Cmd {
 		item := items[m.selectedProjectRow]
 		if item.IsProject {
 			proj := item.Project
-			store := config.NewStore()
-			if err := store.RemoveProject(m.activeHost, proj.Path); err != nil {
-				m.addLog(fmt.Sprintf("Erro ao remover projeto: %v", err))
-			} else {
-				if cfg, err := store.Load(); err == nil {
-					m.cfg = cfg
-				}
-				// Remove from memory list immediately
-				projIdx := -1
-				for i, p := range m.projects {
-					if p.Path == proj.Path {
-						projIdx = i
-						break
-					}
-				}
-				if projIdx != -1 {
-					m.projects = append(m.projects[:projIdx], m.projects[projIdx+1:]...)
-				}
-
-				// Remove any sync sessions linked to this project
-				if sess, ok := m.sessMgr.GetSession(m.activeHost); ok && sess != nil {
-					for _, s := range sess.Syncs {
-						if s.RemoteDir == proj.Path || strings.HasPrefix(s.RemoteDir, proj.Path+"/") {
-							// Stop watchers if running in live session
-							if hostSyncs, exists := m.syncSessions[m.activeHost]; exists {
-								if live, exists := hostSyncs[s.ID]; exists {
-									if live.localWatcher != nil {
-										live.localWatcher.Stop()
-									}
-									if live.remoteWatcher != nil {
-										live.remoteWatcher.Stop()
-									}
-									if live.stopChan != nil {
-										close(live.stopChan)
-									}
-									delete(hostSyncs, s.ID)
-								}
-							}
-							_ = m.sessMgr.RemoveSync(m.activeHost, s.ID)
-							m.addLog(fmt.Sprintf("Sync %s atrelado ao projeto '%s' parado e removido.", s.ID, proj.Name))
-						}
-					}
-					m.selectedSyncRow = 0
-				}
-				
-				// Clamp selectedProjectRow
-				newItems := m.buildProjectTree()
-				if len(newItems) > 0 && m.selectedProjectRow >= len(newItems) {
-					m.selectedProjectRow = len(newItems) - 1
-				} else if len(newItems) == 0 {
-					m.selectedProjectRow = 0
-				}
-				m.addLog(fmt.Sprintf("Projeto '%s' removido.", proj.Name))
-			}
-			return nil
+			m.pendingProject = proj
+			m.promptType = "project_delete_confirm"
+			m.promptActive = true
+			m.textInput.SetValue("n")
+			m.textInput.Placeholder = "s/n"
+			m.textInput.Focus()
+			return textinput.Blink
 		} else if item.Session != nil {
 			name := item.Session.Name
 			m.addLog(fmt.Sprintf("Finalizando sessão Tmux %s...", name))
