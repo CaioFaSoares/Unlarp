@@ -252,6 +252,14 @@ func (m *AppModel) renderSyncs(width, height int) string {
 				statusStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#FF5555")).Bold(true)
 			}
 
+			var direction string
+			switch item.FileProgress.Action {
+			case "upload", "remote_delete":
+				direction = "LOCAL->REMOTE"
+			case "download", "local_delete":
+				direction = "REMOTE->LOCAL"
+			}
+
 			actionStr := "enviando"
 			if item.FileProgress.Action == "download" {
 				actionStr = "baixando"
@@ -259,11 +267,12 @@ func (m *AppModel) renderSyncs(width, height int) string {
 				actionStr = "deletando"
 			}
 
-			fileLine := fmt.Sprintf("%s└─ %s [%s] %s: %s",
+			fileLine := fmt.Sprintf("%s└─ %s [%s] %s (%s): %s",
 				indent,
 				icon,
 				statusStyle.Render(statusText),
 				actionStr,
+				direction,
 				item.FileProgress.Path,
 			)
 			if item.FileProgress.Status == internalsync.StatusFailed && item.FileProgress.Error != nil {
