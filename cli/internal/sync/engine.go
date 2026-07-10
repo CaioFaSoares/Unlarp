@@ -28,6 +28,11 @@ type Engine struct {
 	HostName         string           `json:"host_name"`
 	ConflictStrategy ConflictStrategy `json:"conflict_strategy"`
 	StatePath        string           `json:"state_path"`
+	AuditPath        string           `json:"audit_path"`
+
+	// StateWarning é preenchido quando o estado persistido estava corrompido e
+	// foi re-baselineado automaticamente — o caller decide como exibir.
+	StateWarning string `json:"-"`
 
 	sshClient      *internalssh.Client
 	sftpClient     *sftp.Client
@@ -46,6 +51,10 @@ type Engine struct {
 	gitGuard GitGuard
 
 	OnFileSuccess func(path string, action string)
+
+	// OnConflict é chamado a cada conflito resolvido pela estratégia
+	// (winner: "local" ou "remote"), para a TUI/CLI dar visibilidade.
+	OnConflict func(path string, winner string)
 }
 
 // GitGuard protege contra sobrescrita quando o remote mudou via Git
@@ -82,6 +91,10 @@ type SyncProgress struct {
 	PendingFiles   []FileProgress `json:"pending_files"`
 	CompletedFiles []FileProgress `json:"completed_files"`
 
+	// ConflictsResolved acumula (na vida da engine) quantos conflitos foram
+	// resolvidos automaticamente pela estratégia — detalhes no AuditPath.
+	ConflictsResolved int `json:"conflicts_resolved"`
+
 	// Estatísticas
 	Case              int     `json:"case"`
 	Percent           float64 `json:"percent"`
@@ -113,6 +126,7 @@ func NewEngine(id string, localDir, remoteDir, hostName string, globalIgnores []
 	}
 
 	statePath := filepath.Join(home, ".unlarp", fmt.Sprintf("sync_state_%s_%s.json", hostName, id))
+	auditPath := filepath.Join(home, ".unlarp", fmt.Sprintf("sync_audit_%s_%s.log", hostName, id))
 
 	// Cria o matcher de ignores
 	ignoreFile := filepath.Join(absLocal, ".unlarpignore")
@@ -125,6 +139,7 @@ func NewEngine(id string, localDir, remoteDir, hostName string, globalIgnores []
 		HostName:         hostName,
 		ConflictStrategy: strategy,
 		StatePath:        statePath,
+		AuditPath:        auditPath,
 		sshClient:        sshClient,
 		sftpClient:       sftpClient,
 		matcher:          matcher,
@@ -149,6 +164,29 @@ func (e *Engine) UpdateSFTPClient(client *sftp.Client) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.sftpClient = client
+}
+
+// withRetry tenta uma transferência até 3 vezes com backoff curto, para
+// absorver erros transitórios de SFTP sem abortar a ação do ciclo.
+func withRetry(fn func() error) error {
+	err := fn()
+	for attempt := 1; err != nil && attempt <= 2; attempt++ {
+		time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
+		err = fn()
+	}
+	return err
+}
+
+// audit registra uma decisão do sync em log append-only (AuditPath), uma linha
+// por ação — a trilha permanente do que a engine fez e por quê. Falha de I/O
+// aqui nunca interrompe o sync.
+func (e *Engine) audit(format string, args ...any) {
+	f, err := os.OpenFile(e.AuditPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	fmt.Fprintf(f, time.Now().Format(time.RFC3339)+" "+format+"\n", args...)
 }
 
 // GetProgress retorna uma cópia segura do progresso atual
@@ -243,6 +281,12 @@ func (e *Engine) finishFileProgress(path string, action string, isNew bool, err 
 	e.recalculatePercentLocked()
 	cb := e.OnFileSuccess
 	e.progressMu.Unlock()
+
+	if err != nil {
+		e.audit("%s FALHOU %s: %v", action, path, err)
+	} else {
+		e.audit("%s %s", action, path)
+	}
 
 	if err == nil && cb != nil {
 		cb(path, action)
@@ -425,6 +469,15 @@ type syncPlan struct {
 	remoteDeletes []string
 	adopt         []string // idênticos em ambos mas ausentes de A: adotar no histórico
 	forget        []string // deletados em ambos: limpar do histórico
+
+	// conflicts registra cada caminho em que os dois lados mudaram e a
+	// estratégia decidiu o vencedor — para auditoria e visibilidade na TUI
+	conflicts []planConflict
+}
+
+type planConflict struct {
+	path   string
+	winner string // "local" ou "remote"
 }
 
 // buildSyncPlan classifica cada caminho de L, R e A em ações. É uma função pura
@@ -471,8 +524,10 @@ func buildSyncPlan(L, R, A Snapshot, strategy ConflictStrategy) syncPlan {
 				// Conflito
 				if ResolveConflict(lEntry, rEntry, strategy) {
 					p.uploads = append(p.uploads, path)
+					p.conflicts = append(p.conflicts, planConflict{path, "local"})
 				} else {
 					p.downloads = append(p.downloads, path)
+					p.conflicts = append(p.conflicts, planConflict{path, "remote"})
 				}
 			} else {
 				// Idênticos: adota no histórico. Sem isso, deletar o arquivo em um
@@ -492,8 +547,10 @@ func buildSyncPlan(L, R, A Snapshot, strategy ConflictStrategy) syncPlan {
 				// Conflito: modificado em ambos
 				if ResolveConflict(lEntry, rEntry, strategy) {
 					p.uploads = append(p.uploads, path)
+					p.conflicts = append(p.conflicts, planConflict{path, "local"})
 				} else {
 					p.downloads = append(p.downloads, path)
+					p.conflicts = append(p.conflicts, planConflict{path, "remote"})
 				}
 			}
 		}
@@ -572,6 +629,21 @@ func (e *Engine) SyncExec() (int, error) {
 	A := e.lastState
 
 	plan := buildSyncPlan(L, R, A, e.ConflictStrategy)
+
+	// Conflitos resolvidos automaticamente deixam de ser silenciosos: trilha
+	// permanente no audit log, contador no progresso e callback para a TUI.
+	if len(plan.conflicts) > 0 {
+		for _, c := range plan.conflicts {
+			e.audit("conflict %s vencedor=%s estrategia=%s", c.path, c.winner, e.ConflictStrategy)
+			if cb := e.OnConflict; cb != nil {
+				cb(c.path, c.winner)
+			}
+		}
+		e.progressMu.Lock()
+		e.progress.ConflictsResolved += len(plan.conflicts)
+		e.progressMu.Unlock()
+	}
+
 	uploads := plan.uploads
 	downloads := plan.downloads
 	localDeletes := plan.localDeletes
@@ -759,7 +831,7 @@ func (e *Engine) SyncExec() (int, error) {
 		_ = os.MkdirAll(filepath.Dir(localPath), 0755)
 
 		e.startFileProgress(path, "download")
-		err := e.downloadFile(remotePath, localPath)
+		err := withRetry(func() error { return e.downloadFile(remotePath, localPath) })
 		e.finishFileProgress(path, "download", false, err)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("falha ao baixar %s: %w", path, err))
@@ -798,7 +870,7 @@ func (e *Engine) SyncExec() (int, error) {
 		_ = e.sftpClient.MkdirAll(remoteDir)
 
 		e.startFileProgress(path, "upload")
-		err := e.uploadFile(localPath, remotePath)
+		err := withRetry(func() error { return e.uploadFile(localPath, remotePath) })
 		_, inR := R[path]
 		isNew := !inR
 		e.finishFileProgress(path, "upload", isNew, err)
@@ -835,7 +907,7 @@ func (e *Engine) SyncExec() (int, error) {
 	}
 
 	if len(errs) > 0 {
-		return totalActions - len(errs), fmt.Errorf("sync concluído com %d falha(s). Exemplo: %v", len(errs), errs[0])
+		return totalActions - len(errs), fmt.Errorf("sync concluído com %d falha(s) (todas registradas em %s). Exemplo: %v", len(errs), e.AuditPath, errs[0])
 	}
 
 	return totalActions, nil
@@ -1071,7 +1143,14 @@ func (e *Engine) loadLastState() error {
 
 	var state Snapshot
 	if err := json.Unmarshal(data, &state); err != nil {
-		return fmt.Errorf("estado do sync corrompido em %s (delete o arquivo para re-baseline): %w", e.StatePath, err)
+		// Estado corrompido não bloqueia mais o boot: preserva o arquivo para
+		// perícia, avisa o caller e re-baseline a partir do estado atual — a
+		// reconciliação de 3 vias trata baseline vazio com adoção segura.
+		corruptPath := e.StatePath + ".corrupt"
+		_ = os.Rename(e.StatePath, corruptPath)
+		e.StateWarning = fmt.Sprintf("estado do sync corrompido (movido para %s); re-baseline automático a partir do estado atual", corruptPath)
+		e.audit("state corrompido: re-baseline automático (backup em %s): %v", corruptPath, err)
+		return nil
 	}
 
 	// Trunca os timestamps carregados do estado anterior para garantir

@@ -190,6 +190,13 @@ func runSyncStart(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	if engine.StateWarning != "" {
+		ui.Warn("%s", engine.StateWarning)
+	}
+	engine.OnConflict = func(path string, winner string) {
+		ui.Warn("Conflito em %s — venceu %s (%s); trilha em %s", path, winner, engine.ConflictStrategy, engine.AuditPath)
+	}
+
 	// Registra no session state
 	sessMgr, _ := session.NewManager()
 	if sessMgr != nil && displayName != "" {
@@ -199,6 +206,8 @@ func runSyncStart(cmd *cobra.Command, args []string) error {
 			RemoteDir: remoteDir,
 			Mode:      syncMode,
 			LastSync:  time.Now(),
+			PID:       os.Getpid(),
+			Owner:     "cli",
 		})
 	}
 
@@ -339,12 +348,20 @@ func runSyncStatus(cmd *cobra.Command, args []string) error {
 	hasSyncs := false
 
 	table := tablewriter.NewTable(os.Stdout)
-	table.Header("SESSION ID", "HOST", "LOCAL DIR", "REMOTE DIR", "MODE")
+	table.Header("SESSION ID", "HOST", "LOCAL DIR", "REMOTE DIR", "MODE", "STATUS", "LAST SYNC")
 
 	for name, sess := range sessions {
 		for _, s := range sess.Syncs {
 			hasSyncs = true
-			table.Append(s.ID, name, s.LocalDir, s.RemoteDir, s.Mode)
+			status := "morto"
+			if s.Alive() {
+				status = fmt.Sprintf("ativo (pid %d)", s.PID)
+			}
+			lastSync := "—"
+			if !s.LastSync.IsZero() {
+				lastSync = s.LastSync.Format("02/01 15:04")
+			}
+			table.Append(s.ID, name, s.LocalDir, s.RemoteDir, s.Mode, status, lastSync)
 		}
 	}
 
@@ -389,6 +406,19 @@ func runSyncStop(cmd *cobra.Command, args []string) error {
 	for name, sess := range sessions {
 		for _, s := range sess.Syncs {
 			if s.ID == id {
+				// Para de fato o processo dono quando é um `sync start` do CLI.
+				// Syncs da TUI não são sinalizados: matar o PID derrubaria a TUI
+				// inteira — nesse caso o stop é pela própria TUI (tecla x).
+				if s.Alive() && s.PID != os.Getpid() {
+					if s.Owner == "cli" {
+						if proc, err := os.FindProcess(s.PID); err == nil {
+							_ = proc.Signal(syscall.SIGTERM)
+							ui.Info("Processo de sync (pid %d) sinalizado para parar.", s.PID)
+						}
+					} else {
+						ui.Warn("Sync gerenciado pela TUI (pid %d) — pare pela aba Syncs; removendo só o registro.", s.PID)
+					}
+				}
 				_ = sessMgr.RemoveSync(name, id)
 				ui.Success("Sessão de sincronização '%s' removida do registro.", id)
 				return nil

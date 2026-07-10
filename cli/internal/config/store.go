@@ -39,6 +39,7 @@ type Project struct {
 	Name       string `yaml:"name"`
 	RemotePath string `yaml:"remote_path"`
 	LocalDir   string `yaml:"local_dir,omitempty"` // pasta local vinculada, se um sync foi criado no cadastro
+	Compose    string `yaml:"compose,omitempty"`   // arquivo docker-compose relativo ao path do projeto (vazio = padrão do docker)
 }
 
 // SyncConfig contém as configurações globais de sincronização

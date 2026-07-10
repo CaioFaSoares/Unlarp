@@ -3,6 +3,7 @@ package tui
 import (
 	"fmt"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/CaioFaSoares/unlarp/internal/session"
@@ -91,17 +92,39 @@ func (m *AppModel) renderProjects(width, height int) string {
 
 			line = fmt.Sprintf("%s %-24s %-16s %-10s", marker, nameCol, branchStr, syncState)
 		} else if item.Session != nil {
-			indent := "    "
-			nameCol := fmt.Sprintf("%s└─ %s", indent, item.Session.Name)
-			windowsStr := fmt.Sprintf("%d janelas", item.Session.Windows)
-			if item.Session.Windows == 1 {
-				windowsStr = "1 janela"
+			ts := item.Session
+			nameCol := fmt.Sprintf("    └─ %s %s", ts.StateIcon(), ts.Name)
+			if ts.Attached {
+				nameCol += "*" // convenção tmux para sessão attached
 			}
-			statusStr := "Detached"
-			if item.Session.Attached {
-				statusStr = "Attached"
+
+			// Branch da worktree onde a sessão roda (coletada pelo mesmo batch
+			// git dos projetos, chaveada pelo pane_current_path)
+			branchStr := fmt.Sprintf("%d janelas", ts.Windows)
+			if ts.Windows == 1 {
+				branchStr = "1 janela"
 			}
-			line = fmt.Sprintf("  %-24s %-16s %-10s", nameCol, windowsStr, statusStr)
+			if info, ok := m.gitInfo[ts.Path]; ok && info.IsGitRepo && info.Branch != "" {
+				branchStr = info.Branch
+				if info.IsDirty {
+					branchStr += " *"
+				}
+				if info.AheadBehind.Ahead > 0 || info.AheadBehind.Behind > 0 {
+					branchStr += fmt.Sprintf(" ↑%d↓%d", info.AheadBehind.Ahead, info.AheadBehind.Behind)
+				}
+			}
+
+			statusStr := ts.Command
+			switch ts.State() {
+			case "idle":
+				statusStr = "idle"
+				if d := ts.IdleFor(); d >= time.Minute {
+					statusStr = fmt.Sprintf("idle %s", formatIdle(d))
+				}
+			case "morto":
+				statusStr = "morto"
+			}
+			line = fmt.Sprintf("  %-24s %-16s %-10s", nameCol, branchStr, statusStr)
 		}
 
 		if i == m.selectedProjectRow && !m.sidebarFocus {
@@ -139,7 +162,10 @@ func (m *AppModel) renderProjects(width, height int) string {
 		}
 		
 		if !selectedItem.IsProject && selectedItem.Session != nil {
-			metadataHeight += 3 // Sessão Tmux, Janelas, Attached
+			metadataHeight += 4 // Sessão Tmux, Janelas, Attached, Estado
+			if info, ok := m.gitInfo[selectedItem.Session.Path]; ok && info.IsGitRepo {
+				metadataHeight++ // Git (worktree)
+			}
 			if selectedItem.Session.Command != "" {
 				metadataHeight++ // Comando
 			}
@@ -238,11 +264,29 @@ func (m *AppModel) renderProjectDetail(width, maxOutputLines int, syncs []sessio
 	}
 
 	if !item.IsProject && item.Session != nil {
-		sb.WriteString(fmt.Sprintf(" %s %s\n", styles.StatusLabelStyle.Render("Sessão Tmux:"), item.Session.Name))
-		sb.WriteString(fmt.Sprintf(" %s %d\n", styles.StatusLabelStyle.Render("Janelas:"), item.Session.Windows))
-		sb.WriteString(fmt.Sprintf(" %s %t\n", styles.StatusLabelStyle.Render("Attached:"), item.Session.Attached))
-		if item.Session.Command != "" {
-			sb.WriteString(fmt.Sprintf(" %s %s\n", styles.StatusLabelStyle.Render("Comando:"), item.Session.Command))
+		ts := item.Session
+		sb.WriteString(fmt.Sprintf(" %s %s\n", styles.StatusLabelStyle.Render("Sessão Tmux:"), ts.Name))
+		sb.WriteString(fmt.Sprintf(" %s %d\n", styles.StatusLabelStyle.Render("Janelas:"), ts.Windows))
+		sb.WriteString(fmt.Sprintf(" %s %t\n", styles.StatusLabelStyle.Render("Attached:"), ts.Attached))
+		stateStr := fmt.Sprintf("%s %s", ts.StateIcon(), ts.State())
+		if ts.State() == "idle" {
+			if d := ts.IdleFor(); d >= time.Minute {
+				stateStr += fmt.Sprintf(" há %s", formatIdle(d))
+			}
+		}
+		sb.WriteString(fmt.Sprintf(" %s %s\n", styles.StatusLabelStyle.Render("Estado:"), stateStr))
+		if info, ok := m.gitInfo[ts.Path]; ok && info.IsGitRepo {
+			branchStr := info.Branch
+			if info.IsDirty {
+				branchStr += lipgloss.NewStyle().Foreground(lipgloss.Color("#FF5555")).Render(" *dirty*")
+			}
+			if info.AheadBehind.Ahead > 0 || info.AheadBehind.Behind > 0 {
+				branchStr += lipgloss.NewStyle().Foreground(lipgloss.Color("#F1FA8C")).Render(fmt.Sprintf(" (↑%d ↓%d)", info.AheadBehind.Ahead, info.AheadBehind.Behind))
+			}
+			sb.WriteString(fmt.Sprintf(" %s %s [%s]\n", styles.StatusLabelStyle.Render("Git (worktree):"), branchStr, info.CommitHash))
+		}
+		if ts.Command != "" {
+			sb.WriteString(fmt.Sprintf(" %s %s\n", styles.StatusLabelStyle.Render("Comando:"), ts.Command))
 		}
 	} else {
 		sb.WriteString(fmt.Sprintf(" %s (sessão Tmux padrão: %s)\n", styles.StatusLabelStyle.Render("Últimos comandos:"), proj.Name))
@@ -316,6 +360,14 @@ func (m *AppModel) renderProjectDetail(width, maxOutputLines int, syncs []sessio
 	}
 
 	return sb.String()
+}
+
+// formatIdle formata uma duração de inatividade de forma curta ("12m", "3h")
+func formatIdle(d time.Duration) string {
+	if d >= time.Hour {
+		return fmt.Sprintf("%dh", int(d.Hours()))
+	}
+	return fmt.Sprintf("%dm", int(d.Minutes()))
 }
 
 // truncateLine trunca visualmente uma linha para maxLen caracteres visuais

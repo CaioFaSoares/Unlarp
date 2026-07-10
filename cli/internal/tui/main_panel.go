@@ -146,7 +146,16 @@ func (m *AppModel) renderDashboard(width, height int) string {
 				displayName = s.Name
 			}
 
-			line := fmt.Sprintf("  ● %-14s %-30s (%d janelas) [%s]", displayName, s.Path, s.Windows, statusStr)
+			// Branch da worktree onde a sessão roda (se for repo git)
+			branchStr := "—"
+			if info, ok := m.gitInfo[s.Path]; ok && info.IsGitRepo && info.Branch != "" {
+				branchStr = info.Branch
+				if info.IsDirty {
+					branchStr += " *"
+				}
+			}
+
+			line := fmt.Sprintf("  %s %-14s %-16s %-30s (%d janelas) [%s]", s.StateIcon(), displayName, branchStr, s.Path, s.Windows, statusStr)
 
 			if i == m.selectedTmuxRow && !m.sidebarFocus {
 				sb.WriteString(styles.HostSelectedStyle.Render(line))
