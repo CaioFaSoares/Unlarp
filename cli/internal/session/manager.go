@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/CaioFaSoares/unlarp/internal/fsutil"
 )
 
 // State representa o estado persistido de todas as sessões
@@ -17,9 +19,9 @@ type State struct {
 
 // Session representa uma sessão de conexão com um host
 type Session struct {
-	Name        string       `json:"name"`
-	ConnectedAt *time.Time   `json:"connected_at,omitempty"`
-	Syncs       []SyncEntry  `json:"syncs,omitempty"`
+	Name        string        `json:"name"`
+	ConnectedAt *time.Time    `json:"connected_at,omitempty"`
+	Syncs       []SyncEntry   `json:"syncs,omitempty"`
 	Tunnels     []TunnelEntry `json:"tunnels,omitempty"`
 }
 
@@ -45,9 +47,9 @@ type TunnelEntry struct {
 
 // Manager gerencia múltiplas sessões com persistência
 type Manager struct {
-	state    *State
+	state     *State
 	statePath string
-	mu       sync.RWMutex
+	mu        sync.RWMutex
 }
 
 // NewManager cria um novo gerenciador de sessões
@@ -249,5 +251,5 @@ func (m *Manager) saveState() error {
 		return err
 	}
 
-	return os.WriteFile(m.statePath, data, 0600)
+	return fsutil.WriteFileAtomic(m.statePath, data, 0600)
 }

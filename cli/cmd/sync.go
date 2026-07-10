@@ -22,11 +22,11 @@ import (
 )
 
 var (
-	syncLocalDir   string
-	syncRemoteDir  string
-	syncMode       string
-	syncInit       string
-	syncStopAll    bool
+	syncLocalDir    string
+	syncRemoteDir   string
+	syncMode        string
+	syncInit        string
+	syncStopAll     bool
 	syncInteractive bool
 )
 
@@ -50,10 +50,10 @@ Exemplos:
 }
 
 var syncStatusCmd = &cobra.Command{
-	Use:   "status",
-	Short: "Mostrar status de sincronizações registradas",
+	Use:     "status",
+	Short:   "Mostrar status de sincronizações registradas",
 	Aliases: []string{"ls"},
-	RunE: runSyncStatus,
+	RunE:    runSyncStatus,
 }
 
 var syncStopCmd = &cobra.Command{
@@ -218,7 +218,10 @@ func runSyncStart(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Configura canal de trigger para a engine
+	// Configura canal de trigger para a engine.
+	// Buffer 1 + send com default é um coalescer intencional (dirty flag), não uma
+	// fila: SyncExec é reconciliação full-state, então um único token pendente
+	// cobre todas as mudanças que chegarem durante um ciclo. Não trocar por fila.
 	triggerSync := make(chan string, 1)
 
 	// Goroutine principal do loop de sincronização com debouncer e lock interno
@@ -277,6 +280,7 @@ func runSyncStart(cmd *cobra.Command, args []string) error {
 			newSSH.Close()
 			return nil, err
 		}
+		sftpClient.Close()
 		sshClient.Close()
 		sshClient = newSSH
 		sftpClient = newSFTP
@@ -291,6 +295,12 @@ func runSyncStart(cmd *cobra.Command, args []string) error {
 	remoteWatcher.Start()
 	defer remoteWatcher.Stop()
 	ui.Success("Monitorando diretório remoto (polling %s)...", pollInterval)
+
+	// Cobre edições feitas na janela entre o sync inicial e o start dos watchers
+	select {
+	case triggerSync <- "startup":
+	default:
+	}
 
 	fmt.Println()
 	ui.Warn("Mantenha este processo ativo para continuar sincronizando. Ctrl+C para parar.")
@@ -309,7 +319,9 @@ func runSyncStart(cmd *cobra.Command, args []string) error {
 		_ = sessMgr.RemoveSync(displayName, syncID)
 	}
 
-	close(triggerSync)
+	// Não fecha triggerSync: os watchers (parados só nos defers, depois daqui)
+	// ainda podem enviar um último evento — send em canal fechado panicaria.
+	// A goroutine de sync morre com o processo.
 	sftpClient.Close()
 	sshClient.Close()
 	ui.Success("Sincronização parada com sucesso")

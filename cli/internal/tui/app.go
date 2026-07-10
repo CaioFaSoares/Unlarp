@@ -295,7 +295,19 @@ type cleanupFinishedMsg struct{}
 
 func (m *AppModel) cleanupCmd() tea.Cmd {
 	return func() tea.Msg {
-		m.Cleanup()
+		done := make(chan struct{})
+		go func() {
+			m.Cleanup()
+			close(done)
+		}()
+
+		select {
+		case <-done:
+			// Limpeza finalizada normalmente
+		case <-time.After(5 * time.Second):
+			// Timeout de segurança atingido para evitar travamento da TUI
+			// (Close de SSH/SFTP em rede lenta pode exceder 1,5s e deixaria watchers vivos)
+		}
 		return cleanupFinishedMsg{}
 	}
 }
@@ -307,6 +319,21 @@ func (m *AppModel) Init() tea.Cmd {
 
 // Cleanup encerra todas as conexões e watchers ativos de background
 func (m *AppModel) Cleanup() {
+	// 1. Fechar todas as conexões SFTP e SSH primeiro para interromper chamadas de rede bloqueantes
+	m.sshMu.Lock()
+	for _, sftpCli := range m.sftpClients {
+		if sftpCli != nil {
+			_ = sftpCli.Close()
+		}
+	}
+	for _, client := range m.sshClients {
+		if client != nil {
+			_ = client.Close()
+		}
+	}
+	m.sshMu.Unlock()
+
+	// 2. Parar os watchers ativos
 	for _, hostSyncs := range m.syncSessions {
 		for _, s := range hostSyncs {
 			if s.localWatcher != nil {
@@ -320,15 +347,13 @@ func (m *AppModel) Cleanup() {
 			}
 		}
 	}
-	for _, mgr := range m.tunnelManagers {
-		mgr.Close()
-	}
 
-	m.sshMu.Lock()
-	for _, client := range m.sshClients {
-		client.Close()
+	// 3. Fechar os gerenciadores de túnel
+	for _, mgr := range m.tunnelManagers {
+		if mgr != nil {
+			mgr.Close()
+		}
 	}
-	m.sshMu.Unlock()
 }
 
 // Update gerencia mensagens e entrada do usuário
@@ -1831,14 +1856,14 @@ func (m *AppModel) handleDeleteSelection() tea.Cmd {
 
 func (m *AppModel) getOrCreateSSHClient(hostName string, hostCfg *config.Host) (*internalssh.Client, error) {
 	m.sshMu.Lock()
-	defer m.sshMu.Unlock()
-
 	client, exists := m.sshClients[hostName]
 	if exists && client.IsConnected() {
+		m.sshMu.Unlock()
 		return client, nil
 	}
+	m.sshMu.Unlock()
 
-	// Cria e conecta
+	// Cria e conecta fora do mutex lock para evitar contenção e travamento ao sair
 	newClient, err := internalssh.NewClient(hostCfg)
 	if err != nil {
 		return nil, err
@@ -1846,6 +1871,16 @@ func (m *AppModel) getOrCreateSSHClient(hostName string, hostCfg *config.Host) (
 
 	if err := newClient.Connect(); err != nil {
 		return nil, err
+	}
+
+	m.sshMu.Lock()
+	defer m.sshMu.Unlock()
+
+	// Verifica se outra goroutine criou um cliente válido nesse meio tempo
+	existingClient, exists := m.sshClients[hostName]
+	if exists && existingClient.IsConnected() {
+		_ = newClient.Close()
+		return existingClient, nil
 	}
 
 	m.sshClients[hostName] = newClient
@@ -1857,16 +1892,27 @@ func (m *AppModel) getOrCreateSSHClient(hostName string, hostCfg *config.Host) (
 
 func (m *AppModel) getOrCreateSFTPClient(hostName string, client *internalssh.Client) (*sftp.Client, error) {
 	m.sshMu.Lock()
-	defer m.sshMu.Unlock()
-
 	sftpCli, exists := m.sftpClients[hostName]
 	if exists {
+		m.sshMu.Unlock()
 		return sftpCli, nil
 	}
+	m.sshMu.Unlock()
 
+	// Cria fora do mutex lock para evitar travar a TUI se a rede estiver lenta
 	newSFTP, err := internalssh.NewSFTPClient(client)
 	if err != nil {
 		return nil, err
+	}
+
+	m.sshMu.Lock()
+	defer m.sshMu.Unlock()
+
+	// Checa dupla criação
+	existingSFTP, exists := m.sftpClients[hostName]
+	if exists {
+		_ = newSFTP.Inner().Close()
+		return existingSFTP, nil
 	}
 
 	m.sftpClients[hostName] = newSFTP.Inner()
