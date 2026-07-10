@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/pkg/sftp"
 	"github.com/spf13/cobra"
 
+	"github.com/CaioFaSoares/unlarp/internal/agent"
 	"github.com/CaioFaSoares/unlarp/internal/config"
 	"github.com/CaioFaSoares/unlarp/internal/session"
 	internalssh "github.com/CaioFaSoares/unlarp/internal/ssh"
@@ -215,6 +217,18 @@ func runSyncStart(cmd *cobra.Command, args []string) error {
 	ui.Info("Local:  %s", absLocal)
 	ui.Info("Remoto: %s", remoteDir)
 
+	// Detecta o unlarp-agent no container antes do sync inicial: o snapshot
+	// remoto via agent acelera também o primeiro ciclo (reconnect).
+	// atomic.Pointer para o redial trocar o client sem corrida com SyncExec.
+	var agentRef atomic.Pointer[agent.Client]
+	agentClient := agent.Detect(sshClient)
+	if agentClient != nil {
+		agentRef.Store(agentClient)
+		engine.RemoteSnapshotFn = func() (internalsync.Snapshot, error) {
+			return agentRef.Load().Snapshot(remoteDir, globalIgnores)
+		}
+	}
+
 	// Executa sincronização inicial completa se configurado
 	if syncInit == "full" {
 		spinSync := ui.NewSpinner("Executando sincronização inicial...")
@@ -272,38 +286,72 @@ func runSyncStart(cmd *cobra.Command, args []string) error {
 	defer localWatcher.Stop()
 	ui.Success("Monitorando diretório local recursivamente...")
 
-	// Inicia o Remote Watcher (SFTP poll)
-	// Como precisamos de um ignore matcher que seja gerado localmente, passamos o matcher da engine
-	remoteWatcher := watcher.NewRemoteWatcher(remoteDir, sftpClient.Inner(), pollInterval, engine.IgnoreMatcher(), func(msg string) {
-		ui.Warn("%s", msg)
-	}, func() (*sftp.Client, error) {
+	// redial derruba e recria SSH+SFTP quando um watcher remoto perde a conexão
+	redial := func() (*internalssh.Client, *internalssh.SFTPClient, error) {
 		newSSH, err := internalssh.NewClient(hostCfg)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if err := newSSH.Connect(); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		newSFTP, err := internalssh.NewSFTPClient(newSSH)
 		if err != nil {
 			newSSH.Close()
-			return nil, err
+			return nil, nil, err
 		}
 		sftpClient.Close()
 		sshClient.Close()
 		sshClient = newSSH
 		sftpClient = newSFTP
 		engine.UpdateSFTPClient(newSFTP.Inner())
-		return newSFTP.Inner(), nil
-	}, func() {
+		return newSSH, newSFTP, nil
+	}
+
+	onRemoteChange := func() {
 		select {
 		case triggerSync <- "mudança remota":
 		default:
 		}
-	})
-	remoteWatcher.Start()
+	}
+
+	// Watcher remoto: unlarp-agent (inotify no container) quando disponível,
+	// senão o polling SFTP de sempre — tudo funciona igual sem o agent
+	var remoteWatcher watcher.Stopper
+	if agentClient != nil {
+		aw := watcher.NewAgentWatcher(remoteDir, agentClient, globalIgnores, func(msg string) {
+			ui.Warn("%s", msg)
+		}, func() (*agent.Client, error) {
+			newSSH, _, err := redial()
+			if err != nil {
+				return nil, err
+			}
+			newAgent := agent.New(newSSH)
+			agentRef.Store(newAgent)
+			return newAgent, nil
+		}, onRemoteChange)
+		if err := aw.Start(); err != nil {
+			ui.Warn("Agent detectado mas falhou ao observar (%v); usando polling SFTP.", err)
+		} else {
+			remoteWatcher = aw
+			ui.Success("Monitorando diretório remoto via unlarp-agent (inotify)...")
+		}
+	}
+	if remoteWatcher == nil {
+		rw := watcher.NewRemoteWatcher(remoteDir, sftpClient.Inner(), pollInterval, engine.IgnoreMatcher(), func(msg string) {
+			ui.Warn("%s", msg)
+		}, func() (*sftp.Client, error) {
+			_, newSFTP, err := redial()
+			if err != nil {
+				return nil, err
+			}
+			return newSFTP.Inner(), nil
+		}, onRemoteChange)
+		rw.Start()
+		remoteWatcher = rw
+		ui.Success("Monitorando diretório remoto (polling %s)...", pollInterval)
+	}
 	defer remoteWatcher.Stop()
-	ui.Success("Monitorando diretório remoto (polling %s)...", pollInterval)
 
 	// Cobre edições feitas na janela entre o sync inicial e o start dos watchers
 	select {

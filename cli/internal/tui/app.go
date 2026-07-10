@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
@@ -19,6 +20,8 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/pkg/sftp"
 
+	"github.com/CaioFaSoares/unlarp/internal/agent"
+	"github.com/CaioFaSoares/unlarp/internal/agentapi"
 	"github.com/CaioFaSoares/unlarp/internal/config"
 	"github.com/CaioFaSoares/unlarp/internal/git"
 	"github.com/CaioFaSoares/unlarp/internal/session"
@@ -43,7 +46,7 @@ type liveSyncSession struct {
 	id            string
 	engine        *internalsync.Engine
 	localWatcher  *watcher.LocalWatcher
-	remoteWatcher *watcher.RemoteWatcher
+	remoteWatcher watcher.Stopper // RemoteWatcher (SFTP poll) ou AgentWatcher (unlarp-agent)
 	stopChan      chan struct{}
 }
 
@@ -150,7 +153,7 @@ type syncStartedMsg struct {
 	remoteDir     string
 	engine        *internalsync.Engine
 	localWatcher  *watcher.LocalWatcher
-	remoteWatcher *watcher.RemoteWatcher
+	remoteWatcher watcher.Stopper
 	restored      bool // true quando religado automaticamente a partir do state persistido, não criado pelo usuário agora
 }
 
@@ -167,8 +170,8 @@ const (
 
 // AppModel é o modelo central do Bubble Tea
 type AppModel struct {
-	width  int
-	height int
+	width     int
+	height    int
 	isExiting bool
 
 	// Configs e Estado
@@ -203,6 +206,7 @@ type AppModel struct {
 	sshMu          *sync.Mutex
 	sshClients     map[string]*internalssh.Client
 	sftpClients    map[string]*sftp.Client
+	agentClients   map[string]*agent.Client // nil = detectado como ausente (cache negativo)
 	tunnelManagers map[string]*tunnel.Manager
 	syncSessions   map[string]map[string]*liveSyncSession
 	pendingSyncs   map[string][]pendingSync
@@ -218,9 +222,9 @@ type AppModel struct {
 	expandedSyncs      map[string]bool
 	pendingProject     Project
 
-	gitInfo        map[string]git.RemoteGitInfo // chave: RemotePath/RemoteDir do projeto
-	gitAlerts      map[string]string            // chave: syncID ou RemotePath -> motivo do bloqueio
-	gitTickCounter int
+	gitInfo         map[string]git.RemoteGitInfo // chave: RemotePath/RemoteDir do projeto
+	gitAlerts       map[string]string            // chave: syncID ou RemotePath -> motivo do bloqueio
+	gitTickCounter  int
 	syncTickCounter int
 
 	// Hosts cujos syncs persistidos já foram religados nesta execução da TUI
@@ -242,11 +246,11 @@ type AppModel struct {
 	obPassword     string
 
 	// DirPicker
-	dirPicker      *ui.DirPicker
-	pickerActive   bool
-	pickerStage    string // "local" | "remote"
-	chosenLocal    string
-	chosenRemote   string
+	dirPicker    *ui.DirPicker
+	pickerActive bool
+	pickerStage  string // "local" | "remote"
+	chosenLocal  string
+	chosenRemote string
 
 	// Logs
 	logs            []string
@@ -293,37 +297,38 @@ func NewAppModel() (*AppModel, error) {
 	isOnboarding := len(hostNames) == 0
 
 	return &AppModel{
-		cfg:            cfg,
-		hostNames:      hostNames,
-		selectedHost:   selected,
-		activeHost:     active,
-		activeTab:      tabDashboard,
-		sidebarFocus:   true,
+		cfg:                    cfg,
+		hostNames:              hostNames,
+		selectedHost:           selected,
+		activeHost:             active,
+		activeTab:              tabDashboard,
+		sidebarFocus:           true,
 		promptActive:           false,
 		pendingTunnelDirection: tunnel.DirectionLocal,
 		textInput:              ti,
-		sshMu:          &sync.Mutex{},
-		sshClients:     make(map[string]*internalssh.Client),
-		sftpClients:    make(map[string]*sftp.Client),
-		tunnelManagers: make(map[string]*tunnel.Manager),
-		syncSessions:   make(map[string]map[string]*liveSyncSession),
-		pendingSyncs:   make(map[string][]pendingSync),
-		projectOutput:    make(map[string]string),
-		expandedProjects: make(map[string]bool),
-		expandedSyncs:    make(map[string]bool),
-		gitInfo:          make(map[string]git.RemoteGitInfo),
-		gitAlerts:        make(map[string]string),
-		gitTickCounter:   0,
-		syncTickCounter:  0,
-		restoredHosts:    make(map[string]bool),
-		isOnboarding:     isOnboarding,
-		onboardingStep: 0,
-		obProfileName:  "",
-		obPort:         2222,
-		obUser:         "root",
-		obWorkspace:    "/workspace",
-		spinner:        s,
-		sessMgr:        sessMgr,
+		sshMu:                  &sync.Mutex{},
+		sshClients:             make(map[string]*internalssh.Client),
+		sftpClients:            make(map[string]*sftp.Client),
+		agentClients:           make(map[string]*agent.Client),
+		tunnelManagers:         make(map[string]*tunnel.Manager),
+		syncSessions:           make(map[string]map[string]*liveSyncSession),
+		pendingSyncs:           make(map[string][]pendingSync),
+		projectOutput:          make(map[string]string),
+		expandedProjects:       make(map[string]bool),
+		expandedSyncs:          make(map[string]bool),
+		gitInfo:                make(map[string]git.RemoteGitInfo),
+		gitAlerts:              make(map[string]string),
+		gitTickCounter:         0,
+		syncTickCounter:        0,
+		restoredHosts:          make(map[string]bool),
+		isOnboarding:           isOnboarding,
+		onboardingStep:         0,
+		obProfileName:          "",
+		obPort:                 2222,
+		obUser:                 "root",
+		obWorkspace:            "/workspace",
+		spinner:                s,
+		sessMgr:                sessMgr,
 		logs: []string{
 			"unlarp TUI inicializada com sucesso.",
 			"Configuração carregada de ~/.unlarp.yaml.",
@@ -957,6 +962,22 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 
+		case "b":
+			// Troca de branch orquestrada: pausa syncs do projeto, faz o
+			// checkout remoto (agent quando presente), reconcilia e retoma
+			if !m.sidebarFocus && m.activeTab == tabProjects {
+				items := m.buildProjectTree()
+				if len(items) > 0 && m.selectedProjectRow < len(items) {
+					m.pendingProject = items[m.selectedProjectRow].Project
+					m.promptType = "git_switch_branch"
+					m.promptActive = true
+					m.textInput.SetValue("")
+					m.textInput.Placeholder = "branch de destino (ex: main, feature/x)"
+					m.textInput.Focus()
+					return m, textinput.Blink
+				}
+			}
+
 		case "g", "G":
 			if !m.sidebarFocus && m.activeTab == tabLogs {
 				if msg.String() == "g" {
@@ -1059,7 +1080,7 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					store := config.NewStore()
 					if err := store.RemoveHost(hostToDelete); err == nil {
 						m.addLog(fmt.Sprintf("Host '%s' deletado com sucesso.", hostToDelete))
-						
+
 						cfg, errCfg := store.Load()
 						if errCfg == nil {
 							m.cfg = cfg
@@ -1068,7 +1089,7 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 								hostNames = append(hostNames, name)
 							}
 							m.hostNames = hostNames
-							
+
 							if len(hostNames) == 0 {
 								m.isOnboarding = true
 								m.onboardingStep = 0
@@ -1121,7 +1142,7 @@ func (m *AppModel) View() string {
 	sidebarWidth := 25
 	sidebarHeight := m.height - 5
 	sidebarContent := m.renderSidebar(sidebarHeight)
-	
+
 	sidebarBox := styles.SidebarStyle.Width(sidebarWidth).Height(sidebarHeight)
 	if m.sidebarFocus {
 		sidebarBox = styles.SidebarFocusedStyle.Width(sidebarWidth).Height(sidebarHeight)
@@ -1407,6 +1428,8 @@ func (m *AppModel) handlePromptSubmit() tea.Cmd {
 		}
 		m.expandedProjects[m.pendingProject.Path] = true
 		return m.createProjectSessionCmd(sessionName, m.pendingProject.Path)
+	case "git_switch_branch":
+		return m.switchBranchCmd(m.pendingProject.Path, val)
 	case "project_sync_confirm":
 		if strings.HasPrefix(strings.ToLower(val), "s") {
 			// Quer sync junto: abre o picker local para escolher a pasta que
@@ -1654,7 +1677,7 @@ func (m *AppModel) createSyncLiveCmd(syncID, val string) tea.Cmd {
 // um (host, syncID, dirs) já resolvidos. Usado tanto para sincronizações
 // novas (createSyncLiveCmd) quanto para religar as já persistidas no boot
 // (restoreSyncsCmd).
-func (m *AppModel) startSyncEngine(host, syncID, absLocal, remoteDir string, client *internalssh.Client, sftpCli *sftp.Client) (*internalsync.Engine, *watcher.LocalWatcher, *watcher.RemoteWatcher, error) {
+func (m *AppModel) startSyncEngine(host, syncID, absLocal, remoteDir string, client *internalssh.Client, sftpCli *sftp.Client) (*internalsync.Engine, *watcher.LocalWatcher, watcher.Stopper, error) {
 	engine, err := internalsync.NewEngine(
 		syncID,
 		absLocal,
@@ -1706,34 +1729,73 @@ func (m *AppModel) startSyncEngine(host, syncID, absLocal, remoteDir string, cli
 		return nil, nil, nil, fmt.Errorf("erro ao iniciar watcher local: %w", err)
 	}
 
-	// Watcher remoto: Start() faz uma varredura SFTP completa e síncrona do
-	// diretório remoto — por isso esta função sempre deve rodar fora de
-	// Update() (dentro de um tea.Cmd), nunca no goroutine principal da TUI.
-	pollInterval := m.cfg.Sync.PollIntervalDuration()
-	remoteWatcher := watcher.NewRemoteWatcher(remoteDir, sftpCli, pollInterval, engine.IgnoreMatcher(), m.addLog, func() (*sftp.Client, error) {
-		hostCfg, ok := m.cfg.Hosts[host]
-		if !ok {
-			return nil, fmt.Errorf("host '%s' não configurado", host)
-		}
-		newClient, err := m.getOrCreateSSHClient(host, &hostCfg)
-		if err != nil {
-			return nil, err
-		}
-		newSFTP, err := m.getOrCreateSFTPClient(host, newClient)
-		if err != nil {
-			return nil, err
-		}
-		engine.UpdateSFTPClient(newSFTP)
-		return newSFTP, nil
-	}, func() {
+	onRemoteChange := func() {
 		go func() {
 			_, err := engine.SyncExec()
 			if err != nil {
 				m.addLog(fmt.Sprintf("[%s] Erro ao sincronizar remoto: %v", syncID, err))
 			}
 		}()
-	})
-	remoteWatcher.Start()
+	}
+
+	// Watcher remoto: unlarp-agent (inotify no container) quando disponível,
+	// senão polling SFTP. Detect e Start fazem I/O de rede — assim como o
+	// RemoteWatcher.Start (varredura SFTP síncrona), esta função sempre deve
+	// rodar fora de Update() (dentro de um tea.Cmd), nunca no goroutine
+	// principal da TUI.
+	var remoteWatcher watcher.Stopper
+	if agentClient := m.getOrCreateAgentClient(host, client); agentClient != nil {
+		// atomic.Pointer: o redial troca o client sem corrida com o SyncExec
+		// que usa o RemoteSnapshotFn em outro goroutine
+		var agentRef atomic.Pointer[agent.Client]
+		agentRef.Store(agentClient)
+		aw := watcher.NewAgentWatcher(remoteDir, agentClient, m.cfg.Sync.IgnorePatterns, m.addLog, func() (*agent.Client, error) {
+			hostCfg, ok := m.cfg.Hosts[host]
+			if !ok {
+				return nil, fmt.Errorf("host '%s' não configurado", host)
+			}
+			newClient, err := m.getOrCreateSSHClient(host, &hostCfg)
+			if err != nil {
+				return nil, err
+			}
+			if newSFTP, err := m.getOrCreateSFTPClient(host, newClient); err == nil {
+				engine.UpdateSFTPClient(newSFTP)
+			}
+			newAgent := agent.New(newClient)
+			agentRef.Store(newAgent)
+			return newAgent, nil
+		}, onRemoteChange)
+		if err := aw.Start(); err != nil {
+			m.addLog(fmt.Sprintf("[%s] Agent detectado mas falhou ao observar (%v); usando polling SFTP.", syncID, err))
+		} else {
+			remoteWatcher = aw
+			engine.RemoteSnapshotFn = func() (internalsync.Snapshot, error) {
+				return agentRef.Load().Snapshot(remoteDir, m.cfg.Sync.IgnorePatterns)
+			}
+			m.addLog(fmt.Sprintf("[%s] Monitorando remoto via unlarp-agent (inotify).", syncID))
+		}
+	}
+	if remoteWatcher == nil {
+		pollInterval := m.cfg.Sync.PollIntervalDuration()
+		rw := watcher.NewRemoteWatcher(remoteDir, sftpCli, pollInterval, engine.IgnoreMatcher(), m.addLog, func() (*sftp.Client, error) {
+			hostCfg, ok := m.cfg.Hosts[host]
+			if !ok {
+				return nil, fmt.Errorf("host '%s' não configurado", host)
+			}
+			newClient, err := m.getOrCreateSSHClient(host, &hostCfg)
+			if err != nil {
+				return nil, err
+			}
+			newSFTP, err := m.getOrCreateSFTPClient(host, newClient)
+			if err != nil {
+				return nil, err
+			}
+			engine.UpdateSFTPClient(newSFTP)
+			return newSFTP, nil
+		}, onRemoteChange)
+		rw.Start()
+		remoteWatcher = rw
+	}
 
 	return engine, localWatcher, remoteWatcher, nil
 }
@@ -1895,7 +1957,7 @@ func (m *AppModel) handleDeleteSelection() tea.Cmd {
 	if m.activeTab == tabSyncs && len(sess.Syncs) > 0 {
 		// Para o sync selecionado
 		s := sess.Syncs[m.selectedSyncRow]
-		
+
 		// Encerra watchers se estiver rodando na live session
 		if hostSyncs, exists := m.syncSessions[m.activeHost]; exists {
 			if live, exists := hostSyncs[s.ID]; exists {
@@ -1962,10 +2024,30 @@ func (m *AppModel) getOrCreateSSHClient(hostName string, hostCfg *config.Host) (
 	}
 
 	m.sshClients[hostName] = newClient
-	// A conexão SSH foi recriada, então qualquer *sftp.Client em cache está
-	// preso à conexão morta anterior — descarta para forçar a recriação.
+	// A conexão SSH foi recriada, então qualquer *sftp.Client ou *agent.Client
+	// em cache está preso à conexão morta anterior — descarta para recriar.
 	delete(m.sftpClients, hostName)
+	delete(m.agentClients, hostName)
 	return newClient, nil
+}
+
+// getOrCreateAgentClient detecta o unlarp-agent uma vez por host e cacheia o
+// resultado (inclusive a ausência, para não pagar o handshake a cada tick).
+// O cache é invalidado junto com a conexão SSH em getOrCreateSSHClient.
+func (m *AppModel) getOrCreateAgentClient(hostName string, client *internalssh.Client) *agent.Client {
+	m.sshMu.Lock()
+	ac, checked := m.agentClients[hostName]
+	m.sshMu.Unlock()
+	if checked {
+		return ac
+	}
+
+	ac = agent.Detect(client) // fora do mutex: handshake com timeout de 2s
+
+	m.sshMu.Lock()
+	m.agentClients[hostName] = ac
+	m.sshMu.Unlock()
+	return ac
 }
 
 func (m *AppModel) getOrCreateSFTPClient(hostName string, client *internalssh.Client) (*sftp.Client, error) {
@@ -2030,6 +2112,28 @@ func (m *AppModel) checkTmuxCmd() tea.Cmd {
 		client, err := m.getOrCreateSSHClient(m.activeHost, &hostCfg)
 		if err != nil {
 			return tmuxSessionsMsg(nil)
+		}
+
+		// Via agent quando presente: resposta estruturada, sem parsing de shell
+		if ac := m.getOrCreateAgentClient(m.activeHost, client); ac != nil {
+			if resp, err := ac.Projects("", nil); err == nil {
+				sessions := make([]TmuxSession, 0, len(resp.Tmux))
+				for _, t := range resp.Tmux {
+					s := TmuxSession{
+						Name:     t.Name,
+						Windows:  t.Windows,
+						Attached: t.Attached,
+						Command:  t.Command,
+						Path:     t.Path,
+						PaneDead: t.PaneDead,
+					}
+					if t.ActivityUnix > 0 {
+						s.Activity = time.Unix(t.ActivityUnix, 0)
+					}
+					sessions = append(sessions, s)
+				}
+				return tmuxSessionsMsg(sessions)
+			}
 		}
 
 		// Uma linha por sessão: dados da sessão + comando/diretório do painel ativo
@@ -2102,89 +2206,110 @@ func (m *AppModel) checkProjectsCmd() tea.Cmd {
 		branches := make(map[string]string)
 
 		if client, err := m.getOrCreateSSHClient(m.activeHost, &hostCfg); err == nil {
-			var paths strings.Builder
+			allPaths := make([]string, 0, len(hostCfg.Projects)+len(sessionPaths))
 			queried := make(map[string]bool)
 			for _, p := range hostCfg.Projects {
 				queried[p.RemotePath] = true
-				paths.WriteString(shellQuote(p.RemotePath))
-				paths.WriteString(" ")
+				allPaths = append(allPaths, p.RemotePath)
 			}
 			for _, sp := range sessionPaths {
 				if !queried[sp] {
-					paths.WriteString(shellQuote(sp))
-					paths.WriteString(" ")
+					allPaths = append(allPaths, sp)
 				}
 			}
-			
-			gitCmd := fmt.Sprintf(
-				`for p in %s; do `+
-					`echo "PROJ|$p" && `+
-					`cd "$p" 2>/dev/null && git rev-parse --is-inside-work-tree >/dev/null 2>&1 && `+
-					`echo "REPO|true" && `+
-					`echo "BRANCH|$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" && `+
-					`echo "HASH|$(git rev-parse --short HEAD 2>/dev/null)" && `+
-					`echo "MSG|$(git log -1 --format=%%%%s 2>/dev/null)" && `+
-					`echo "TIME|$(git log -1 --format=%%%%aI 2>/dev/null)" && `+
-					`echo "DIRTY|$(git status --porcelain 2>/dev/null | head -1)" && `+
-					`echo "URL|$(git remote get-url origin 2>/dev/null)" && `+
-					`echo "AB|$(git rev-list --left-right --count HEAD...origin/$(git rev-parse --abbrev-ref HEAD) 2>/dev/null)" || `+
-					`echo "REPO|false"; `+
-				`done`,
-				strings.TrimSpace(paths.String()),
-			)
 
-			if stdout, _, err := client.RunCommand(gitCmd); err == nil {
-				var currentProj string
-				var currentInfo git.RemoteGitInfo
-				
-				for _, line := range strings.Split(stdout, "\n") {
-					line = strings.TrimSpace(line)
-					if line == "" {
-						continue
-					}
-					
-					parts := strings.SplitN(line, "|", 2)
-					if len(parts) != 2 {
-						continue
-					}
-					
-					key := parts[0]
-					val := strings.TrimSpace(parts[1])
-					
-					switch key {
-					case "PROJ":
-						if currentProj != "" {
-							gitInfos[currentProj] = currentInfo
-						}
-						currentProj = val
-						currentInfo = git.RemoteGitInfo{}
-					case "REPO":
-						currentInfo.IsGitRepo = val == "true"
-					case "BRANCH":
-						currentInfo.Branch = val
-						branches[currentProj] = val
-					case "HASH":
-						currentInfo.CommitHash = val
-					case "MSG":
-						currentInfo.CommitMessage = val
-					case "TIME":
-						if t, err := time.Parse(time.RFC3339, val); err == nil {
-							currentInfo.CommitTime = t
-						}
-					case "DIRTY":
-						currentInfo.IsDirty = val != ""
-					case "URL":
-						currentInfo.RemoteURL = val
-					case "AB":
-						abParts := strings.Fields(val)
-						if len(abParts) == 2 {
-							currentInfo.AheadBehind.Ahead, _ = strconv.Atoi(abParts[0])
-							currentInfo.AheadBehind.Behind, _ = strconv.Atoi(abParts[1])
+			// Via agent quando presente: uma chamada HTTP com git estruturado
+			// de todos os paths, sem parsing de shell
+			agentDone := false
+			if ac := m.getOrCreateAgentClient(m.activeHost, client); ac != nil {
+				if resp, err := ac.Projects("", allPaths); err == nil {
+					for _, pi := range resp.Projects {
+						gitInfos[pi.Path] = pi.Git
+						if pi.Git.IsGitRepo {
+							branches[pi.Path] = pi.Git.Branch
 						}
 					}
+					agentDone = true
 				}
-				if currentProj != "" {
-					gitInfos[currentProj] = currentInfo
+			}
+
+			if !agentDone {
+				var paths strings.Builder
+				for _, p := range allPaths {
+					paths.WriteString(shellQuote(p))
+					paths.WriteString(" ")
+				}
+
+				gitCmd := fmt.Sprintf(
+					`for p in %s; do `+
+						`echo "PROJ|$p" && `+
+						`cd "$p" 2>/dev/null && git rev-parse --is-inside-work-tree >/dev/null 2>&1 && `+
+						`echo "REPO|true" && `+
+						`echo "BRANCH|$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" && `+
+						`echo "HASH|$(git rev-parse --short HEAD 2>/dev/null)" && `+
+						`echo "MSG|$(git log -1 --format=%%%%s 2>/dev/null)" && `+
+						`echo "TIME|$(git log -1 --format=%%%%aI 2>/dev/null)" && `+
+						`echo "DIRTY|$(git status --porcelain 2>/dev/null | head -1)" && `+
+						`echo "URL|$(git remote get-url origin 2>/dev/null)" && `+
+						`echo "AB|$(git rev-list --left-right --count HEAD...origin/$(git rev-parse --abbrev-ref HEAD) 2>/dev/null)" || `+
+						`echo "REPO|false"; `+
+						`done`,
+					strings.TrimSpace(paths.String()),
+				)
+
+				if stdout, _, err := client.RunCommand(gitCmd); err == nil {
+					var currentProj string
+					var currentInfo git.RemoteGitInfo
+
+					for _, line := range strings.Split(stdout, "\n") {
+						line = strings.TrimSpace(line)
+						if line == "" {
+							continue
+						}
+
+						parts := strings.SplitN(line, "|", 2)
+						if len(parts) != 2 {
+							continue
+						}
+
+						key := parts[0]
+						val := strings.TrimSpace(parts[1])
+
+						switch key {
+						case "PROJ":
+							if currentProj != "" {
+								gitInfos[currentProj] = currentInfo
+							}
+							currentProj = val
+							currentInfo = git.RemoteGitInfo{}
+						case "REPO":
+							currentInfo.IsGitRepo = val == "true"
+						case "BRANCH":
+							currentInfo.Branch = val
+							branches[currentProj] = val
+						case "HASH":
+							currentInfo.CommitHash = val
+						case "MSG":
+							currentInfo.CommitMessage = val
+						case "TIME":
+							if t, err := time.Parse(time.RFC3339, val); err == nil {
+								currentInfo.CommitTime = t
+							}
+						case "DIRTY":
+							currentInfo.IsDirty = val != ""
+						case "URL":
+							currentInfo.RemoteURL = val
+						case "AB":
+							abParts := strings.Fields(val)
+							if len(abParts) == 2 {
+								currentInfo.AheadBehind.Ahead, _ = strconv.Atoi(abParts[0])
+								currentInfo.AheadBehind.Behind, _ = strconv.Atoi(abParts[1])
+							}
+						}
+					}
+					if currentProj != "" {
+						gitInfos[currentProj] = currentInfo
+					}
 				}
 			}
 		}
@@ -2360,8 +2485,8 @@ func (m *AppModel) runSSHKeySetupCmd() tea.Cmd {
 				// Conexão direta funcionou! Instala a chave.
 				installCmd := fmt.Sprintf(
 					`mkdir -p ~/.ssh && chmod 700 ~/.ssh && `+
-					`grep -qxF '%s' ~/.ssh/authorized_keys 2>/dev/null || echo '%s' >> ~/.ssh/authorized_keys && `+
-					`chmod 600 ~/.ssh/authorized_keys && chown -R $(whoami):$(id -gn) ~/.ssh`,
+						`grep -qxF '%s' ~/.ssh/authorized_keys 2>/dev/null || echo '%s' >> ~/.ssh/authorized_keys && `+
+						`chmod 600 ~/.ssh/authorized_keys && chown -R $(whoami):$(id -gn) ~/.ssh`,
 					pubKeyStr, pubKeyStr,
 				)
 				_, _, err2 := directClient.RunCommand(installCmd)
@@ -2421,7 +2546,7 @@ func (m *AppModel) runSSHKeySetupCmd() tea.Cmd {
 		// Conectado ao VPS! Roda docker exec para injetar a chave
 		bootstrapCmd := fmt.Sprintf(
 			`docker exec -i $(docker ps -qf label=com.docker.compose.service=workspace) sh -c `+
-			`"mkdir -p /root/.ssh && echo '%s' >> /root/.ssh/authorized_keys && chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys && chown -R root:root /root"`,
+				`"mkdir -p /root/.ssh && echo '%s' >> /root/.ssh/authorized_keys && chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys && chown -R root:root /root"`,
 			pubKeyStr,
 		)
 
@@ -2430,7 +2555,7 @@ func (m *AppModel) runSSHKeySetupCmd() tea.Cmd {
 			// Fallback para nome padrão de container se a label falhar
 			bootstrapCmdFallback := fmt.Sprintf(
 				`docker exec -i workspace_machine sh -c `+
-				`"mkdir -p /root/.ssh && echo '%s' >> /root/.ssh/authorized_keys && chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys && chown -R root:root /root"`,
+					`"mkdir -p /root/.ssh && echo '%s' >> /root/.ssh/authorized_keys && chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys && chown -R root:root /root"`,
 				pubKeyStr,
 			)
 			_, stderr, err = vpsClient.RunCommand(bootstrapCmdFallback)
@@ -2579,6 +2704,86 @@ type projectsGitMsg struct {
 	gitInfos map[string]git.RemoteGitInfo
 }
 
+// switchBranchCmd faz a troca de branch remota sem correr contra o sync:
+// pausa as engines do projeto, executa o checkout (agent quando presente,
+// SSH senão), atualiza o GitGuard com o novo estado, reconcilia e retoma.
+func (m *AppModel) switchBranchCmd(projPath, branch string) tea.Cmd {
+	host := m.activeHost
+	return func() tea.Msg {
+		hostCfg, ok := m.cfg.Hosts[host]
+		if !ok {
+			return nil
+		}
+		client, err := m.getOrCreateSSHClient(host, &hostCfg)
+		if err != nil {
+			m.addLog(fmt.Sprintf("Troca de branch: erro SSH: %v", err))
+			return nil
+		}
+
+		// Engines sincronizando este projeto (ou subpastas dele)
+		var engines []*internalsync.Engine
+		if hostSyncs, ok := m.syncSessions[host]; ok {
+			for _, sc := range hostSyncs {
+				if sc.engine != nil && (sc.engine.RemoteDir == projPath || strings.HasPrefix(sc.engine.RemoteDir, projPath+"/")) {
+					engines = append(engines, sc.engine)
+				}
+			}
+		}
+
+		for _, e := range engines {
+			e.Pause("troca de branch em andamento")
+		}
+		resumeAll := func() {
+			for _, e := range engines {
+				e.Resume()
+			}
+		}
+
+		m.addLog(fmt.Sprintf("Trocando branch de %s para %s (%d sync(s) pausado(s))...", projPath, branch, len(engines)))
+
+		var newBranch, newCommit string
+		if ac := m.getOrCreateAgentClient(host, client); ac != nil {
+			resp, err := ac.GitOp(projPath, agentapi.GitOpCheckout, []string{branch})
+			if err != nil {
+				resumeAll()
+				m.addLog(fmt.Sprintf("Checkout falhou: %v", err))
+				return nil
+			}
+			newBranch, newCommit = resp.Branch, resp.Commit
+		} else {
+			_, stderr, err := client.RunCommand(fmt.Sprintf("git -C %s checkout %s", shellQuote(projPath), shellQuote(branch)))
+			if err != nil {
+				resumeAll()
+				m.addLog(fmt.Sprintf("Checkout falhou: %s (%v)", strings.TrimSpace(stderr), err))
+				return nil
+			}
+			if info, err := git.GetRemoteGitInfo(client, projPath); err == nil && info.IsGitRepo {
+				newBranch, newCommit = info.Branch, info.CommitHash
+			}
+		}
+
+		// Atualiza o GitGuard antes de retomar, para o check periódico não
+		// interpretar a troca como divergência e pausar de novo
+		for _, e := range engines {
+			e.UpdateGitState(newCommit, newBranch)
+		}
+		resumeAll()
+
+		// Um ciclo de reconciliação explícito propaga a árvore da nova branch
+		for _, e := range engines {
+			eng := e
+			go func() {
+				if _, err := eng.SyncExec(); err != nil {
+					m.addLog(fmt.Sprintf("[%s] Erro ao reconciliar após troca de branch: %v", eng.ID, err))
+				}
+			}()
+		}
+
+		m.addLog(fmt.Sprintf("Branch de %s agora é %s (%s).", projPath, newBranch, newCommit))
+		return m.checkProjectsCmd()()
+	}
+}
+
 func (m *AppModel) checkGitCmd() tea.Cmd {
 	host := m.activeHost
 	hostCfg, ok := m.cfg.Hosts[host]
@@ -2617,7 +2822,7 @@ func (m *AppModel) checkGitCmd() tea.Cmd {
 				sessCtx, exists := activeHostSyncs[syncEntry.ID]
 				if exists && sessCtx.engine != nil {
 					guard := sessCtx.engine.GetGitGuard()
-					
+
 					if guard.LastKnownCommit == "" {
 						sessCtx.engine.UpdateGitState(info.CommitHash, info.Branch)
 					} else {
@@ -2684,9 +2889,9 @@ func (m *AppModel) resolveGitCmd(syncID, action, localDir, remoteDir, branch str
 					}
 				}
 			}
-			
+
 			sessCtx.engine.Resume()
-			
+
 		case "force":
 			hostCfg, ok := m.cfg.Hosts[host]
 			if ok {
