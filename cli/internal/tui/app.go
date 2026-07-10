@@ -63,8 +63,52 @@ type TmuxSession struct {
 	Name     string
 	Windows  int
 	Attached bool
-	Command  string // comando em execução no painel ativo
-	Path     string // diretório onde o comando está rodando
+	Command  string    // comando em execução no painel ativo
+	Path     string    // diretório onde o comando está rodando
+	PaneDead bool      // processo do painel ativo terminou (remain-on-exit)
+	Activity time.Time // última atividade registrada na janela ativa
+}
+
+// shellCommands são comandos que indicam que só o shell está rodando no
+// painel — ou seja, o agente/processo que rodava ali terminou (idle).
+var shellCommands = map[string]bool{
+	"zsh": true, "bash": true, "sh": true, "fish": true, "dash": true, "ksh": true, "tcsh": true,
+}
+
+// State infere o estado do painel ativo da sessão: "rodando", "idle" ou "morto".
+func (s TmuxSession) State() string {
+	if s.PaneDead {
+		return "morto"
+	}
+	if s.Command == "" || shellCommands[s.Command] {
+		return "idle"
+	}
+	return "rodando"
+}
+
+// StateIcon retorna o indicador visual do estado: ● rodando, ◌ idle, ✗ morto.
+func (s TmuxSession) StateIcon() string {
+	switch s.State() {
+	case "rodando":
+		return "●"
+	case "morto":
+		return "✗"
+	default:
+		return "◌"
+	}
+}
+
+// IdleFor retorna há quanto tempo a janela ativa está sem atividade
+// (zero se desconhecido). Sujeito a pequeno skew de relógio local vs remoto.
+func (s TmuxSession) IdleFor() time.Duration {
+	if s.Activity.IsZero() {
+		return 0
+	}
+	d := time.Since(s.Activity)
+	if d < 0 {
+		return 0
+	}
+	return d
 }
 
 type tmuxSessionsMsg []TmuxSession
@@ -530,6 +574,30 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case tmuxSessionsMsg:
+		// Loga transições de estado dos agentes (rodando -> idle/morto e
+		// sessões finalizadas). Só compara quando a nova listagem tem conteúdo,
+		// para não confundir erro transitório de SSH (msg nil) com "tudo sumiu".
+		if len(msg) > 0 && len(m.tmuxSessions) > 0 {
+			previous := make(map[string]TmuxSession, len(m.tmuxSessions))
+			for _, s := range m.tmuxSessions {
+				previous[s.Name] = s
+			}
+			for _, s := range msg {
+				if prev, ok := previous[s.Name]; ok {
+					if prev.State() == "rodando" && s.State() != "rodando" {
+						branchNote := ""
+						if info, ok := m.gitInfo[s.Path]; ok && info.IsGitRepo && info.Branch != "" {
+							branchNote = fmt.Sprintf(" (branch %s)", info.Branch)
+						}
+						m.addLog(fmt.Sprintf("Sessão %s: '%s' terminou — agora %s%s", s.Name, prev.Command, s.State(), branchNote))
+					}
+					delete(previous, s.Name)
+				}
+			}
+			for name := range previous {
+				m.addLog(fmt.Sprintf("Sessão tmux %s finalizada", name))
+			}
+		}
 		m.tmuxSessions = msg
 		if m.selectedTmuxRow >= len(m.tmuxSessions) {
 			m.selectedTmuxRow = 0
@@ -1612,6 +1680,14 @@ func (m *AppModel) startSyncEngine(host, syncID, absLocal, remoteDir string, cli
 		m.addLog(fmt.Sprintf("[%s] %s: %s", syncID, direction, path))
 	}
 
+	engine.OnConflict = func(path string, winner string) {
+		m.addLog(fmt.Sprintf("[%s] ⚡ CONFLITO em %s — venceu %s (%s)", syncID, path, winner, engine.ConflictStrategy))
+	}
+
+	if engine.StateWarning != "" {
+		m.addLog(fmt.Sprintf("[%s] ⚠ %s", syncID, engine.StateWarning))
+	}
+
 	// Watcher local. onWarn vai para m.addLog (aba Logs) em vez de
 	// os.Stderr, que corromperia visualmente a TUI em alt-screen.
 	localWatcher, err := watcher.NewLocalWatcher(engine.LocalDir, 200*time.Millisecond, engine.IgnoreMatcher(), m.addLog, func() {
@@ -1757,6 +1833,8 @@ func (m *AppModel) handleSyncStarted(msg syncStartedMsg) {
 			RemoteDir: msg.remoteDir,
 			Mode:      "bidirectional",
 			LastSync:  time.Now(),
+			PID:       os.Getpid(),
+			Owner:     "tui",
 		}); err != nil {
 			m.addLog(fmt.Sprintf("Erro ao salvar registro de sync: %v", err))
 		}
@@ -1956,7 +2034,7 @@ func (m *AppModel) checkTmuxCmd() tea.Cmd {
 
 		// Uma linha por sessão: dados da sessão + comando/diretório do painel ativo
 		// da janela ativa (o que está de fato rodando ali no momento).
-		stdout, _, err := client.RunCommand("tmux list-panes -a -f '#{&&:#{window_active},#{pane_active}}' -F '#{session_name}|#{session_windows}|#{?session_attached,1,0}|#{pane_current_command}|#{pane_current_path}' 2>/dev/null")
+		stdout, _, err := client.RunCommand("tmux list-panes -a -f '#{&&:#{window_active},#{pane_active}}' -F '#{session_name}|#{session_windows}|#{?session_attached,1,0}|#{pane_current_command}|#{pane_current_path}|#{pane_dead}|#{window_activity}' 2>/dev/null")
 		if err != nil {
 			return tmuxSessionsMsg(nil)
 		}
@@ -1986,6 +2064,12 @@ func (m *AppModel) checkTmuxCmd() tea.Cmd {
 				session.Command = parts[3]
 				session.Path = parts[4]
 			}
+			if len(parts) >= 7 {
+				session.PaneDead = parts[5] == "1"
+				if ts, err := strconv.ParseInt(parts[6], 10, 64); err == nil && ts > 0 {
+					session.Activity = time.Unix(ts, 0)
+				}
+			}
 
 			sessions = append(sessions, session)
 		}
@@ -1996,20 +2080,40 @@ func (m *AppModel) checkTmuxCmd() tea.Cmd {
 // checkProjectsCmd retorna um comando assíncrono que atualiza o status rico do Git
 // de cada projeto já cadastrado (config.Host.Projects) no host ativo de uma só vez.
 func (m *AppModel) checkProjectsCmd() tea.Cmd {
+	// Snapshot dos paths das sessões tmux fora do closure (que roda em outro
+	// goroutine): eles entram no mesmo batch git dos projetos, para que a TUI
+	// mostre branch/estado git por sessão (worktrees têm paths próprios).
+	sessionPaths := make([]string, 0, len(m.tmuxSessions))
+	seenPaths := make(map[string]bool)
+	for _, ts := range m.tmuxSessions {
+		if ts.Path != "" && !seenPaths[ts.Path] {
+			seenPaths[ts.Path] = true
+			sessionPaths = append(sessionPaths, ts.Path)
+		}
+	}
+
 	return func() tea.Msg {
 		hostCfg, ok := m.cfg.Hosts[m.activeHost]
-		if !ok || len(hostCfg.Projects) == 0 {
+		if !ok || (len(hostCfg.Projects) == 0 && len(sessionPaths) == 0) {
 			return projectsGitMsg{projects: nil, gitInfos: nil}
 		}
 
 		gitInfos := make(map[string]git.RemoteGitInfo)
 		branches := make(map[string]string)
-		
+
 		if client, err := m.getOrCreateSSHClient(m.activeHost, &hostCfg); err == nil {
 			var paths strings.Builder
+			queried := make(map[string]bool)
 			for _, p := range hostCfg.Projects {
+				queried[p.RemotePath] = true
 				paths.WriteString(shellQuote(p.RemotePath))
 				paths.WriteString(" ")
+			}
+			for _, sp := range sessionPaths {
+				if !queried[sp] {
+					paths.WriteString(shellQuote(sp))
+					paths.WriteString(" ")
+				}
 			}
 			
 			gitCmd := fmt.Sprintf(

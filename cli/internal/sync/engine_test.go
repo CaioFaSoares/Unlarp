@@ -154,3 +154,69 @@ func TestBuildSyncPlan(t *testing.T) {
 		})
 	}
 }
+
+func TestBuildSyncPlanRecordsConflicts(t *testing.T) {
+	t0 := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	t1 := t0.Add(time.Minute)
+	file := func(size int64, mt time.Time) FileEntry {
+		return FileEntry{Mode: 0644, Size: size, ModTime: mt}
+	}
+
+	// Conflito com histórico: modificado em ambos, local mais novo vence
+	p := buildSyncPlan(
+		Snapshot{"a.txt": file(20, t1)},
+		Snapshot{"a.txt": file(30, t0)},
+		Snapshot{"a.txt": file(10, t0.Add(-time.Minute))},
+		StrategyNewestWins,
+	)
+	if len(p.conflicts) != 1 || p.conflicts[0].path != "a.txt" || p.conflicts[0].winner != "local" {
+		t.Errorf("esperado conflito a.txt vencedor=local, obtido %+v", p.conflicts)
+	}
+
+	// Conflito sem histórico: novo em ambos com conteúdo diferente, remoto mais novo vence
+	p = buildSyncPlan(
+		Snapshot{"b.txt": file(10, t0)},
+		Snapshot{"b.txt": file(20, t1)},
+		Snapshot{},
+		StrategyNewestWins,
+	)
+	if len(p.conflicts) != 1 || p.conflicts[0].winner != "remote" {
+		t.Errorf("esperado conflito b.txt vencedor=remote, obtido %+v", p.conflicts)
+	}
+
+	// Sem conflito: mudança só de um lado não registra nada
+	p = buildSyncPlan(
+		Snapshot{"c.txt": file(20, t1)},
+		Snapshot{"c.txt": file(10, t0)},
+		Snapshot{"c.txt": file(10, t0)},
+		StrategyNewestWins,
+	)
+	if len(p.conflicts) != 0 {
+		t.Errorf("esperado nenhum conflito, obtido %+v", p.conflicts)
+	}
+}
+
+func TestLoadLastStateRebaselinesCorrupt(t *testing.T) {
+	dir := t.TempDir()
+	statePath := dir + "/sync_state_test.json"
+	if err := os.WriteFile(statePath, []byte("{corrompido"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	e := &Engine{StatePath: statePath, AuditPath: dir + "/audit.log", lastState: make(Snapshot)}
+	if err := e.loadLastState(); err != nil {
+		t.Fatalf("estado corrompido não deve bloquear: %v", err)
+	}
+	if e.StateWarning == "" {
+		t.Error("StateWarning deveria estar preenchido após re-baseline")
+	}
+	if len(e.lastState) != 0 {
+		t.Errorf("lastState deveria estar vazio após re-baseline, obtido %d entradas", len(e.lastState))
+	}
+	if _, err := os.Stat(statePath + ".corrupt"); err != nil {
+		t.Errorf("arquivo corrompido deveria ter sido preservado em .corrupt: %v", err)
+	}
+	if _, err := os.Stat(statePath); !os.IsNotExist(err) {
+		t.Error("arquivo de estado original deveria ter sido movido")
+	}
+}
