@@ -102,6 +102,12 @@ func (m *IgnoreMatcher) Matches(relPath string, isDir bool) bool {
 		return isDir
 	}
 
+	// Arquivos temporários de transferência do próprio unlarp (temp+rename atômico)
+	// nunca entram em snapshots nem disparam watchers
+	if strings.HasPrefix(baseName, ".unlarp-") || strings.HasSuffix(baseName, ".unlarp-tmp") {
+		return true
+	}
+
 	// 3. A pasta ".git/worktrees/" e seus conteúdos NÃO devem ser ignorados,
 	// pois mantêm os metadados das worktrees que precisamos sincronizar.
 	if strings.HasPrefix(path, ".git/worktrees/") || path == ".git/worktrees" {

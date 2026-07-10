@@ -13,6 +13,7 @@ import (
 
 	"github.com/pkg/sftp"
 
+	"github.com/CaioFaSoares/unlarp/internal/fsutil"
 	internalssh "github.com/CaioFaSoares/unlarp/internal/ssh"
 )
 
@@ -27,6 +28,11 @@ type Engine struct {
 	HostName         string           `json:"host_name"`
 	ConflictStrategy ConflictStrategy `json:"conflict_strategy"`
 	StatePath        string           `json:"state_path"`
+	AuditPath        string           `json:"audit_path"`
+
+	// StateWarning é preenchido quando o estado persistido estava corrompido e
+	// foi re-baselineado automaticamente — o caller decide como exibir.
+	StateWarning string `json:"-"`
 
 	sshClient      *internalssh.Client
 	sftpClient     *sftp.Client
@@ -45,6 +51,10 @@ type Engine struct {
 	gitGuard GitGuard
 
 	OnFileSuccess func(path string, action string)
+
+	// OnConflict é chamado a cada conflito resolvido pela estratégia
+	// (winner: "local" ou "remote"), para a TUI/CLI dar visibilidade.
+	OnConflict func(path string, winner string)
 }
 
 // GitGuard protege contra sobrescrita quando o remote mudou via Git
@@ -81,6 +91,10 @@ type SyncProgress struct {
 	PendingFiles   []FileProgress `json:"pending_files"`
 	CompletedFiles []FileProgress `json:"completed_files"`
 
+	// ConflictsResolved acumula (na vida da engine) quantos conflitos foram
+	// resolvidos automaticamente pela estratégia — detalhes no AuditPath.
+	ConflictsResolved int `json:"conflicts_resolved"`
+
 	// Estatísticas
 	Case              int     `json:"case"`
 	Percent           float64 `json:"percent"`
@@ -112,6 +126,7 @@ func NewEngine(id string, localDir, remoteDir, hostName string, globalIgnores []
 	}
 
 	statePath := filepath.Join(home, ".unlarp", fmt.Sprintf("sync_state_%s_%s.json", hostName, id))
+	auditPath := filepath.Join(home, ".unlarp", fmt.Sprintf("sync_audit_%s_%s.log", hostName, id))
 
 	// Cria o matcher de ignores
 	ignoreFile := filepath.Join(absLocal, ".unlarpignore")
@@ -124,6 +139,7 @@ func NewEngine(id string, localDir, remoteDir, hostName string, globalIgnores []
 		HostName:         hostName,
 		ConflictStrategy: strategy,
 		StatePath:        statePath,
+		AuditPath:        auditPath,
 		sshClient:        sshClient,
 		sftpClient:       sftpClient,
 		matcher:          matcher,
@@ -132,7 +148,9 @@ func NewEngine(id string, localDir, remoteDir, hostName string, globalIgnores []
 		lastState:        make(Snapshot),
 	}
 
-	e.loadLastState()
+	if err := e.loadLastState(); err != nil {
+		return nil, err
+	}
 
 	e.progress.Percent = 100
 	e.progress.Case = 1
@@ -146,6 +164,29 @@ func (e *Engine) UpdateSFTPClient(client *sftp.Client) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.sftpClient = client
+}
+
+// withRetry tenta uma transferência até 3 vezes com backoff curto, para
+// absorver erros transitórios de SFTP sem abortar a ação do ciclo.
+func withRetry(fn func() error) error {
+	err := fn()
+	for attempt := 1; err != nil && attempt <= 2; attempt++ {
+		time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
+		err = fn()
+	}
+	return err
+}
+
+// audit registra uma decisão do sync em log append-only (AuditPath), uma linha
+// por ação — a trilha permanente do que a engine fez e por quê. Falha de I/O
+// aqui nunca interrompe o sync.
+func (e *Engine) audit(format string, args ...any) {
+	f, err := os.OpenFile(e.AuditPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	fmt.Fprintf(f, time.Now().Format(time.RFC3339)+" "+format+"\n", args...)
 }
 
 // GetProgress retorna uma cópia segura do progresso atual
@@ -240,6 +281,12 @@ func (e *Engine) finishFileProgress(path string, action string, isNew bool, err 
 	e.recalculatePercentLocked()
 	cb := e.OnFileSuccess
 	e.progressMu.Unlock()
+
+	if err != nil {
+		e.audit("%s FALHOU %s: %v", action, path, err)
+	} else {
+		e.audit("%s %s", action, path)
+	}
 
 	if err == nil && cb != nil {
 		cb(path, action)
@@ -391,7 +438,7 @@ func (e *Engine) rebuildMatcher() {
 // hasParentTypeConflict verifica se qualquer pasta pai do caminho informado é um arquivo regular
 // no snapshot local (L) ou remoto (R). Isso detecta e previne colisões destrutivas onde uma pasta
 // foi convertida em arquivo ou vice-versa em um dos lados.
-func (e *Engine) hasParentTypeConflict(path string, L, R Snapshot) bool {
+func hasParentTypeConflict(path string, L, R Snapshot) bool {
 	parts := strings.Split(path, "/")
 	prefix := ""
 	for i := 0; i < len(parts)-1; i++ {
@@ -411,6 +458,143 @@ func (e *Engine) hasParentTypeConflict(path string, L, R Snapshot) bool {
 		}
 	}
 	return false
+}
+
+// syncPlan é o resultado puro da reconciliação de 3 vias: o que transferir,
+// o que deletar e quais mutações aplicar no histórico (A)
+type syncPlan struct {
+	uploads       []string
+	downloads     []string
+	localDeletes  []string
+	remoteDeletes []string
+	adopt         []string // idênticos em ambos mas ausentes de A: adotar no histórico
+	forget        []string // deletados em ambos: limpar do histórico
+
+	// conflicts registra cada caminho em que os dois lados mudaram e a
+	// estratégia decidiu o vencedor — para auditoria e visibilidade na TUI
+	conflicts []planConflict
+}
+
+type planConflict struct {
+	path   string
+	winner string // "local" ou "remote"
+}
+
+// buildSyncPlan classifica cada caminho de L, R e A em ações. É uma função pura
+// (sem I/O, sem mutação) para que a lógica de reconciliação seja testável isoladamente.
+func buildSyncPlan(L, R, A Snapshot, strategy ConflictStrategy) syncPlan {
+	var p syncPlan
+
+	// Analisa mudanças locais e novos arquivos
+	for path, lEntry := range L {
+		if hasParentTypeConflict(path, L, R) {
+			continue
+		}
+		rEntry, inR := R[path]
+		aEntry, inA := A[path]
+
+		if !inR && !inA {
+			// Novo localmente, não existe remoto nem no histórico
+			if !lEntry.IsDir {
+				p.uploads = append(p.uploads, path)
+			}
+		} else if !inR && inA {
+			// Excluído no remoto (estava no histórico mas sumiu do remoto)
+			if lEntry.Changed(aEntry) {
+				// Foi modificado localmente após a exclusão remota (conflito: recria remoto)
+				p.uploads = append(p.uploads, path)
+			} else {
+				// Exclusão normal remota -> deleta local
+				p.localDeletes = append(p.localDeletes, path)
+			}
+		} else if inR && !inA {
+			// Existe local e remoto, mas não no histórico (novo em ambos)
+			var hasDifference bool
+			lIsSymlink := lEntry.Mode&os.ModeSymlink != 0
+			rIsSymlink := rEntry.Mode&os.ModeSymlink != 0
+			if lIsSymlink != rIsSymlink {
+				hasDifference = true
+			} else if lIsSymlink {
+				hasDifference = lEntry.SymlinkTarget != rEntry.SymlinkTarget
+			} else {
+				hasDifference = lEntry.Size != rEntry.Size || !lEntry.ModTime.Equal(rEntry.ModTime)
+			}
+
+			if hasDifference {
+				// Conflito
+				if ResolveConflict(lEntry, rEntry, strategy) {
+					p.uploads = append(p.uploads, path)
+					p.conflicts = append(p.conflicts, planConflict{path, "local"})
+				} else {
+					p.downloads = append(p.downloads, path)
+					p.conflicts = append(p.conflicts, planConflict{path, "remote"})
+				}
+			} else {
+				// Idênticos: adota no histórico. Sem isso, deletar o arquivo em um
+				// lado o ressuscitaria no outro (cairia no branch "novo localmente")
+				p.adopt = append(p.adopt, path)
+			}
+		} else if inR && inA {
+			// Existe em todos
+			lChanged := lEntry.Changed(aEntry)
+			rChanged := rEntry.Changed(aEntry)
+
+			if lChanged && !rChanged {
+				p.uploads = append(p.uploads, path)
+			} else if rChanged && !lChanged {
+				p.downloads = append(p.downloads, path)
+			} else if lChanged && rChanged {
+				// Conflito: modificado em ambos
+				if ResolveConflict(lEntry, rEntry, strategy) {
+					p.uploads = append(p.uploads, path)
+					p.conflicts = append(p.conflicts, planConflict{path, "local"})
+				} else {
+					p.downloads = append(p.downloads, path)
+					p.conflicts = append(p.conflicts, planConflict{path, "remote"})
+				}
+			}
+		}
+	}
+
+	// Analisa mudanças remotas, exclusões locais e novos arquivos remotos
+	for path, rEntry := range R {
+		if hasParentTypeConflict(path, L, R) {
+			continue
+		}
+		_, inL := L[path]
+		aEntry, inA := A[path]
+
+		if !inL && !inA {
+			// Novo remoto
+			if !rEntry.IsDir {
+				p.downloads = append(p.downloads, path)
+			}
+		} else if !inL && inA {
+			// Excluído localmente
+			if rEntry.Changed(aEntry) {
+				// Modificado remoto após exclusão local -> recria local
+				p.downloads = append(p.downloads, path)
+			} else {
+				// Exclusão normal local -> deleta remoto
+				p.remoteDeletes = append(p.remoteDeletes, path)
+			}
+		}
+	}
+
+	// Analisa deletados em ambos
+	for path := range A {
+		if hasParentTypeConflict(path, L, R) {
+			continue
+		}
+		_, inL := L[path]
+		_, inR := R[path]
+		if !inL && !inR {
+			// Deletado nos dois lados, nada a fazer além de limpar o histórico
+			p.forget = append(p.forget, path)
+		}
+	}
+
+	return p
 }
 
 // SyncExec executa um ciclo completo de sincronização de três vias
@@ -444,118 +628,44 @@ func (e *Engine) SyncExec() (int, error) {
 	// A é o lastState (último estado salvo)
 	A := e.lastState
 
-	uploads := make([]string, 0)
-	downloads := make([]string, 0)
-	localDeletes := make([]string, 0)
-	remoteDeletes := make([]string, 0)
+	plan := buildSyncPlan(L, R, A, e.ConflictStrategy)
 
-	// Analisa mudanças locais e novos arquivos
-	for path, lEntry := range L {
-		if e.hasParentTypeConflict(path, L, R) {
-			continue
-		}
-		rEntry, inR := R[path]
-		aEntry, inA := A[path]
-
-		if !inR && !inA {
-			// Novo localmente, não existe remoto nem no histórico
-			if !lEntry.IsDir {
-				uploads = append(uploads, path)
-			}
-		} else if !inR && inA {
-			// Excluído no remoto (estava no histórico mas sumiu do remoto)
-			if lEntry.Changed(aEntry) {
-				// Foi modificado localmente após a exclusão remota (conflito: recria remoto)
-				uploads = append(uploads, path)
-			} else {
-				// Exclusão normal remota -> deleta local
-				localDeletes = append(localDeletes, path)
-			}
-		} else if inR && !inA {
-			// Existe local e remoto, mas não no histórico (novo em ambos)
-			var hasDifference bool
-			lIsSymlink := lEntry.Mode&os.ModeSymlink != 0
-			rIsSymlink := rEntry.Mode&os.ModeSymlink != 0
-			if lIsSymlink != rIsSymlink {
-				hasDifference = true
-			} else if lIsSymlink {
-				hasDifference = lEntry.SymlinkTarget != rEntry.SymlinkTarget
-			} else {
-				hasDifference = lEntry.Size != rEntry.Size || !lEntry.ModTime.Equal(rEntry.ModTime)
-			}
-
-			if hasDifference {
-				// Conflito
-				if ResolveConflict(lEntry, rEntry, e.ConflictStrategy) {
-					uploads = append(uploads, path)
-				} else {
-					downloads = append(downloads, path)
-				}
-			}
-		} else if inR && inA {
-			// Existe em todos
-			lChanged := lEntry.Changed(aEntry)
-			rChanged := rEntry.Changed(aEntry)
-
-			if lChanged && !rChanged {
-				uploads = append(uploads, path)
-			} else if rChanged && !lChanged {
-				downloads = append(downloads, path)
-			} else if lChanged && rChanged {
-				// Conflito: modificado em ambos
-				if ResolveConflict(lEntry, rEntry, e.ConflictStrategy) {
-					uploads = append(uploads, path)
-				} else {
-					downloads = append(downloads, path)
-				}
+	// Conflitos resolvidos automaticamente deixam de ser silenciosos: trilha
+	// permanente no audit log, contador no progresso e callback para a TUI.
+	if len(plan.conflicts) > 0 {
+		for _, c := range plan.conflicts {
+			e.audit("conflict %s vencedor=%s estrategia=%s", c.path, c.winner, e.ConflictStrategy)
+			if cb := e.OnConflict; cb != nil {
+				cb(c.path, c.winner)
 			}
 		}
+		e.progressMu.Lock()
+		e.progress.ConflictsResolved += len(plan.conflicts)
+		e.progressMu.Unlock()
 	}
 
-	// Analisa mudanças remotas, exclusões locais e novos arquivos remotos
-	for path, rEntry := range R {
-		if e.hasParentTypeConflict(path, L, R) {
-			continue
-		}
-		_, inL := L[path]
-		aEntry, inA := A[path]
+	uploads := plan.uploads
+	downloads := plan.downloads
+	localDeletes := plan.localDeletes
+	remoteDeletes := plan.remoteDeletes
 
-		if !inL && !inA {
-			// Novo remoto
-			if !rEntry.IsDir {
-				downloads = append(downloads, path)
-			}
-		} else if !inL && inA {
-			// Excluído localmente
-			if rEntry.Changed(aEntry) {
-				// Modificado remoto após exclusão local -> recria local
-				downloads = append(downloads, path)
-			} else {
-				// Exclusão normal local -> deleta remoto
-				remoteDeletes = append(remoteDeletes, path)
-			}
-		}
-	}
-
-	// Analisa deletados em ambos
+	// Aplica mutações de histórico decididas pelo planejamento
 	stateChanged := false
-	for path := range A {
-		if e.hasParentTypeConflict(path, L, R) {
-			continue
-		}
-		_, inL := L[path]
-		_, inR := R[path]
-		if !inL && !inR {
-			// Deletado nos dois lados, nada a fazer além de limpar o histórico
-			delete(e.lastState, path)
-			stateChanged = true
-		}
+	for _, path := range plan.adopt {
+		e.lastState[path] = L[path]
+		stateChanged = true
+	}
+	for _, path := range plan.forget {
+		delete(e.lastState, path)
+		stateChanged = true
 	}
 
 	totalActions := len(uploads) + len(downloads) + len(localDeletes) + len(remoteDeletes)
 	if totalActions == 0 {
 		if stateChanged {
-			e.saveLastState()
+			if err := e.saveLastState(); err != nil {
+				return 0, fmt.Errorf("falha ao salvar estado do sync: %w", err)
+			}
 		}
 		return 0, nil
 	}
@@ -659,7 +769,7 @@ func (e *Engine) SyncExec() (int, error) {
 	for _, path := range localDeletes {
 		e.startFileProgress(path, "local_delete")
 		localPath := filepath.Join(e.LocalDir, path)
-		
+
 		stat, err := os.Lstat(localPath)
 		if err == nil {
 			if stat.IsDir() {
@@ -670,7 +780,7 @@ func (e *Engine) SyncExec() (int, error) {
 		} else if os.IsNotExist(err) {
 			err = nil // Já não existe
 		}
-		
+
 		e.finishFileProgress(path, "local_delete", false, err)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("falha ao deletar local %s: %w", path, err))
@@ -684,7 +794,7 @@ func (e *Engine) SyncExec() (int, error) {
 	for _, path := range remoteDeletes {
 		e.startFileProgress(path, "remote_delete")
 		remotePath := filepath.ToSlash(filepath.Join(e.RemoteDir, path))
-		
+
 		stat, err := e.sftpClient.Lstat(remotePath)
 		if err == nil {
 			if stat.IsDir() {
@@ -695,7 +805,7 @@ func (e *Engine) SyncExec() (int, error) {
 		} else if os.IsNotExist(err) {
 			err = nil // Já não existe
 		}
-		
+
 		e.finishFileProgress(path, "remote_delete", false, err)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("falha ao deletar remoto %s: %w", path, err))
@@ -704,6 +814,13 @@ func (e *Engine) SyncExec() (int, error) {
 			delete(e.lastState, path)
 		}
 	}
+
+	// Persiste os deletes antes das transferências: um crash daqui em diante
+	// não pode ressuscitar arquivos já deletados
+	_ = e.saveLastState()
+
+	// ponytail: save periódico a cada 25 transferências, não por operação
+	opsSinceSave := 0
 
 	// 3. Executa Downloads (Remoto -> Local)
 	for _, path := range downloads {
@@ -714,7 +831,7 @@ func (e *Engine) SyncExec() (int, error) {
 		_ = os.MkdirAll(filepath.Dir(localPath), 0755)
 
 		e.startFileProgress(path, "download")
-		err := e.downloadFile(remotePath, localPath)
+		err := withRetry(func() error { return e.downloadFile(remotePath, localPath) })
 		e.finishFileProgress(path, "download", false, err)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("falha ao baixar %s: %w", path, err))
@@ -736,6 +853,10 @@ func (e *Engine) SyncExec() (int, error) {
 					SymlinkTarget: symlinkTarget,
 				}
 			}
+			opsSinceSave++
+			if opsSinceSave%25 == 0 {
+				_ = e.saveLastState()
+			}
 		}
 	}
 
@@ -749,7 +870,7 @@ func (e *Engine) SyncExec() (int, error) {
 		_ = e.sftpClient.MkdirAll(remoteDir)
 
 		e.startFileProgress(path, "upload")
-		err := e.uploadFile(localPath, remotePath)
+		err := withRetry(func() error { return e.uploadFile(localPath, remotePath) })
 		_, inR := R[path]
 		isNew := !inR
 		e.finishFileProgress(path, "upload", isNew, err)
@@ -773,17 +894,37 @@ func (e *Engine) SyncExec() (int, error) {
 					SymlinkTarget: symlinkTarget,
 				}
 			}
+			opsSinceSave++
+			if opsSinceSave%25 == 0 {
+				_ = e.saveLastState()
+			}
 		}
 	}
 
 	// Salva o histórico das alterações aplicadas com sucesso
-	e.saveLastState()
+	if err := e.saveLastState(); err != nil {
+		errs = append(errs, fmt.Errorf("falha ao salvar estado do sync: %w", err))
+	}
 
 	if len(errs) > 0 {
-		return totalActions - len(errs), fmt.Errorf("sync concluído com %d falha(s). Exemplo: %v", len(errs), errs[0])
+		return totalActions - len(errs), fmt.Errorf("sync concluído com %d falha(s) (todas registradas em %s). Exemplo: %v", len(errs), e.AuditPath, errs[0])
 	}
 
 	return totalActions, nil
+}
+
+// translateSymlinkTarget traduz um target absoluto de symlink de uma base para outra,
+// respeitando fronteiras de path ("/workspace/prod" não casa com "/workspace/prod-api").
+// Targets relativos ou fora da base passam intactos. Espera bases em formato slash.
+func translateSymlinkTarget(target, fromBase, toBase string) string {
+	t := filepath.ToSlash(target)
+	if t == fromBase {
+		return toBase
+	}
+	if strings.HasPrefix(t, fromBase+"/") {
+		return toBase + strings.TrimPrefix(t, fromBase)
+	}
+	return target
 }
 
 func (e *Engine) downloadFile(remotePath, localPath string) error {
@@ -794,26 +935,23 @@ func (e *Engine) downloadFile(remotePath, localPath string) error {
 		if err != nil {
 			return err
 		}
-		
-		// Traduz target se for caminho absoluto contendo o base remoto
-		remoteBase := filepath.ToSlash(e.RemoteDir)
-		localBase := filepath.ToSlash(e.LocalDir)
-		if strings.HasPrefix(filepath.ToSlash(target), remoteBase) {
-			target = strings.Replace(filepath.ToSlash(target), remoteBase, localBase, 1)
-			target = filepath.FromSlash(target)
-		}
 
-		// Limpa colisão local
-		_ = os.RemoveAll(localPath)
+		// Traduz target se for caminho absoluto dentro do base remoto
+		target = filepath.FromSlash(translateSymlinkTarget(target, filepath.ToSlash(e.RemoteDir), filepath.ToSlash(e.LocalDir)))
+
+		// Limpa colisão local (nunca diretório, por segurança)
+		if statLocal, err := os.Lstat(localPath); err == nil {
+			if statLocal.IsDir() {
+				return fmt.Errorf("conflito de tipo: o caminho local %s é um diretório, não é possível criar symlink nele", localPath)
+			}
+			_ = os.Remove(localPath)
+		}
 		return os.Symlink(target, localPath)
 	}
 
-	// 2. Se for arquivo regular, primeiro limpa colisão local (se existir diretório ou arquivo antigo no caminho)
-	if statLocal, err := os.Lstat(localPath); err == nil {
-		if statLocal.IsDir() {
-			return fmt.Errorf("conflito de tipo: o caminho local %s é um diretório, não é possível baixar arquivo para ele", localPath)
-		}
-		_ = os.Remove(localPath)
+	// 2. Arquivo regular: valida conflito de tipo local
+	if statLocal, err := os.Lstat(localPath); err == nil && statLocal.IsDir() {
+		return fmt.Errorf("conflito de tipo: o caminho local %s é um diretório, não é possível baixar arquivo para ele", localPath)
 	}
 
 	remoteFile, err := e.sftpClient.Open(remotePath)
@@ -821,38 +959,52 @@ func (e *Engine) downloadFile(remotePath, localPath string) error {
 		return err
 	}
 	defer remoteFile.Close()
+	remoteStat, errStat := remoteFile.Stat()
 
-	localFile, err := os.Create(localPath)
+	// Escreve num temp no mesmo diretório e faz rename atômico:
+	// um crash/queda de rede no meio da cópia nunca deixa arquivo truncado no destino
+	tmpFile, err := os.CreateTemp(filepath.Dir(localPath), ".unlarp-*")
 	if err != nil {
 		return err
 	}
-	defer localFile.Close()
+	tmpPath := tmpFile.Name()
+	defer os.Remove(tmpPath) // no-op após rename bem-sucedido
 
 	relPath, errRel := filepath.Rel(e.LocalDir, localPath)
 	if errRel == nil && e.shouldRewriteGitPath(relPath) {
 		content, err := io.ReadAll(remoteFile)
 		if err != nil {
+			tmpFile.Close()
 			return err
 		}
-		rewritten := e.rewriteGitContent(content, "download")
-		_, err = localFile.Write(rewritten)
-		if err != nil {
+		if _, err := tmpFile.Write(e.rewriteGitContent(content, "download")); err != nil {
+			tmpFile.Close()
 			return err
 		}
 	} else {
-		_, err = io.Copy(localFile, remoteFile)
+		n, err := io.Copy(tmpFile, remoteFile)
 		if err != nil {
+			tmpFile.Close()
 			return err
+		}
+		if errStat == nil && n != remoteStat.Size() {
+			tmpFile.Close()
+			return fmt.Errorf("transferência incompleta de %s: %d de %d bytes", remotePath, n, remoteStat.Size())
 		}
 	}
 
-	// Preserva ModTime e permissões
-	if stat, err := remoteFile.Stat(); err == nil {
-		_ = os.Chmod(localPath, stat.Mode())
-		_ = os.Chtimes(localPath, time.Now(), stat.ModTime())
+	// Preserva permissões e ModTime no temp antes do rename
+	if errStat == nil {
+		_ = tmpFile.Chmod(remoteStat.Mode())
+	}
+	if err := tmpFile.Close(); err != nil {
+		return err
+	}
+	if errStat == nil {
+		_ = os.Chtimes(tmpPath, time.Now(), remoteStat.ModTime())
 	}
 
-	return nil
+	return os.Rename(tmpPath, localPath)
 }
 
 func (e *Engine) uploadFile(localPath, remotePath string) error {
@@ -863,26 +1015,24 @@ func (e *Engine) uploadFile(localPath, remotePath string) error {
 		if err != nil {
 			return err
 		}
-		
-		// Traduz target se for caminho absoluto contendo o base local
-		localBase := filepath.ToSlash(e.LocalDir)
-		remoteBase := filepath.ToSlash(e.RemoteDir)
-		if strings.HasPrefix(filepath.ToSlash(target), localBase) {
-			target = strings.Replace(filepath.ToSlash(target), localBase, remoteBase, 1)
-			target = filepath.ToSlash(target)
-		}
 
-		// Limpa colisão remota usando rm -rf via SSH
-		_, _, _ = e.sshClient.RunCommand("rm -rf " + shellQuote(remotePath))
+		// Traduz target se for caminho absoluto dentro do base local
+		target = translateSymlinkTarget(target, filepath.ToSlash(e.LocalDir), filepath.ToSlash(e.RemoteDir))
+
+		// Limpa colisão remota via SFTP (nunca diretório, por segurança).
+		// SFTP em vez de shell remoto: sobrevive a reconexões (UpdateSFTPClient)
+		if statRemote, err := e.sftpClient.Lstat(remotePath); err == nil {
+			if statRemote.IsDir() {
+				return fmt.Errorf("conflito de tipo: o caminho remoto %s é um diretório, não é possível criar symlink nele", remotePath)
+			}
+			_ = e.sftpClient.Remove(remotePath)
+		}
 		return e.sftpClient.Symlink(target, remotePath)
 	}
 
-	// 2. Se for arquivo regular, primeiro limpa colisão remota
-	if statRemote, err := e.sftpClient.Lstat(remotePath); err == nil {
-		if statRemote.IsDir() {
-			return fmt.Errorf("conflito de tipo: o caminho remoto %s é um diretório, não é possível enviar arquivo para ele", remotePath)
-		}
-		_ = e.sftpClient.Remove(remotePath)
+	// 2. Arquivo regular: valida conflito de tipo remoto
+	if statRemote, err := e.sftpClient.Lstat(remotePath); err == nil && statRemote.IsDir() {
+		return fmt.Errorf("conflito de tipo: o caminho remoto %s é um diretório, não é possível enviar arquivo para ele", remotePath)
 	}
 
 	localFile, err := os.Open(localPath)
@@ -890,35 +1040,59 @@ func (e *Engine) uploadFile(localPath, remotePath string) error {
 		return err
 	}
 	defer localFile.Close()
+	localStat, errStat := localFile.Stat()
 
-	remoteFile, err := e.sftpClient.Create(remotePath)
+	// Escreve num temp remoto e faz rename atômico:
+	// uma queda de rede no meio da cópia nunca deixa arquivo truncado no destino
+	tmpRemote := remotePath + ".unlarp-tmp"
+	remoteFile, err := e.sftpClient.Create(tmpRemote)
 	if err != nil {
 		return err
 	}
-	defer remoteFile.Close()
+
+	fail := func(err error) error {
+		remoteFile.Close()
+		_ = e.sftpClient.Remove(tmpRemote)
+		return err
+	}
 
 	relPath, errRel := filepath.Rel(e.LocalDir, localPath)
 	if errRel == nil && e.shouldRewriteGitPath(relPath) {
 		content, err := io.ReadAll(localFile)
 		if err != nil {
-			return err
+			return fail(err)
 		}
-		rewritten := e.rewriteGitContent(content, "upload")
-		_, err = remoteFile.Write(rewritten)
-		if err != nil {
-			return err
+		if _, err := remoteFile.Write(e.rewriteGitContent(content, "upload")); err != nil {
+			return fail(err)
 		}
 	} else {
-		_, err = io.Copy(remoteFile, localFile)
+		n, err := io.Copy(remoteFile, localFile)
 		if err != nil {
-			return err
+			return fail(err)
+		}
+		if errStat == nil && n != localStat.Size() {
+			return fail(fmt.Errorf("transferência incompleta de %s: %d de %d bytes", localPath, n, localStat.Size()))
 		}
 	}
 
-	// Preserva ModTime e permissões
-	if stat, err := localFile.Stat(); err == nil {
-		_ = e.sftpClient.Chmod(remotePath, stat.Mode())
-		_ = e.sftpClient.Chtimes(remotePath, time.Now(), stat.ModTime())
+	if err := remoteFile.Close(); err != nil {
+		_ = e.sftpClient.Remove(tmpRemote)
+		return err
+	}
+
+	// Preserva permissões e ModTime no temp antes do rename
+	if errStat == nil {
+		_ = e.sftpClient.Chmod(tmpRemote, localStat.Mode())
+		_ = e.sftpClient.Chtimes(tmpRemote, time.Now(), localStat.ModTime())
+	}
+
+	if err := e.sftpClient.PosixRename(tmpRemote, remotePath); err != nil {
+		// Fallback para servidores SFTP sem posix-rename: remove + rename
+		_ = e.sftpClient.Remove(remotePath)
+		if err2 := e.sftpClient.Rename(tmpRemote, remotePath); err2 != nil {
+			_ = e.sftpClient.Remove(tmpRemote)
+			return err2
+		}
 	}
 
 	return nil
@@ -927,12 +1101,12 @@ func (e *Engine) uploadFile(localPath, remotePath string) error {
 // shouldRewriteGitPath retorna se o arquivo relativo necessita de tradução de caminho absoluto do Git
 func (e *Engine) shouldRewriteGitPath(relPath string) bool {
 	path := filepath.ToSlash(relPath)
-	
+
 	// Caso 1: arquivo de texto ".git" de uma worktree (geralmente tem prefixo gitdir: )
 	if filepath.Base(path) == ".git" {
 		return true
 	}
-	
+
 	// Caso 2: arquivo "gitdir" em metadados de worktrees (.git/worktrees/<name>/gitdir)
 	parts := strings.Split(path, "/")
 	n := len(parts)
@@ -947,7 +1121,7 @@ func (e *Engine) rewriteGitContent(content []byte, direction string) []byte {
 	str := string(content)
 	localBase := filepath.ToSlash(e.LocalDir)
 	remoteBase := filepath.ToSlash(e.RemoteDir)
-	
+
 	if direction == "upload" {
 		str = strings.ReplaceAll(str, localBase, remoteBase)
 	} else {
@@ -956,38 +1130,48 @@ func (e *Engine) rewriteGitContent(content []byte, direction string) []byte {
 	return []byte(str)
 }
 
-func (e *Engine) loadLastState() {
+func (e *Engine) loadLastState() error {
 	data, err := os.ReadFile(e.StatePath)
 	if err != nil {
-		return
+		if os.IsNotExist(err) {
+			return nil // Primeiro sync: começa com histórico vazio
+		}
+		// Nunca prossegue silenciosamente com histórico vazio se o arquivo existe:
+		// isso causaria uma tempestade de conflitos na reconciliação de 3 vias
+		return fmt.Errorf("falha ao ler estado do sync em %s (delete o arquivo para re-baseline): %w", e.StatePath, err)
 	}
 
 	var state Snapshot
-	if err := json.Unmarshal(data, &state); err == nil {
-		// Trunca os timestamps carregados do estado anterior para garantir
-		// consistência em segundos, evitando falsos positivos com dados legados
-		for k, entry := range state {
-			entry.ModTime = entry.ModTime.UTC().Truncate(time.Second)
-			state[k] = entry
-		}
-		e.lastState = state
+	if err := json.Unmarshal(data, &state); err != nil {
+		// Estado corrompido não bloqueia mais o boot: preserva o arquivo para
+		// perícia, avisa o caller e re-baseline a partir do estado atual — a
+		// reconciliação de 3 vias trata baseline vazio com adoção segura.
+		corruptPath := e.StatePath + ".corrupt"
+		_ = os.Rename(e.StatePath, corruptPath)
+		e.StateWarning = fmt.Sprintf("estado do sync corrompido (movido para %s); re-baseline automático a partir do estado atual", corruptPath)
+		e.audit("state corrompido: re-baseline automático (backup em %s): %v", corruptPath, err)
+		return nil
 	}
+
+	// Trunca os timestamps carregados do estado anterior para garantir
+	// consistência em segundos, evitando falsos positivos com dados legados
+	for k, entry := range state {
+		entry.ModTime = entry.ModTime.UTC().Truncate(time.Second)
+		state[k] = entry
+	}
+	e.lastState = state
+	return nil
 }
 
-func (e *Engine) saveLastState() {
+func (e *Engine) saveLastState() error {
 	data, err := json.MarshalIndent(e.lastState, "", "  ")
 	if err != nil {
-		return
+		return err
 	}
-
-	_ = os.WriteFile(e.StatePath, data, 0600)
+	return fsutil.WriteFileAtomic(e.StatePath, data, 0600)
 }
 
 // IgnoreMatcher retorna o matcher de ignores associado a esta engine
 func (e *Engine) IgnoreMatcher() *IgnoreMatcher {
 	return e.matcher
-}
-
-func shellQuote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
 }

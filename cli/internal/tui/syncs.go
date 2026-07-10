@@ -190,6 +190,7 @@ func (m *AppModel) renderSyncs(width, height int) string {
 				percent := 100.0
 				caseType := 1
 				isPaused := false
+				conflicts := 0
 				activeHostSyncs, exists := m.syncSessions[m.activeHost]
 				if exists {
 					sessCtx, exists := activeHostSyncs[item.Sync.ID]
@@ -197,6 +198,7 @@ func (m *AppModel) renderSyncs(width, height int) string {
 						prog := sessCtx.engine.GetProgress()
 						percent = prog.Percent
 						caseType = prog.Case
+						conflicts = prog.ConflictsResolved
 						isPaused, _ = sessCtx.engine.IsPaused()
 					}
 				}
@@ -209,6 +211,10 @@ func (m *AppModel) renderSyncs(width, height int) string {
 					if info, hasInfo := m.gitInfo[item.Sync.RemoteDir]; hasInfo && info.IsGitRepo && info.Branch != "" {
 						branchStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#8BE9FD")).Italic(true)
 						barHtml = fmt.Sprintf("%s %s", barHtml, branchStyle.Render("("+info.Branch+")"))
+					}
+					if conflicts > 0 {
+						conflictStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#FFB86C")).Bold(true)
+						barHtml = fmt.Sprintf("%s %s", barHtml, conflictStyle.Render(fmt.Sprintf("⚡%d conflito(s)", conflicts)))
 					}
 				}
 

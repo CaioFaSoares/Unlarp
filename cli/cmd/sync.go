@@ -22,11 +22,11 @@ import (
 )
 
 var (
-	syncLocalDir   string
-	syncRemoteDir  string
-	syncMode       string
-	syncInit       string
-	syncStopAll    bool
+	syncLocalDir    string
+	syncRemoteDir   string
+	syncMode        string
+	syncInit        string
+	syncStopAll     bool
 	syncInteractive bool
 )
 
@@ -50,10 +50,10 @@ Exemplos:
 }
 
 var syncStatusCmd = &cobra.Command{
-	Use:   "status",
-	Short: "Mostrar status de sincronizações registradas",
+	Use:     "status",
+	Short:   "Mostrar status de sincronizações registradas",
 	Aliases: []string{"ls"},
-	RunE: runSyncStatus,
+	RunE:    runSyncStatus,
 }
 
 var syncStopCmd = &cobra.Command{
@@ -190,6 +190,13 @@ func runSyncStart(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	if engine.StateWarning != "" {
+		ui.Warn("%s", engine.StateWarning)
+	}
+	engine.OnConflict = func(path string, winner string) {
+		ui.Warn("Conflito em %s — venceu %s (%s); trilha em %s", path, winner, engine.ConflictStrategy, engine.AuditPath)
+	}
+
 	// Registra no session state
 	sessMgr, _ := session.NewManager()
 	if sessMgr != nil && displayName != "" {
@@ -199,6 +206,8 @@ func runSyncStart(cmd *cobra.Command, args []string) error {
 			RemoteDir: remoteDir,
 			Mode:      syncMode,
 			LastSync:  time.Now(),
+			PID:       os.Getpid(),
+			Owner:     "cli",
 		})
 	}
 
@@ -218,7 +227,10 @@ func runSyncStart(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Configura canal de trigger para a engine
+	// Configura canal de trigger para a engine.
+	// Buffer 1 + send com default é um coalescer intencional (dirty flag), não uma
+	// fila: SyncExec é reconciliação full-state, então um único token pendente
+	// cobre todas as mudanças que chegarem durante um ciclo. Não trocar por fila.
 	triggerSync := make(chan string, 1)
 
 	// Goroutine principal do loop de sincronização com debouncer e lock interno
@@ -277,6 +289,7 @@ func runSyncStart(cmd *cobra.Command, args []string) error {
 			newSSH.Close()
 			return nil, err
 		}
+		sftpClient.Close()
 		sshClient.Close()
 		sshClient = newSSH
 		sftpClient = newSFTP
@@ -291,6 +304,12 @@ func runSyncStart(cmd *cobra.Command, args []string) error {
 	remoteWatcher.Start()
 	defer remoteWatcher.Stop()
 	ui.Success("Monitorando diretório remoto (polling %s)...", pollInterval)
+
+	// Cobre edições feitas na janela entre o sync inicial e o start dos watchers
+	select {
+	case triggerSync <- "startup":
+	default:
+	}
 
 	fmt.Println()
 	ui.Warn("Mantenha este processo ativo para continuar sincronizando. Ctrl+C para parar.")
@@ -309,7 +328,9 @@ func runSyncStart(cmd *cobra.Command, args []string) error {
 		_ = sessMgr.RemoveSync(displayName, syncID)
 	}
 
-	close(triggerSync)
+	// Não fecha triggerSync: os watchers (parados só nos defers, depois daqui)
+	// ainda podem enviar um último evento — send em canal fechado panicaria.
+	// A goroutine de sync morre com o processo.
 	sftpClient.Close()
 	sshClient.Close()
 	ui.Success("Sincronização parada com sucesso")
@@ -327,12 +348,20 @@ func runSyncStatus(cmd *cobra.Command, args []string) error {
 	hasSyncs := false
 
 	table := tablewriter.NewTable(os.Stdout)
-	table.Header("SESSION ID", "HOST", "LOCAL DIR", "REMOTE DIR", "MODE")
+	table.Header("SESSION ID", "HOST", "LOCAL DIR", "REMOTE DIR", "MODE", "STATUS", "LAST SYNC")
 
 	for name, sess := range sessions {
 		for _, s := range sess.Syncs {
 			hasSyncs = true
-			table.Append(s.ID, name, s.LocalDir, s.RemoteDir, s.Mode)
+			status := "morto"
+			if s.Alive() {
+				status = fmt.Sprintf("ativo (pid %d)", s.PID)
+			}
+			lastSync := "—"
+			if !s.LastSync.IsZero() {
+				lastSync = s.LastSync.Format("02/01 15:04")
+			}
+			table.Append(s.ID, name, s.LocalDir, s.RemoteDir, s.Mode, status, lastSync)
 		}
 	}
 
@@ -377,6 +406,19 @@ func runSyncStop(cmd *cobra.Command, args []string) error {
 	for name, sess := range sessions {
 		for _, s := range sess.Syncs {
 			if s.ID == id {
+				// Para de fato o processo dono quando é um `sync start` do CLI.
+				// Syncs da TUI não são sinalizados: matar o PID derrubaria a TUI
+				// inteira — nesse caso o stop é pela própria TUI (tecla x).
+				if s.Alive() && s.PID != os.Getpid() {
+					if s.Owner == "cli" {
+						if proc, err := os.FindProcess(s.PID); err == nil {
+							_ = proc.Signal(syscall.SIGTERM)
+							ui.Info("Processo de sync (pid %d) sinalizado para parar.", s.PID)
+						}
+					} else {
+						ui.Warn("Sync gerenciado pela TUI (pid %d) — pare pela aba Syncs; removendo só o registro.", s.PID)
+					}
+				}
 				_ = sessMgr.RemoveSync(name, id)
 				ui.Success("Sessão de sincronização '%s' removida do registro.", id)
 				return nil

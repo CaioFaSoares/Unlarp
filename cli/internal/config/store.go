@@ -8,6 +8,8 @@ import (
 
 	"github.com/mitchellh/go-homedir"
 	"gopkg.in/yaml.v3"
+
+	"github.com/CaioFaSoares/unlarp/internal/fsutil"
 )
 
 // Config é a estrutura raiz do arquivo ~/.unlarp.yaml
@@ -37,6 +39,7 @@ type Project struct {
 	Name       string `yaml:"name"`
 	RemotePath string `yaml:"remote_path"`
 	LocalDir   string `yaml:"local_dir,omitempty"` // pasta local vinculada, se um sync foi criado no cadastro
+	Compose    string `yaml:"compose,omitempty"`   // arquivo docker-compose relativo ao path do projeto (vazio = padrão do docker)
 }
 
 // SyncConfig contém as configurações globais de sincronização
@@ -182,7 +185,7 @@ func (s *Store) Save(cfg *Config) error {
 		return fmt.Errorf("erro ao criar diretório %s: %w", dir, err)
 	}
 
-	if err := os.WriteFile(s.path, data, 0600); err != nil {
+	if err := fsutil.WriteFileAtomic(s.path, data, 0600); err != nil {
 		return fmt.Errorf("erro ao salvar %s: %w", s.path, err)
 	}
 

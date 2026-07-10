@@ -75,7 +75,7 @@ func init() {
 	tunnelCmd.AddCommand(tunnelListCmd)
 	tunnelCmd.AddCommand(tunnelStopCmd)
 
-	tunnelCmd.Flags().BoolVarP(&tunnelBackground, "background", "b", false, "rodar em background")
+	tunnelCmd.Flags().BoolVarP(&tunnelBackground, "background", "b", false, "manter rodando sem exibir status (o processo precisa continuar vivo — não é um daemon)")
 	tunnelCmd.Flags().BoolVarP(&tunnelLocal, "local", "l", false, "escutar na máquina local e encaminhar para o host remoto (ssh -L), em vez do padrão (ssh -R)")
 	tunnelStopCmd.Flags().BoolVar(&tunnelStopAll, "all", false, "parar todos os túneis")
 }
@@ -300,7 +300,7 @@ func runTunnelList(cmd *cobra.Command, args []string) error {
 	hasTunnels := false
 
 	table := tablewriter.NewTable(os.Stdout)
-	table.Header("ID", "HOST", "MAPPING", "DIRECTION", "STATUS")
+	table.Header("ID", "HOST", "MAPPING", "DIRECTION", "ORIGIN", "STATUS")
 
 	for name, sess := range sessions {
 		for _, t := range sess.Tunnels {
@@ -310,7 +310,11 @@ func runTunnelList(cmd *cobra.Command, args []string) error {
 			if direction == "" {
 				direction = tunnel.DirectionRemote.String()
 			}
-			table.Append(t.ID, name, mapping, direction, "● Registered")
+			origin := t.Origin
+			if origin == "" {
+				origin = "manual"
+			}
+			table.Append(t.ID, name, mapping, direction, origin, "● Registered")
 		}
 	}
 
