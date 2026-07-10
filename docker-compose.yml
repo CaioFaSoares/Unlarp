@@ -1,8 +1,9 @@
 services:
   workspace:
     build:
-      context: ./machine
-      dockerfile: Dockerfile
+      # Raiz do repo: o Dockerfile compila o unlarp-agent a partir de cli/
+      context: .
+      dockerfile: machine/Dockerfile
     container_name: workspace_machine
     privileged: true
     ports:

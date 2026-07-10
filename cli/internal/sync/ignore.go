@@ -59,6 +59,71 @@ func NewIgnoreMatcher(globalPatterns []string, ignoreFilePath string) *IgnoreMat
 	return m
 }
 
+// BuildMatcherForDir constrói o matcher completo de um diretório: regras
+// estáticas (globais + .unlarpignore na raiz) mais todos os .gitignore da
+// árvore. Usado pela engine (lado Mac) e pelo unlarp-agent (lado container) —
+// mesmo código, mesmos resultados nos dois lados.
+func BuildMatcherForDir(root string, globalIgnores []string) *IgnoreMatcher {
+	// 1. Matcher inicial apenas com as regras estáticas (globais + .unlarpignore)
+	matcher := NewIgnoreMatcher(globalIgnores, filepath.Join(root, ".unlarpignore"))
+
+	// Lista para acumular os arquivos .gitignore encontrados
+	type gitIgnoreFile struct {
+		relDir  string
+		absPath string
+	}
+	var gitignores []gitIgnoreFile
+
+	// Primeiro passo: varre a estrutura para encontrar arquivos .gitignore,
+	// respeitando APENAS os ignores estáticos compilados até agora (para
+	// evitar entrar em node_modules, .git, etc.)
+	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+
+		if path == root {
+			return nil
+		}
+
+		relPath, err := filepath.Rel(root, path)
+		if err != nil {
+			return nil
+		}
+		relPath = filepath.ToSlash(relPath)
+
+		// Usa o matcher temporário para ignorar pastas gigantescas (ex: node_modules)
+		if matcher.Matches(relPath, d.IsDir()) {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		if !d.IsDir() && filepath.Base(path) == ".gitignore" {
+			dir := filepath.Dir(relPath)
+			if dir == "." {
+				dir = ""
+			}
+			gitignores = append(gitignores, gitIgnoreFile{
+				relDir:  dir,
+				absPath: path,
+			})
+		}
+
+		return nil
+	})
+
+	// Segundo passo: carrega as regras de todos os arquivos .gitignore encontrados.
+	// Como todas as regras de todos os diretórios são carregadas antes de iniciar o sync,
+	// evitamos problemas de ordenação léxica na descoberta das regras.
+	for _, gf := range gitignores {
+		matcher.LoadGitIgnoreFile(gf.relDir, gf.absPath)
+	}
+
+	return matcher
+}
+
 // isIgnoringClaude verifica se a regra ignora a pasta .claude
 func isIgnoringClaude(pattern string) bool {
 	clean := strings.TrimPrefix(strings.TrimSpace(pattern), "!")

@@ -1,3 +1,11 @@
+# Stage de build do unlarp-agent (contexto de build = raiz do repositório)
+FROM golang:1.26 AS agent-build
+WORKDIR /src
+COPY cli/go.mod cli/go.sum ./
+RUN go mod download
+COPY cli/ .
+RUN CGO_ENABLED=0 go build -o /unlarp-agent ./agent
+
 FROM debian:trixie-slim
 
 # Evita interações manuais durante a instalação de pacotes
@@ -59,7 +67,9 @@ RUN mkdir -p /var/run/sshd \
 
 WORKDIR /workspace
 
-COPY entrypoint.sh /entrypoint.sh
+COPY --from=agent-build /unlarp-agent /usr/local/bin/unlarp-agent
+
+COPY machine/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
 EXPOSE 22
