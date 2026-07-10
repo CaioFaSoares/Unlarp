@@ -93,6 +93,35 @@ func GetRemoteGitInfo(client *internalssh.Client, projectPath string) (RemoteGit
 	return info, nil
 }
 
+// LocalInfo consulta o estado Git de um diretório do filesystem local via
+// os/exec — usado pelo unlarp-agent, onde o "remoto" é local ao container.
+// Mesmos campos de GetRemoteGitInfo, sem parsing de shell.
+func LocalInfo(dir string) RemoteGitInfo {
+	var info RemoteGitInfo
+	run := func(args ...string) string {
+		out, _ := exec.Command("git", append([]string{"-C", dir}, args...)...).Output()
+		return strings.TrimSpace(string(out))
+	}
+
+	if run("rev-parse", "--is-inside-work-tree") != "true" {
+		return info
+	}
+	info.IsGitRepo = true
+	info.Branch = run("rev-parse", "--abbrev-ref", "HEAD")
+	info.CommitHash = run("rev-parse", "--short", "HEAD")
+	info.CommitMessage = run("log", "-1", "--format=%s")
+	if t, err := time.Parse(time.RFC3339, run("log", "-1", "--format=%aI")); err == nil {
+		info.CommitTime = t
+	}
+	info.IsDirty = run("status", "--porcelain") != ""
+	info.RemoteURL = run("remote", "get-url", "origin")
+	if ab := strings.Fields(run("rev-list", "--left-right", "--count", "HEAD...origin/"+info.Branch)); len(ab) == 2 {
+		info.AheadBehind.Ahead, _ = strconv.Atoi(ab[0])
+		info.AheadBehind.Behind, _ = strconv.Atoi(ab[1])
+	}
+	return info
+}
+
 // PullLocal executa `git pull` no repositório local do usuário.
 func PullLocal(localDir string, remote string, branch string) error {
 	if remote == "" {

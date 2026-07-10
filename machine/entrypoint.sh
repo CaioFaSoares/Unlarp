@@ -8,6 +8,13 @@
     sleep 2
 done) &
 
+(while true; do
+    echo "Iniciando unlarp-agent..."
+    /usr/local/bin/unlarp-agent >> /var/log/unlarp-agent.log 2>&1
+    echo "unlarp-agent caiu (exit $?), reiniciando em 2s..."
+    sleep 2
+done) &
+
 # Espera limitada — sshd sobe mesmo se o dockerd falhar (nunca perder o SSH)
 for i in $(seq 30); do
     docker info >/dev/null 2>&1 && { echo "Docker interno operacional"; break; }
