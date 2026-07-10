@@ -27,6 +27,7 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     xz-utils \
     wget \
+    pipx \
     && rm -rf /var/lib/apt/lists/*
 
 # 2. Instalar Docker (DinD)
@@ -43,6 +44,8 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y nodejs \
     && npm install -g @anthropic-ai/claude-code \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+RUN pipx install uv
 
 # 4. Instalar o Gerenciador de Pacotes Nix (Single User Mode)
 # Criamos o nix.conf previamente para desabilitar o build-users-group (necessário para rodar sob o root no container)
