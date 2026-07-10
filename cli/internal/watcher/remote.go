@@ -28,6 +28,7 @@ type RemoteWatcher struct {
 	onWarn       func(string)
 	reconnect    func() (*sftp.Client, error)
 	connected    bool
+	failCount    int
 	pollInterval time.Duration
 	matcher      *internalsync.IgnoreMatcher
 	lastState    map[string]remoteFileState
@@ -115,7 +116,9 @@ func (w *RemoteWatcher) checkChanges() {
 			w.connected = false
 			w.onWarn(fmt.Sprintf("Conexão remota perdida (%v); tentando reconectar em segundo plano...", err))
 		}
-		if w.reconnect != nil {
+		w.failCount++
+		// ponytail: backoff por módulo, não exponencial — o tick de poll já limita a taxa
+		if w.reconnect != nil && w.failCount%5 == 1 {
 			if newClient, rerr := w.reconnect(); rerr == nil {
 				w.sftpClient = newClient
 			}
@@ -127,6 +130,7 @@ func (w *RemoteWatcher) checkChanges() {
 		w.connected = true
 		w.onWarn("Conexão remota reestabelecida.")
 	}
+	w.failCount = 0
 
 	changed := false
 
@@ -159,8 +163,18 @@ func (w *RemoteWatcher) scanRemote() (map[string]remoteFileState, error) {
 	state := make(map[string]remoteFileState)
 	cleanRoot := filepath.ToSlash(filepath.Clean(w.dir))
 
+	if w.sftpClient == nil {
+		return nil, fmt.Errorf("sftpClient is nil")
+	}
+
 	walker := w.sftpClient.Walk(cleanRoot)
 	for walker.Step() {
+		select {
+		case <-w.ctx.Done():
+			return nil, w.ctx.Err()
+		default:
+		}
+
 		if walker.Err() != nil {
 			return nil, walker.Err()
 		}

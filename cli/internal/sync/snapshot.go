@@ -137,6 +137,10 @@ func CreateLocalSnapshot(rootDir string, matcher *IgnoreMatcher) (Snapshot, erro
 
 // CreateRemoteSnapshot gera um snapshot de um diretório remoto via SFTP
 func CreateRemoteSnapshot(client *sftp.Client, rootDir string, matcher *IgnoreMatcher) (Snapshot, error) {
+	if client == nil {
+		return nil, fmt.Errorf("sftp client is nil")
+	}
+
 	snapshot := make(Snapshot)
 
 	// Garante que o caminho remoto é absoluto ou normalizado
