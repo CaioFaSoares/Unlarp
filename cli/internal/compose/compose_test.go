@@ -51,3 +51,10 @@ func TestCommandFor(t *testing.T) {
 		t.Errorf("CommandFor com -f: %q", got)
 	}
 }
+
+func TestEnsureRestart(t *testing.T) {
+	got := EnsureRestart("/ws/api", "")
+	if got != "cd '/ws/api' && docker compose ps -q | xargs -r docker update --restart unless-stopped" {
+		t.Errorf("EnsureRestart: %q", got)
+	}
+}
