@@ -6,7 +6,10 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
+
+	"github.com/CaioFaSoares/unlarp/internal/fsutil"
 )
 
 // State representa o estado persistido de todas as sessões
@@ -17,9 +20,9 @@ type State struct {
 
 // Session representa uma sessão de conexão com um host
 type Session struct {
-	Name        string       `json:"name"`
-	ConnectedAt *time.Time   `json:"connected_at,omitempty"`
-	Syncs       []SyncEntry  `json:"syncs,omitempty"`
+	Name        string        `json:"name"`
+	ConnectedAt *time.Time    `json:"connected_at,omitempty"`
+	Syncs       []SyncEntry   `json:"syncs,omitempty"`
 	Tunnels     []TunnelEntry `json:"tunnels,omitempty"`
 }
 
@@ -33,6 +36,24 @@ type SyncEntry struct {
 	GitBranch      string    `json:"git_branch,omitempty"`
 	GitCommit      string    `json:"git_commit,omitempty"`
 	GitGuardActive bool      `json:"git_guard_active,omitempty"`
+
+	// PID do processo que mantém este sync vivo e quem ele é ("cli" ou "tui").
+	// Owner evita que `sync stop` derrube a TUI inteira ao matar o dono.
+	// ponytail: liveness por signal 0 no PID; heartbeat só se PID reuse virar problema real.
+	PID   int    `json:"pid,omitempty"`
+	Owner string `json:"owner,omitempty"`
+}
+
+// Alive informa se o processo dono do sync ainda está rodando.
+func (s SyncEntry) Alive() bool {
+	if s.PID <= 0 {
+		return false
+	}
+	proc, err := os.FindProcess(s.PID)
+	if err != nil {
+		return false
+	}
+	return proc.Signal(syscall.Signal(0)) == nil
 }
 
 // TunnelEntry representa um túnel ativo
@@ -41,13 +62,14 @@ type TunnelEntry struct {
 	RemotePort int    `json:"remote_port"`
 	LocalPort  int    `json:"local_port"`
 	Direction  string `json:"direction,omitempty"` // "remote" (padrão) | "local"
+	Origin     string `json:"origin,omitempty"`    // ex: "compose:<projeto>" para túneis criados automaticamente
 }
 
 // Manager gerencia múltiplas sessões com persistência
 type Manager struct {
-	state    *State
+	state     *State
 	statePath string
-	mu       sync.RWMutex
+	mu        sync.RWMutex
 }
 
 // NewManager cria um novo gerenciador de sessões
@@ -249,5 +271,5 @@ func (m *Manager) saveState() error {
 		return err
 	}
 
-	return os.WriteFile(m.statePath, data, 0600)
+	return fsutil.WriteFileAtomic(m.statePath, data, 0600)
 }
