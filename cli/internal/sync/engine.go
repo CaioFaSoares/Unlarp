@@ -34,12 +34,15 @@ type Engine struct {
 	// foi re-baselineado automaticamente — o caller decide como exibir.
 	StateWarning string `json:"-"`
 
-	sshClient      *internalssh.Client
-	sftpClient     *sftp.Client
-	matcher        *IgnoreMatcher
-	globalIgnores  []string
-	ignoreFilePath string
-	mu             sync.Mutex
+	sshClient     *internalssh.Client
+	sftpClient    *sftp.Client
+	matcher       *IgnoreMatcher
+	globalIgnores []string
+	mu            sync.Mutex
+
+	// RemoteSnapshotFn, quando setado (agent presente), substitui a varredura
+	// SFTP na geração do snapshot remoto; erro cai no fallback SFTP.
+	RemoteSnapshotFn func() (Snapshot, error) `json:"-"`
 
 	// Último estado conhecido compartilhado (A na reconciliação de 3 vias)
 	lastState Snapshot
@@ -144,7 +147,6 @@ func NewEngine(id string, localDir, remoteDir, hostName string, globalIgnores []
 		sftpClient:       sftpClient,
 		matcher:          matcher,
 		globalIgnores:    globalIgnores,
-		ignoreFilePath:   ignoreFile,
 		lastState:        make(Snapshot),
 	}
 
@@ -373,66 +375,7 @@ func (e *Engine) SetGitGuardEnabled(enabled bool) {
 
 // rebuildMatcher reconstrói o ignore matcher de forma limpa e lê todos os arquivos .gitignore no diretório local
 func (e *Engine) rebuildMatcher() {
-	// 1. Cria o matcher inicial apenas com as regras estáticas (globais + .unlarpignore)
-	newMatcher := NewIgnoreMatcher(e.globalIgnores, e.ignoreFilePath)
-
-	// Caminho absoluto da raiz local
-	absRoot := e.LocalDir
-
-	// Lista para acumular os arquivos .gitignore encontrados
-	type gitIgnoreFile struct {
-		relDir  string
-		absPath string
-	}
-	var gitignores []gitIgnoreFile
-
-	// Primeiro Passo: Varre a estrutura para encontrar arquivos .gitignore,
-	// respeitando APENAS os ignores estáticos compilados até agora (para evitar entrar em node_modules, .git, etc.)
-	_ = filepath.WalkDir(absRoot, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return nil
-		}
-
-		if path == absRoot {
-			return nil
-		}
-
-		relPath, err := filepath.Rel(absRoot, path)
-		if err != nil {
-			return nil
-		}
-		relPath = filepath.ToSlash(relPath)
-
-		// Usa o matcher temporário para ignorar pastas gigantescas (ex: node_modules)
-		if newMatcher.Matches(relPath, d.IsDir()) {
-			if d.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-
-		if !d.IsDir() && filepath.Base(path) == ".gitignore" {
-			dir := filepath.Dir(relPath)
-			if dir == "." {
-				dir = ""
-			}
-			gitignores = append(gitignores, gitIgnoreFile{
-				relDir:  dir,
-				absPath: path,
-			})
-		}
-
-		return nil
-	})
-
-	// Segundo Passo: Carrega as regras de todos os arquivos .gitignore encontrados.
-	// Como todas as regras de todos os diretórios são carregadas antes de iniciar o sync,
-	// evitamos problemas de ordenação léxica na descoberta das regras.
-	for _, gf := range gitignores {
-		newMatcher.LoadGitIgnoreFile(gf.relDir, gf.absPath)
-	}
-
-	e.matcher = newMatcher
+	e.matcher = BuildMatcherForDir(e.LocalDir, e.globalIgnores)
 }
 
 // hasParentTypeConflict verifica se qualquer pasta pai do caminho informado é um arquivo regular
@@ -619,10 +562,21 @@ func (e *Engine) SyncExec() (int, error) {
 		return 0, fmt.Errorf("falha no snapshot local: %w", err)
 	}
 
-	// 2. Gera Snapshot Remoto (R)
-	R, err := CreateRemoteSnapshot(e.sftpClient, e.RemoteDir, e.matcher)
-	if err != nil {
-		return 0, fmt.Errorf("falha no snapshot remoto: %w", err)
+	// 2. Gera Snapshot Remoto (R) — via agent quando disponível (uma chamada
+	// HTTP em vez de milhares de round-trips SFTP), com fallback SFTP no erro
+	var R Snapshot
+	if e.RemoteSnapshotFn != nil {
+		R, err = e.RemoteSnapshotFn()
+		if err != nil {
+			e.audit("snapshot via agent falhou (%v); fallback SFTP", err)
+			R = nil
+		}
+	}
+	if R == nil {
+		R, err = CreateRemoteSnapshot(e.sftpClient, e.RemoteDir, e.matcher)
+		if err != nil {
+			return 0, fmt.Errorf("falha no snapshot remoto: %w", err)
+		}
 	}
 
 	// A é o lastState (último estado salvo)
