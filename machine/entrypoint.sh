@@ -1,16 +1,18 @@
 #!/bin/bash
 
-echo "Iniciando Docker Daemon interno (DinD)..."
-# Inicia o docker daemon em background
-dockerd > /var/log/dockerd.log 2>&1 &
+# ponytail: loop-restart é o supervisor; migrar p/ supervisord só se surgirem mais daemons
+(while true; do
+    echo "Iniciando dockerd interno..."
+    dockerd >> /var/log/dockerd.log 2>&1
+    echo "dockerd caiu (exit $?), reiniciando em 2s..."
+    sleep 2
+done) &
 
-# Aguarda até o Docker estar online
-while ! docker info >/dev/null 2>&1; do
-    echo "Aguardando dockerd..."
+# Espera limitada — sshd sobe mesmo se o dockerd falhar (nunca perder o SSH)
+for i in $(seq 30); do
+    docker info >/dev/null 2>&1 && { echo "Docker interno operacional"; break; }
     sleep 1
 done
-echo "Docker Daemon operacional!"
 
 echo "Iniciando servidor OpenSSH..."
-# Executa o SSH em foreground
 exec /usr/sbin/sshd -D

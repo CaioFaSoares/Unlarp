@@ -12,7 +12,7 @@ services:
       - workspace-nix-store:/nix
       - workspace-home:/root
       - workspace-docker:/var/lib/docker
-    restart: unless-stopped
+    restart: always
 
 volumes:
   workspace-data:

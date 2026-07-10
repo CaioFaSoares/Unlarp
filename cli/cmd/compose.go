@@ -204,6 +204,13 @@ func runComposeUp(cmd *cobra.Command, args []string) error {
 	}
 	spin.StopWithSuccess("Serviços no ar")
 
+	// Fixa restart policy nos containers para voltarem sozinhos após reboot do servidor
+	if !composeLocal {
+		if _, stderr, err := client.RunCommand(compose.EnsureRestart(proj.RemotePath, proj.Compose)); err != nil {
+			ui.Warn("Não foi possível fixar restart policy: %v %s", err, strings.TrimSpace(stderr))
+		}
+	}
+
 	// Descobre serviços/portas — com retries curtos, containers demoram a publicar
 	var svcs []compose.Service
 	for attempt := 0; attempt < 5; attempt++ {

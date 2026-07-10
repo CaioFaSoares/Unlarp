@@ -83,6 +83,12 @@ func CommandFor(projectDir, composeFile, action string) string {
 	return fmt.Sprintf("cd %s && %s %s", shellQuote(projectDir), cmd, action)
 }
 
+// EnsureRestart monta o comando que fixa restart policy nos containers do
+// projeto — garante que os serviços internos voltem sozinhos após reboot do servidor.
+func EnsureRestart(projectDir, composeFile string) string {
+	return CommandFor(projectDir, composeFile, "ps -q") + " | xargs -r docker update --restart unless-stopped"
+}
+
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
