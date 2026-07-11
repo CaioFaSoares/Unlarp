@@ -68,8 +68,6 @@ RUN mkdir -p /var/run/sshd \
     && sed -i 's/#PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config \
     && echo "StrictModes no" >> /etc/ssh/sshd_config
 
-RUN echo "set -g mouse on" >> ~/.tmux.conf
-
 WORKDIR /workspace
 
 COPY --from=agent-build /unlarp-agent /usr/local/bin/unlarp-agent
