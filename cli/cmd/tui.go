@@ -51,19 +51,21 @@ var tuiCmd = &cobra.Command{
 		// 1. Checa se existe a sessão unlarp-tui
 		hasSess := exec.Command("tmux", "has-session", "-t", "unlarp-tui").Run() == nil
 
-		var execArgs []string
-		if hasSess {
-			// Se existe, anexa
-			execArgs = []string{"tmux", "attach-session", "-t", "unlarp-tui"}
-		} else {
-			// Se não existe, cria a sessão executando a TUI sem tmux interno
+		if !hasSess {
+			// Se não existe, cria a sessão (detached) executando a TUI sem tmux interno
 			self, err := os.Executable()
 			if err != nil {
 				self = "unlarp"
 			}
-			execArgs = []string{"tmux", "new-session", "-s", "unlarp-tui", self, "tui", "--no-tmux"}
+			if err := exec.Command("tmux", "new-session", "-d", "-s", "unlarp-tui", self, "tui", "--no-tmux").Run(); err != nil {
+				return fmt.Errorf("falha ao criar sessão tmux local: %w", err)
+			}
 		}
 
+		// Habilita scroll com mouse só nesta sessão (não mexe no tmux.conf global do usuário)
+		_ = exec.Command("tmux", "set-option", "-t", "unlarp-tui", "mouse", "on").Run()
+
+		execArgs := []string{"tmux", "attach-session", "-t", "unlarp-tui"}
 		env := os.Environ()
 		execErr := syscall.Exec(tmuxPath, execArgs, env)
 		if execErr != nil {
