@@ -125,6 +125,57 @@ unlarp tunnel list
 unlarp tunnel stop t-xyz123
 ```
 
+### 7. Worktrees para Agentes (`unlarp worktree`)
+
+Cria uma worktree git **dentro** do repositório remoto de um projeto cadastrado
+(em `.claude/worktree-<branch>`) e abre uma sessão tmux nela — o habitat ideal
+para um agente (Claude Code) trabalhar numa branch isolada sem tocar no
+checkout principal. Como a worktree fica dentro do repo, **o sync do projeto já
+a espelha na sua pasta local automaticamente** (a engine reescreve os metadados
+`gitdir` entre Mac e container, então `git status` funciona dos dois lados).
+
+```bash
+# Cria a worktree na branch feat-x (cria a branch se não existir, com -b)
+unlarp worktree add meu-projeto feat-x -b
+
+# Conectar na sessão tmux criada e rodar o agente
+unlarp connect --tmux --tmux-session meu-projeto-wt-feat-x
+
+# Remover a worktree e a sessão tmux (worktree suja é recusada — commite antes)
+unlarp worktree remove meu-projeto feat-x
+```
+
+Na TUI, a tecla **`w`** na aba Projetos faz o mesmo fluxo por um prompt.
+
+### 8. Colar Imagens no Agente Remoto (`unlarp paste`)
+
+Envia a imagem do clipboard do macOS para o servidor e cola o **caminho** do
+arquivo no pane tmux alvo — o Claude Code lê a imagem pelo caminho.
+
+```bash
+# (recomendado) brew install pngpaste — sem ele, cai num fallback via osascript
+unlarp paste --session meu-projeto-wt-feat-x
+# → complete o prompt na sessão e aperte Enter para o agente ler a imagem
+```
+
+### 9. Comandos Git Remotos e o Agente (`unlarp git` / `unlarp agent`)
+
+```bash
+# Troca a branch de um projeto remoto (syncs ativos pausam via GitGuard)
+unlarp git switch feat-x --project meu-projeto
+
+# Status/instalação do unlarp-agent (plano de controle no container)
+unlarp agent status
+unlarp agent install   # hot-swap sem redeploy: cross-compila, envia e reinicia
+```
+
+O `unlarp-agent` roda dentro do container (HTTP sobre unix socket, alcançado
+pela própria conexão SSH — nenhuma porta nova) e acelera watch de arquivos
+(inotify em vez de polling SFTP), snapshots e operações git. Ele **já vem
+embutido na imagem Docker** (o Dockerfile compila e o entrypoint supervisiona);
+`unlarp agent install` serve para atualizá-lo sem derrubar o container (um
+redeploy mata as sessões tmux — o hot-swap não).
+
 ---
 
 ## 📺 Dashboard Interativa (TUI)
