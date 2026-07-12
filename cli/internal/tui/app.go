@@ -165,6 +165,7 @@ const (
 	tabSyncs
 	tabTunnels
 	tabLogs
+	tabWatch
 	tabCount
 )
 
@@ -256,6 +257,19 @@ type AppModel struct {
 	logs            []string
 	logScrollOffset int
 	logAutoScroll   bool
+	logsMu          sync.Mutex // addLog é chamado de goroutines de background
+
+	// Syncs cujo restore falhou nesta execução (não re-tentar a cada reload)
+	failedRestores map[string]bool
+
+	// Estado inferido dos agentes Claude Code por sessão tmux (claude_status.go)
+	claudeStatus      map[string]string
+	claudeTickCounter int
+
+	// Watch-commands configurados no yaml (watch.go); chave: host + "/" + nome
+	watcherLastRun map[string]time.Time
+	watcherRunning map[string]bool
+	watcherOutput  map[string]watcherResult
 }
 
 // NewAppModel inicializa o modelo do aplicativo
@@ -271,18 +285,20 @@ func NewAppModel() (*AppModel, error) {
 		return nil, err
 	}
 
-	// Ordena hosts
+	// Ordena hosts (range de map é não determinístico — a sidebar pulava de
+	// ordem a cada execução)
 	var hostNames []string
-	selected := 0
-	active := cfg.DefaultHost
-
-	i := 0
 	for name := range cfg.Hosts {
 		hostNames = append(hostNames, name)
+	}
+	sort.Strings(hostNames)
+
+	selected := 0
+	active := cfg.DefaultHost
+	for i, name := range hostNames {
 		if name == active {
 			selected = i
 		}
-		i++
 	}
 
 	s := spinner.New()
@@ -336,6 +352,11 @@ func NewAppModel() (*AppModel, error) {
 		},
 		logScrollOffset: 0,
 		logAutoScroll:   true,
+		failedRestores:  make(map[string]bool),
+		claudeStatus:    make(map[string]string),
+		watcherLastRun:  make(map[string]time.Time),
+		watcherRunning:  make(map[string]bool),
+		watcherOutput:   make(map[string]watcherResult),
 	}, nil
 }
 
@@ -422,6 +443,24 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	var cmds []tea.Cmd
+
+	// Mensagens de fundo auto-rearmáveis são tratadas ANTES de qualquer branch
+	// modal (dirPicker): sem isso, o primeiro tickMsg/spinner.TickMsg que chega
+	// com o picker aberto é engolido sem re-arme e a cadeia morre para o resto
+	// da sessão — progresso de sync e logs congelam até o usuário teclar algo.
+	switch bg := msg.(type) {
+	case tickMsg:
+		cmds = append(cmds, tickCmd())
+	case spinner.TickMsg:
+		var cmd tea.Cmd
+		m.spinner, cmd = m.spinner.Update(bg)
+		cmds = append(cmds, cmd)
+	case syncStartedMsg:
+		// Engine recém-criada precisa ser registrada mesmo com picker aberto,
+		// senão fica órfã (sem registro em syncSessions nem saída de pendingSyncs).
+		m.handleSyncStarted(bg)
+		return m, tea.Batch(cmds...)
+	}
 
 	if m.pickerActive {
 		var cmd tea.Cmd
@@ -522,17 +561,39 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 
 	case tickMsg:
-		// Dispara tick recorrente
-		cmds = append(cmds, tickCmd())
+		// Re-arme do tick acontece no topo de Update (antes dos branches modais)
 		if !m.isOnboarding {
 			cmds = append(cmds, m.checkTmuxCmd())
 			cmds = append(cmds, m.checkProjectsCmd())
+
+			cmds = append(cmds, m.dispatchWatchersCmd()...)
+
+			m.claudeTickCounter++
+			if m.claudeTickCounter >= 3 {
+				m.claudeTickCounter = 0
+				if cmd := m.checkClaudeStatusCmd(); cmd != nil {
+					cmds = append(cmds, cmd)
+				}
+			}
 
 			m.gitTickCounter++
 			if m.gitTickCounter >= 5 {
 				m.gitTickCounter = 0
 				if cmd := m.checkGitCmd(); cmd != nil {
 					cmds = append(cmds, cmd)
+				}
+
+				// Relê o state.json para absorver syncs criados/removidos por
+				// outros processos (ex: `unlarp sync start` no CLI) e re-agenda
+				// o restore de todos os hosts — os guards em restoreSyncsCmd
+				// (engine viva, dono externo vivo, falha anterior) garantem que
+				// isso é barato e não duplica engines nem spamma logs.
+				m.sessMgr.Reload()
+				for _, host := range m.hostNames {
+					m.restoredHosts[host] = true
+					if restoreCmd := m.restoreSyncsCmd(host); restoreCmd != nil {
+						cmds = append(cmds, restoreCmd)
+					}
 				}
 			}
 
@@ -622,8 +683,8 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// resto sem precisar de um passo extra de curadoria manual.
 		if sess, ok := m.sessMgr.GetSession(m.activeHost); ok {
 			sort.SliceStable(m.projects, func(i, j int) bool {
-				return matchProjectSync(sess.Syncs, m.projects[i].Path) != nil &&
-					matchProjectSync(sess.Syncs, m.projects[j].Path) == nil
+				return matchProjectSync(sess.Syncs, m.projects[i]) != nil &&
+					matchProjectSync(sess.Syncs, m.projects[j]) == nil
 			})
 		}
 		if items := m.buildProjectTree(); len(items) > 0 && m.selectedProjectRow >= len(items) {
@@ -643,8 +704,17 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, m.checkTmuxCmd())
 		cmds = append(cmds, m.checkProjectsCmd())
 
-	case syncStartedMsg:
-		m.handleSyncStarted(msg)
+	// syncStartedMsg e spinner.TickMsg são tratados no topo de Update,
+	// antes dos branches modais.
+
+	case claudeStatusMsg:
+		if msg.host == m.activeHost {
+			m.claudeStatus = msg.statuses
+		}
+
+	case watcherOutputMsg:
+		m.watcherRunning[msg.key] = false
+		m.watcherOutput[msg.key] = msg.result
 
 	case gitCheckResultMsg:
 		m.gitInfo[msg.projectPath] = msg.info
@@ -688,11 +758,6 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.textInput.EchoMode = textinput.EchoPassword
 		m.textInput.Focus()
 		cmds = append(cmds, textinput.Blink)
-
-	case spinner.TickMsg:
-		var cmd tea.Cmd
-		m.spinner, cmd = m.spinner.Update(msg)
-		cmds = append(cmds, cmd)
 
 	case tea.KeyMsg:
 		// Se estiver no onboarding, processa separadamente
@@ -879,7 +944,7 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					if item.IsProject {
 						sess, sessOk := m.sessMgr.GetSession(m.activeHost)
 						if sessOk {
-							syncEntry := matchProjectSync(sess.Syncs, item.Project.Path)
+							syncEntry := matchProjectSync(sess.Syncs, item.Project)
 							if syncEntry != nil {
 								if _, hasAlert := m.gitAlerts[syncEntry.ID]; hasAlert {
 									switch msg.String() {
@@ -978,6 +1043,23 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 
+		case "w":
+			// Cria worktree no projeto selecionado (+ sessão tmux nela). A
+			// worktree fica DENTRO do repo (.claude/worktree-<branch>), então o
+			// sync do projeto já a espelha localmente — sem sync novo.
+			if !m.sidebarFocus && m.activeTab == tabProjects {
+				items := m.buildProjectTree()
+				if len(items) > 0 && m.selectedProjectRow < len(items) && items[m.selectedProjectRow].IsProject {
+					m.pendingProject = items[m.selectedProjectRow].Project
+					m.promptType = "worktree_add"
+					m.promptActive = true
+					m.textInput.SetValue("")
+					m.textInput.Placeholder = "branch da worktree (nova branch se não existir)"
+					m.textInput.Focus()
+					return m, textinput.Blink
+				}
+			}
+
 		case "g", "G":
 			if !m.sidebarFocus && m.activeTab == tabLogs {
 				if msg.String() == "g" {
@@ -1006,12 +1088,10 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "s":
-			// Atalho para iniciar sync (somente se não estiver na barra lateral)
+			// Atalho para iniciar sync (somente se não estiver na barra lateral).
+			// Nota: 's' não togglea mais o auto-scroll de logs — rolar para cima
+			// pausa, 'G' ou chegar ao fim religa. Um caminho a menos para se perder.
 			if !m.sidebarFocus {
-				if m.activeTab == tabLogs {
-					m.logAutoScroll = !m.logAutoScroll
-					return m, nil
-				}
 				m.addLog(fmt.Sprintf("Abrindo seletor de diretório local para host %s...", m.activeHost))
 				m.pickerActive = true
 				m.pickerStage = "local"
@@ -1039,7 +1119,7 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					if item.IsProject {
 						sess, sessOk := m.sessMgr.GetSession(m.activeHost)
 						if sessOk {
-							syncEntry := matchProjectSync(sess.Syncs, item.Project.Path)
+							syncEntry := matchProjectSync(sess.Syncs, item.Project)
 							if syncEntry != nil {
 								if _, hasAlert := m.gitAlerts[syncEntry.ID]; hasAlert {
 									m.addLog(fmt.Sprintf("Definindo sync %s para modo Download-Only temporário...", syncEntry.ID))
@@ -1088,6 +1168,7 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							for name := range cfg.Hosts {
 								hostNames = append(hostNames, name)
 							}
+							sort.Strings(hostNames)
 							m.hostNames = hostNames
 
 							if len(hostNames) == 0 {
@@ -1176,12 +1257,23 @@ func (m *AppModel) View() string {
 	)
 }
 
+// addLog é chamado também de goroutines de background (watchers, callbacks da
+// engine de sync), então m.logs precisa de lock próprio.
 func (m *AppModel) addLog(msg string) {
+	m.logsMu.Lock()
+	defer m.logsMu.Unlock()
 	timestamp := time.Now().Format("15:04:05")
 	m.logs = append(m.logs, fmt.Sprintf("[%s] %s", timestamp, msg))
 	if len(m.logs) > 500 {
 		m.logs = m.logs[1:] // Mantém cap de 500
 	}
+}
+
+// snapshotLogs devolve uma cópia estável para render sem segurar o lock.
+func (m *AppModel) snapshotLogs() []string {
+	m.logsMu.Lock()
+	defer m.logsMu.Unlock()
+	return append([]string(nil), m.logs...)
 }
 
 func (m *AppModel) renderSidebar(height int) string {
@@ -1277,20 +1369,20 @@ func (m *AppModel) renderFooter() string {
 					styles.KeyStyle.Render("q"),
 				}
 			} else if m.activeTab == tabProjects {
-				actions = "%s Navegar | %s Cadastrar | %s Expandir/Conectar | %s Nova Sessão | %s Remover/Kill | %s Sair"
+				actions = "%s Navegar | %s Cadastrar | %s Expandir/Conectar | %s Nova Sessão | %s Worktree | %s Remover/Kill | %s Sair"
 				keys = []string{
 					styles.KeyStyle.Render("↑/↓/j/k"),
 					styles.KeyStyle.Render("a"),
 					styles.KeyStyle.Render("Enter/c"),
 					styles.KeyStyle.Render("n"),
+					styles.KeyStyle.Render("w"),
 					styles.KeyStyle.Render("x"),
 					styles.KeyStyle.Render("q"),
 				}
 			} else if m.activeTab == tabLogs {
-				actions = "%s Rolar | %s Auto-Scroll | %s Mudar Foco | %s Sair"
+				actions = "%s Rolar (G: fim + auto-scroll) | %s Mudar Foco | %s Sair"
 				keys = []string{
 					styles.KeyStyle.Render("↑/↓/j/k/g/G"),
-					styles.KeyStyle.Render("s"),
 					styles.KeyStyle.Render("Tab"),
 					styles.KeyStyle.Render("q"),
 				}
@@ -1430,6 +1522,9 @@ func (m *AppModel) handlePromptSubmit() tea.Cmd {
 		return m.createProjectSessionCmd(sessionName, m.pendingProject.Path)
 	case "git_switch_branch":
 		return m.switchBranchCmd(m.pendingProject.Path, val)
+	case "worktree_add":
+		m.expandedProjects[m.pendingProject.Path] = true
+		return m.worktreeAddCmd(m.pendingProject, val)
 	case "project_sync_confirm":
 		if strings.HasPrefix(strings.ToLower(val), "s") {
 			// Quer sync junto: abre o picker local para escolher a pasta que
@@ -1645,6 +1740,12 @@ func (m *AppModel) createSyncLiveCmd(syncID, val string) tea.Cmd {
 			return syncStartedMsg{err: fmt.Errorf("caminho local inválido: %w", err), host: host, syncID: syncID}
 		}
 
+		// Colisão de pasta local: dois syncs (mesmo de hosts diferentes)
+		// escrevendo na mesma árvore local corromperiam a reconciliação
+		if otherHost, other, found := m.sessMgr.FindSyncByLocalDir(absLocal, syncID); found {
+			return syncStartedMsg{err: fmt.Errorf("pasta local %s colide com o sync %s do host %s (%s)", absLocal, other.ID, otherHost, other.LocalDir), host: host, syncID: syncID}
+		}
+
 		// Garante conexão SSH e SFTP
 		client, err := m.getOrCreateSSHClient(host, &hostCfg)
 		if err != nil {
@@ -1818,6 +1919,19 @@ func (m *AppModel) restoreSyncsCmd(host string) tea.Cmd {
 			}
 		}
 
+		// Sync de outro processo vivo (ex: `unlarp sync start` num terminal):
+		// religar aqui duplicaria a engine. Só exibe (renderSyncs mostra "externo").
+		if entry.Alive() && entry.PID != os.Getpid() {
+			continue
+		}
+
+		// Restore é re-tentado periodicamente (tick de reload); não insistir
+		// em entradas que já falharam nesta execução para não spammar os logs.
+		if m.failedRestores[entry.ID] {
+			continue
+		}
+
+		entry := entry
 		cmds = append(cmds, func() tea.Msg {
 			hostCfg, ok := m.cfg.Hosts[host]
 			if !ok {
@@ -1866,6 +1980,10 @@ func (m *AppModel) handleSyncStarted(msg syncStartedMsg) {
 	m.removePendingSync(msg.host, msg.syncID)
 
 	if msg.err != nil {
+		if msg.restored {
+			// Não re-tentar a cada tick de reload — uma falha basta por execução.
+			m.failedRestores[msg.syncID] = true
+		}
 		m.addLog(fmt.Sprintf("Erro ao criar sincronização: %v", msg.err))
 		return
 	}
@@ -1895,6 +2013,7 @@ func (m *AppModel) handleSyncStarted(msg syncStartedMsg) {
 			RemoteDir: msg.remoteDir,
 			Mode:      "bidirectional",
 			LastSync:  time.Now(),
+			Project:   matchProjectName(m.projects, msg.remoteDir),
 			PID:       os.Getpid(),
 			Owner:     "tui",
 		}); err != nil {
@@ -1954,12 +2073,30 @@ func (m *AppModel) handleDeleteSelection() tea.Cmd {
 		return m.killTmuxSessionCmd(name)
 	}
 
-	if m.activeTab == tabSyncs && len(sess.Syncs) > 0 {
-		// Para o sync selecionado
-		s := sess.Syncs[m.selectedSyncRow]
+	if m.activeTab == tabSyncs {
+		// Resolve o sync pelo item da árvore (a árvore inclui linhas de arquivos
+		// expandidos e pendings — indexar sess.Syncs direto pegava a entry errada)
+		items := m.buildSyncTree()
+		if len(items) == 0 || m.selectedSyncRow >= len(items) {
+			return nil
+		}
+		item := items[m.selectedSyncRow]
+		if !item.IsSync || item.PendingSync != nil {
+			return nil
+		}
+		s := item.Sync
+
+		// Sync de outro processo vivo: só remove o registro (matar o PID de uma
+		// TUI/CLI alheia por aqui seria surpresa demais; use `unlarp sync stop`)
+		if s.Alive() && s.PID != os.Getpid() {
+			_ = m.sessMgr.RemoveSync(item.Host, s.ID)
+			m.addLog(fmt.Sprintf("Registro do sync externo %s removido (processo dono pid %d segue rodando; use `unlarp sync stop %s`).", s.ID, s.PID, s.ID))
+			m.selectedSyncRow = 0
+			return nil
+		}
 
 		// Encerra watchers se estiver rodando na live session
-		if hostSyncs, exists := m.syncSessions[m.activeHost]; exists {
+		if hostSyncs, exists := m.syncSessions[item.Host]; exists {
 			if live, exists := hostSyncs[s.ID]; exists {
 				if live.localWatcher != nil {
 					live.localWatcher.Stop()
@@ -1974,7 +2111,7 @@ func (m *AppModel) handleDeleteSelection() tea.Cmd {
 			}
 		}
 
-		_ = m.sessMgr.RemoveSync(m.activeHost, s.ID)
+		_ = m.sessMgr.RemoveSync(item.Host, s.ID)
 		m.addLog(fmt.Sprintf("Sessão de sync %s parada e removida.", s.ID))
 		m.selectedSyncRow = 0
 
@@ -2595,6 +2732,7 @@ func (m *AppModel) finalizeOnboarding() error {
 	for name := range cfg.Hosts {
 		hostNames = append(hostNames, name)
 	}
+	sort.Strings(hostNames)
 	m.hostNames = hostNames
 	m.selectedHost = 0
 
@@ -2707,6 +2845,61 @@ type projectsGitMsg struct {
 // switchBranchCmd faz a troca de branch remota sem correr contra o sync:
 // pausa as engines do projeto, executa o checkout (agent quando presente,
 // SSH senão), atualiza o GitGuard com o novo estado, reconcilia e retoma.
+// worktreeAddCmd cria uma worktree DENTRO do repo do projeto e abre uma sessão
+// tmux nela. Sem pause/resume de sync: o HEAD do repo principal não muda
+// (GitGuard não dispara) e a worktree entra no sync como arquivos novos.
+// Tenta com branch existente; se não existir, cria com -b.
+func (m *AppModel) worktreeAddCmd(proj Project, branch string) tea.Cmd {
+	host := m.activeHost
+	return func() tea.Msg {
+		hostCfg, ok := m.cfg.Hosts[host]
+		if !ok {
+			return nil
+		}
+		client, err := m.getOrCreateSSHClient(host, &hostCfg)
+		if err != nil {
+			m.addLog(fmt.Sprintf("Worktree: erro SSH: %v", err))
+			return nil
+		}
+
+		wtPath := strings.TrimSuffix(proj.Path, "/") + "/" + git.WorktreeRelPath(branch)
+		sessionName := proj.Name + "-wt-" + git.SanitizeWorktreeName(branch)
+
+		m.addLog(fmt.Sprintf("Criando worktree %s (branch %s)...", wtPath, branch))
+
+		if ac := m.getOrCreateAgentClient(host, client); ac != nil {
+			if _, err := ac.GitOp(proj.Path, agentapi.GitOpWorktreeAdd, []string{wtPath, branch}); err != nil {
+				if _, err2 := ac.GitOp(proj.Path, agentapi.GitOpWorktreeAdd, []string{"-b", branch, wtPath}); err2 != nil {
+					m.addLog(fmt.Sprintf("Worktree add falhou: %v", err2))
+					return nil
+				}
+			}
+		} else {
+			cmdStr := fmt.Sprintf("git -C %s worktree add %s %s || git -C %s worktree add -b %s %s",
+				shellQuote(proj.Path), shellQuote(wtPath), shellQuote(branch),
+				shellQuote(proj.Path), shellQuote(branch), shellQuote(wtPath))
+			if _, stderr, err := client.RunCommand(cmdStr); err != nil {
+				m.addLog(fmt.Sprintf("Worktree add falhou: %s", strings.TrimSpace(stderr)))
+				return nil
+			}
+		}
+
+		// Esconde as worktrees do `git status` do repo principal (info/exclude
+		// é local ao repo, não versionado). Falha aqui não é fatal.
+		excludeCmd := fmt.Sprintf(
+			"grep -qxF '.claude/worktree-*' %[1]s/.git/info/exclude 2>/dev/null || echo '.claude/worktree-*' >> %[1]s/.git/info/exclude",
+			shellQuote(proj.Path))
+		_, _, _ = client.RunCommand(excludeCmd)
+
+		if proj.LocalDir != "" {
+			m.addLog(fmt.Sprintf("Worktree criada — com o sync do projeto ativo ela aparece em %s/%s.", strings.TrimSuffix(proj.LocalDir, "/"), git.WorktreeRelPath(branch)))
+		} else {
+			m.addLog("Worktree criada.")
+		}
+		return m.createProjectSessionCmd(sessionName, wtPath)()
+	}
+}
+
 func (m *AppModel) switchBranchCmd(projPath, branch string) tea.Cmd {
 	host := m.activeHost
 	return func() tea.Msg {

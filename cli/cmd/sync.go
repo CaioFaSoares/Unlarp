@@ -30,6 +30,7 @@ var (
 	syncInit        string
 	syncStopAll     bool
 	syncInteractive bool
+	syncProject     string
 )
 
 var syncCmd = &cobra.Command{
@@ -78,6 +79,7 @@ func init() {
 	syncStartCmd.Flags().StringVar(&syncMode, "mode", "bidirectional", "modo: bidirectional | push | pull")
 	syncStartCmd.Flags().StringVar(&syncInit, "initial-sync", "full", "sync inicial: full | none")
 	syncStartCmd.Flags().BoolVarP(&syncInteractive, "interactive", "i", false, "iniciar seletor interativo de pastas")
+	syncStartCmd.Flags().StringVar(&syncProject, "project", "", "nome do projeto cadastrado dono deste sync (marca o sync como sync de projeto)")
 
 	// Flags para stop
 	syncStopCmd.Flags().BoolVar(&syncStopAll, "all", false, "parar todas as sessões de sync")
@@ -97,6 +99,24 @@ func runSyncStart(cmd *cobra.Command, args []string) error {
 	displayName := hostName
 	if displayName == "" {
 		displayName = getActiveHost()
+	}
+
+	// --project: valida contra os projetos cadastrados e, sem --remote-dir,
+	// usa o caminho remoto do projeto como default.
+	if syncProject != "" {
+		found := false
+		for _, p := range hostCfg.Projects {
+			if p.Name == syncProject {
+				found = true
+				if syncRemoteDir == "" {
+					syncRemoteDir = p.RemotePath
+				}
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("projeto '%s' não cadastrado no host %s (veja ~/.unlarp.yaml)", syncProject, displayName)
+		}
 	}
 
 	// Verifica se deve rodar no modo interativo (caso as pastas não sejam fornecidas ou forçado por flag)
@@ -120,6 +140,14 @@ func runSyncStart(cmd *cobra.Command, args []string) error {
 		absLocal, err = filepath.Abs(localPath)
 		if err != nil {
 			return fmt.Errorf("caminho local inválido: %w", err)
+		}
+	}
+
+	// Colisão de pasta local: dois syncs (mesmo de hosts diferentes) escrevendo
+	// na mesma árvore local corromperiam a reconciliação
+	if mgr, mgrErr := session.NewManager(); mgrErr == nil {
+		if otherHost, other, found := mgr.FindSyncByLocalDir(absLocal, ""); found {
+			return fmt.Errorf("a pasta local %s colide com o sync %s do host %s (%s) — pare-o antes com `unlarp sync stop %s`", absLocal, other.ID, otherHost, other.LocalDir, other.ID)
 		}
 	}
 
@@ -208,6 +236,7 @@ func runSyncStart(cmd *cobra.Command, args []string) error {
 			RemoteDir: remoteDir,
 			Mode:      syncMode,
 			LastSync:  time.Now(),
+			Project:   syncProject,
 			PID:       os.Getpid(),
 			Owner:     "cli",
 		})

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"github.com/mitchellh/go-homedir"
@@ -32,6 +33,24 @@ type Host struct {
 	Container string    `yaml:"container,omitempty"` // Para operações Docker diretas (local only)
 	Password  string    `yaml:"-"`                   // Usado apenas em memória para bootstrap/setup
 	Projects  []Project `yaml:"projects,omitempty"`
+	Watchers  []Watcher `yaml:"watchers,omitempty"`
+}
+
+// Watcher é um comando shell executado periodicamente no host remoto, com o
+// output exibido na aba Watch da TUI (ex: uso dos agentes claude via ccusage).
+// Sem CRUD próprio — edite via `unlarp config edit`.
+type Watcher struct {
+	Name     string `yaml:"name"`
+	Cmd      string `yaml:"cmd"`
+	Interval string `yaml:"interval,omitempty"` // time.ParseDuration; default 30s
+}
+
+// IntervalDuration devolve o intervalo do watcher (default/fallback 30s).
+func (w Watcher) IntervalDuration() time.Duration {
+	if d, err := time.ParseDuration(w.Interval); err == nil && d > 0 {
+		return d
+	}
+	return 30 * time.Second
 }
 
 // Project representa um projeto (pasta remota) cadastrado manualmente dentro de um host
@@ -226,12 +245,17 @@ func (s *Store) RemoveHost(name string) error {
 
 	delete(cfg.Hosts, name)
 
-	// Se removeu o default, limpa ou define outro
+	// Se removeu o default, limpa ou define outro — o menor alfabeticamente,
+	// para a escolha ser estável (range de map é não determinístico)
 	if cfg.DefaultHost == name {
 		cfg.DefaultHost = ""
+		names := make([]string, 0, len(cfg.Hosts))
 		for n := range cfg.Hosts {
-			cfg.DefaultHost = n
-			break
+			names = append(names, n)
+		}
+		if len(names) > 0 {
+			sort.Strings(names)
+			cfg.DefaultHost = names[0]
 		}
 	}
 

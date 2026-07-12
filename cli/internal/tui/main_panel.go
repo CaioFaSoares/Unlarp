@@ -11,7 +11,7 @@ import (
 
 // renderMainPanel desenha a barra de abas e o conteúdo da aba selecionada
 func (m *AppModel) renderMainPanel(width, height int) string {
-	tabs := []string{"Dashboard", "Projetos", "Syncs", "Túneis", "Logs"}
+	tabs := []string{"Dashboard", "Projetos", "Syncs", "Túneis", "Logs", "Watch"}
 	var renderedTabs []string
 
 	for i, t := range tabs {
@@ -58,6 +58,10 @@ func (m *AppModel) renderMainPanel(width, height int) string {
 			promptTitle = "Cadastrar Projeto — Sincronizar Agora?"
 		case "project_delete_confirm":
 			promptTitle = fmt.Sprintf("Confirmar exclusão do projeto '%s'? (s/n)", m.pendingProject.Name)
+		case "git_switch_branch":
+			promptTitle = fmt.Sprintf("Trocar branch do projeto '%s'", m.pendingProject.Name)
+		case "worktree_add":
+			promptTitle = fmt.Sprintf("Nova worktree em '%s' — nome da branch", m.pendingProject.Name)
 		}
 
 		promptBox := lipgloss.NewStyle().
@@ -87,6 +91,8 @@ func (m *AppModel) renderMainPanel(width, height int) string {
 		content = m.renderTunnels(width, contentHeight)
 	case tabLogs:
 		content = m.renderLogs(width, contentHeight)
+	case tabWatch:
+		content = m.renderWatch(width, contentHeight)
 	default:
 		content = "Aba desconhecida"
 	}
@@ -144,6 +150,10 @@ func (m *AppModel) renderDashboard(width, height int) string {
 			displayName := s.Command
 			if displayName == "" {
 				displayName = s.Name
+			}
+			// Agente Claude Code: mostra o estado inferido do pane
+			if label := m.claudeStatusLabel(s.Name); label != "" {
+				displayName = label
 			}
 
 			// Branch da worktree onde a sessão roda (se for repo git)

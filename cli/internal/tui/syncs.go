@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
@@ -14,28 +15,55 @@ import (
 // SyncTreeItem representa um item na visualização em árvore/acordeão dos syncs
 type SyncTreeItem struct {
 	IsSync       bool
+	Host         string // host dono do sync (a aba Syncs mostra todos os hosts)
 	Sync         session.SyncEntry
 	PendingSync  *pendingSync
 	FileProgress *internalsync.FileProgress
 }
 
+// syncTreeHosts devolve os hosts em ordem estável para a árvore de syncs:
+// o host ativo primeiro, demais em ordem alfabética.
+func (m *AppModel) syncTreeHosts() []string {
+	hosts := append([]string(nil), m.hostNames...)
+	sort.SliceStable(hosts, func(i, j int) bool {
+		if hosts[i] == m.activeHost {
+			return true
+		}
+		if hosts[j] == m.activeHost {
+			return false
+		}
+		return hosts[i] < hosts[j]
+	})
+	return hosts
+}
+
 func (m *AppModel) buildSyncTree() []SyncTreeItem {
 	var items []SyncTreeItem
 
-	sess, sessOk := m.sessMgr.GetSession(m.activeHost)
-	pending := m.pendingSyncs[m.activeHost]
+	for _, host := range m.syncTreeHosts() {
+		items = append(items, m.buildHostSyncItems(host)...)
+	}
+	return items
+}
+
+func (m *AppModel) buildHostSyncItems(host string) []SyncTreeItem {
+	var items []SyncTreeItem
+
+	sess, sessOk := m.sessMgr.GetSession(host)
+	pending := m.pendingSyncs[host]
 
 	if sessOk {
 		for _, s := range sess.Syncs {
 			items = append(items, SyncTreeItem{
 				IsSync: true,
+				Host:   host,
 				Sync:   s,
 			})
 
 			if m.expandedSyncs[s.ID] {
 				// Encontra a sessão de sync ativa para obter o progresso
 				var progress internalsync.SyncProgress
-				activeHostSyncs, exists := m.syncSessions[m.activeHost]
+				activeHostSyncs, exists := m.syncSessions[host]
 				if exists {
 					sessCtx, exists := activeHostSyncs[s.ID]
 					if exists && sessCtx.engine != nil {
@@ -76,6 +104,7 @@ func (m *AppModel) buildSyncTree() []SyncTreeItem {
 				for i := range displayFiles {
 					items = append(items, SyncTreeItem{
 						IsSync:       false,
+						Host:         host,
 						Sync:         s,
 						FileProgress: &displayFiles[i],
 					})
@@ -88,6 +117,7 @@ func (m *AppModel) buildSyncTree() []SyncTreeItem {
 		pCopy := p
 		items = append(items, SyncTreeItem{
 			IsSync:      true,
+			Host:        host,
 			PendingSync: &pCopy,
 		})
 	}
@@ -141,25 +171,28 @@ func renderProgressBar(percent float64, caseType int, width int) string {
 func (m *AppModel) renderSyncs(width, height int) string {
 	var sb strings.Builder
 
-	sess, sessOk := m.sessMgr.GetSession(m.activeHost)
-	pending := m.pendingSyncs[m.activeHost]
-
-	realCount := 0
-	if sessOk {
-		realCount = len(sess.Syncs)
-	}
-	if realCount == 0 && len(pending) == 0 {
-		sb.WriteString("Nenhuma sincronização de arquivos ativa registrada neste host.\n\n")
+	items := m.buildSyncTree()
+	if len(items) == 0 {
+		sb.WriteString("Nenhuma sincronização de arquivos ativa registrada (em nenhum host).\n\n")
 		sb.WriteString(fmt.Sprintf("Pressione %s para iniciar uma nova sincronização direto por aqui.", styles.KeyStyle.Render("s")))
 		return sb.String()
 	}
+
+	// A aba mostra syncs de todos os hosts; o sufixo @host só aparece quando
+	// mais de um host tem syncs, para não poluir o caso comum de host único.
+	hostsSeen := make(map[string]bool)
+	for _, it := range items {
+		if it.IsSync {
+			hostsSeen[it.Host] = true
+		}
+	}
+	multiHost := len(hostsSeen) > 1
 
 	sb.WriteString(styles.TableHeaderStyle.Width(width).Render(
 		fmt.Sprintf("  %-8s %-18s %-18s %-10s %-12s %-20s", "SESSION", "LOCAL DIR", "REMOTE DIR", "MODE", "PROJECT", "PROGRESS"),
 	))
 	sb.WriteString("\n")
 
-	items := m.buildSyncTree()
 	for i, item := range items {
 		var line string
 		if item.IsSync {
@@ -181,20 +214,26 @@ func (m *AppModel) renderSyncs(width, height int) string {
 				localDir := truncatePath(item.Sync.LocalDir, 18)
 				remoteDir := truncatePath(item.Sync.RemoteDir, 18)
 
-				projectName := matchProjectName(m.projects, item.Sync.RemoteDir)
+				projectName := item.Sync.Project
+				if projectName == "" {
+					// Entries antigas, sem o campo persistido
+					projectName = matchProjectName(m.projects, item.Sync.RemoteDir)
+				}
 				if projectName == "" {
 					projectName = "—"
 				}
 
-				// Pega o progresso, caso e se está pausado
+				// Pega o progresso, caso e se está pausado — do host dono do item
 				percent := 100.0
 				caseType := 1
 				isPaused := false
 				conflicts := 0
-				activeHostSyncs, exists := m.syncSessions[m.activeHost]
+				hasEngine := false
+				activeHostSyncs, exists := m.syncSessions[item.Host]
 				if exists {
 					sessCtx, exists := activeHostSyncs[item.Sync.ID]
 					if exists && sessCtx.engine != nil {
+						hasEngine = true
 						prog := sessCtx.engine.GetProgress()
 						percent = prog.Percent
 						caseType = prog.Case
@@ -204,7 +243,16 @@ func (m *AppModel) renderSyncs(width, height int) string {
 				}
 
 				barHtml := renderProgressBar(percent, caseType, 12)
-				if isPaused {
+				if !hasEngine {
+					// Sem engine neste processo: sync de outro processo (vivo)
+					// ou órfão — não fingir uma barra 100%.
+					dimStyle := lipgloss.NewStyle().Foreground(styles.ColorDim).Italic(true)
+					if item.Sync.Alive() {
+						barHtml = dimStyle.Render(fmt.Sprintf("externo (%s, pid %d)", item.Sync.Owner, item.Sync.PID))
+					} else {
+						barHtml = dimStyle.Render("—")
+					}
+				} else if isPaused {
 					redStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#FF5555")).Bold(true)
 					barHtml = redStyle.Render("🔒 Bloqueado (ver Projects)")
 				} else {
@@ -223,9 +271,14 @@ func (m *AppModel) renderSyncs(width, height int) string {
 					indicator = "▾ "
 				}
 
+				idCol := item.Sync.ID
+				if multiHost {
+					idCol += "@" + item.Host
+				}
+
 				line = fmt.Sprintf("  %s%-6s %-18s %-18s %-10s %-12s %s",
 					indicator,
-					item.Sync.ID,
+					idCol,
 					localDir,
 					remoteDir,
 					item.Sync.Mode,

@@ -12,11 +12,17 @@ import (
 	"github.com/mattn/go-runewidth"
 )
 
-// matchProjectSync encontra o sync (se houver) cujo RemoteDir está dentro do
-// caminho do projeto, para cruzar o estado de sincronização por projeto.
-func matchProjectSync(syncs []session.SyncEntry, projectPath string) *session.SyncEntry {
+// matchProjectSync encontra o sync (se houver) do projeto: primeiro pelo campo
+// persistido SyncEntry.Project, depois por prefixo de caminho (fallback para
+// entries antigas gravadas antes do campo existir).
+func matchProjectSync(syncs []session.SyncEntry, proj Project) *session.SyncEntry {
 	for i, s := range syncs {
-		if s.RemoteDir == projectPath || strings.HasPrefix(s.RemoteDir, projectPath+"/") {
+		if s.Project != "" && s.Project == proj.Name {
+			return &syncs[i]
+		}
+	}
+	for i, s := range syncs {
+		if s.RemoteDir == proj.Path || strings.HasPrefix(s.RemoteDir, proj.Path+"/") {
 			return &syncs[i]
 		}
 	}
@@ -51,7 +57,7 @@ func (m *AppModel) renderProjects(width, height int) string {
 	}
 
 	headerStr := styles.TableHeaderStyle.Width(width).Render(
-		fmt.Sprintf("  %-24s %-16s %-10s", "PROJETO / SESSÃO", "BRANCH / JANELAS", "SYNC / STATUS"),
+		fmt.Sprintf("  %-24s %-16s %-20s %-10s", "PROJETO / SESSÃO", "BRANCH / JANELAS", "LOCAL DIR", "SYNC / STATUS"),
 	)
 	sb.WriteString(headerStr)
 	sb.WriteString("\n")
@@ -65,7 +71,7 @@ func (m *AppModel) renderProjects(width, height int) string {
 		if item.IsProject {
 			marker := " "
 			syncState := "—"
-			if s := matchProjectSync(syncs, item.Project.Path); s != nil {
+			if s := matchProjectSync(syncs, item.Project); s != nil {
 				marker = "★"
 				syncState = s.ID
 			}
@@ -74,12 +80,12 @@ func (m *AppModel) renderProjects(width, height int) string {
 			if m.expandedProjects[item.Project.Path] {
 				indicator = "▾"
 			}
-			
+
 			nameCol := fmt.Sprintf("%s %s", indicator, item.Project.Name)
 			branchStr := item.Project.Branch
 
 			var hasAlert bool
-			if s := matchProjectSync(syncs, item.Project.Path); s != nil {
+			if s := matchProjectSync(syncs, item.Project); s != nil {
 				if _, ok := m.gitAlerts[s.ID]; ok {
 					hasAlert = true
 					marker = lipgloss.NewStyle().Foreground(lipgloss.Color("#FF5555")).Bold(true).Render("⚠")
@@ -90,7 +96,11 @@ func (m *AppModel) renderProjects(width, height int) string {
 				nameCol = nameCol + " " + lipgloss.NewStyle().Foreground(lipgloss.Color("#FF5555")).Bold(true).Render("[DIVERGIU]")
 			}
 
-			line = fmt.Sprintf("%s %-24s %-16s %-10s", marker, nameCol, branchStr, syncState)
+			localDirStr := "—"
+			if item.Project.LocalDir != "" {
+				localDirStr = truncatePath(item.Project.LocalDir, 18)
+			}
+			line = fmt.Sprintf("%s %-24s %-16s %-20s %-10s", marker, nameCol, branchStr, localDirStr, syncState)
 		} else if item.Session != nil {
 			ts := item.Session
 			nameCol := fmt.Sprintf("    └─ %s %s", ts.StateIcon(), ts.Name)
@@ -124,7 +134,11 @@ func (m *AppModel) renderProjects(width, height int) string {
 			case "morto":
 				statusStr = "morto"
 			}
-			line = fmt.Sprintf("  %-24s %-16s %-10s", nameCol, branchStr, statusStr)
+			// Agente Claude Code: estado inferido do pane vence o genérico
+			if label := m.claudeStatusLabel(ts.Name); label != "" {
+				statusStr = label
+			}
+			line = fmt.Sprintf("  %-24s %-16s %-20s %-10s", nameCol, branchStr, "", statusStr)
 		}
 
 		if i == m.selectedProjectRow && !m.sidebarFocus {
@@ -151,16 +165,16 @@ func (m *AppModel) renderProjects(width, height int) string {
 	detailHeaderHeight := lipgloss.Height(detailHeaderStr) + 1
 
 	metadataHeight := 3 // Caminho remoto, Git Info (Remote), Sync
-	
+
 	gitAlert := ""
 	if len(items) > 0 && m.selectedProjectRow < len(items) {
 		selectedItem := items[m.selectedProjectRow]
-		if s := matchProjectSync(syncs, selectedItem.Project.Path); s != nil {
+		if s := matchProjectSync(syncs, selectedItem.Project); s != nil {
 			if alert, ok := m.gitAlerts[s.ID]; ok {
 				gitAlert = alert
 			}
 		}
-		
+
 		if !selectedItem.IsProject && selectedItem.Session != nil {
 			metadataHeight += 4 // Sessão Tmux, Janelas, Attached, Estado
 			if info, ok := m.gitInfo[selectedItem.Session.Path]; ok && info.IsGitRepo {
@@ -211,12 +225,12 @@ func (m *AppModel) renderProjectDetail(width, maxOutputLines int, syncs []sessio
 		if info.IsDirty {
 			dirtyStr = lipgloss.NewStyle().Foreground(lipgloss.Color("#FF5555")).Render(" *dirty*")
 		}
-		
+
 		abStr := ""
 		if info.AheadBehind.Ahead > 0 || info.AheadBehind.Behind > 0 {
 			abStr = lipgloss.NewStyle().Foreground(lipgloss.Color("#F1FA8C")).Render(fmt.Sprintf(" (↑%d ↓%d)", info.AheadBehind.Ahead, info.AheadBehind.Behind))
 		}
-		
+
 		gitInfoStr = fmt.Sprintf("%s [%s]%s%s", info.Branch, info.CommitHash, dirtyStr, abStr)
 		if info.CommitMessage != "" {
 			gitInfoStr += fmt.Sprintf(" - %s", info.CommitMessage)
@@ -226,7 +240,7 @@ func (m *AppModel) renderProjectDetail(width, maxOutputLines int, syncs []sessio
 
 	var gitAlert string
 	var syncID string
-	if s := matchProjectSync(syncs, proj.Path); s != nil {
+	if s := matchProjectSync(syncs, proj); s != nil {
 		syncID = s.ID
 		if alert, ok := m.gitAlerts[s.ID]; ok {
 			gitAlert = alert
@@ -245,11 +259,11 @@ func (m *AppModel) renderProjectDetail(width, maxOutputLines int, syncs []sessio
 			Border(lipgloss.NormalBorder()).
 			BorderForeground(lipgloss.Color("#FF5555")).
 			Padding(0, 1)
-		
+
 		sb.WriteString("\n")
 		sb.WriteString(alertStyle.Render(fmt.Sprintf("⚠ ALERTA DE DIVERGÊNCIA GIT (Sync %s): %s", syncID, gitAlert)))
 		sb.WriteString("\n\n")
-		
+
 		keyStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#50FA7B")).Bold(true)
 		sb.WriteString(" Opções de Resolução (pressione a tecla correspondente):\n")
 		sb.WriteString(fmt.Sprintf("  [%s] Puxar mudanças para a máquina local (git pull)\n", keyStyle.Render("p")))
@@ -305,7 +319,7 @@ func (m *AppModel) renderProjectDetail(width, maxOutputLines int, syncs []sessio
 		}
 	} else {
 		lines := strings.Split(strings.TrimRight(output, "\n"), "\n")
-		
+
 		// Limpa as linhas (tabs, espaços no fim) e detecta se são em branco usando isBlank
 		var cleanedLines []string
 		for _, l := range lines {
@@ -316,7 +330,7 @@ func (m *AppModel) renderProjectDetail(width, maxOutputLines int, syncs []sessio
 				cleanedLines = append(cleanedLines, strings.TrimRight(cleaned, " \r\n"))
 			}
 		}
-		
+
 		// Remove linhas vazias no início do output
 		for len(cleanedLines) > 0 && cleanedLines[0] == "" {
 			cleanedLines = cleanedLines[1:]
@@ -337,9 +351,9 @@ func (m *AppModel) renderProjectDetail(width, maxOutputLines int, syncs []sessio
 			if len(cleanedLines) > maxOutputLines {
 				start = len(cleanedLines) - maxOutputLines
 			}
-			
+
 			renderedCount := len(cleanedLines[start:])
-			
+
 			// Trunca horizontalmente as linhas para evitar que o terminal dê wrap delas
 			// Reduzido para width - 5 para compensar o espaço inicial e evitar qualquer wrap horizontal de 1 caractere
 			maxLineLen := width - 5
@@ -351,7 +365,7 @@ func (m *AppModel) renderProjectDetail(width, maxOutputLines int, syncs []sessio
 				truncated := truncateLine(l, maxLineLen)
 				sb.WriteString(" " + truncated + "\n")
 			}
-			
+
 			// Preenche com novas linhas até atingir exatamente maxOutputLines
 			for i := renderedCount; i < maxOutputLines; i++ {
 				sb.WriteString("\n")
