@@ -77,9 +77,10 @@ func (s *server) handleGitOp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Sem flags nos args (fronteira de confiança): a única exceção é -b no
-	// checkout, para criar branch nova
+	// checkout e no worktree add, para criar branch nova
 	for _, a := range req.Args {
-		if strings.HasPrefix(a, "-") && !(req.Op == agentapi.GitOpCheckout && a == "-b") {
+		allowB := (req.Op == agentapi.GitOpCheckout || req.Op == agentapi.GitOpWorktreeAdd) && a == "-b"
+		if strings.HasPrefix(a, "-") && !allowB {
 			http.Error(w, "argumento não permitido: "+a, http.StatusBadRequest)
 			return
 		}

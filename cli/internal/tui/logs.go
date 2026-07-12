@@ -10,7 +10,8 @@ import (
 )
 
 func (m *AppModel) renderLogs(width, height int) string {
-	if len(m.logs) == 0 {
+	logs := m.snapshotLogs()
+	if len(logs) == 0 {
 		return "Nenhum log registrado."
 	}
 
@@ -24,7 +25,7 @@ func (m *AppModel) renderLogs(width, height int) string {
 	// Wrap each log line to the current panel width
 	var wrappedLines []string
 	style := lipgloss.NewStyle().Width(width)
-	for _, logLine := range m.logs {
+	for _, logLine := range logs {
 		wrapped := style.Render(logLine)
 		subLines := strings.Split(wrapped, "\n")
 		wrappedLines = append(wrappedLines, subLines...)
@@ -58,7 +59,7 @@ func (m *AppModel) renderLogs(width, height int) string {
 	if end > totalLines {
 		end = totalLines
 	}
-	
+
 	// Safe bounds check
 	start := m.logScrollOffset
 	if start > totalLines {
@@ -75,7 +76,7 @@ func (m *AppModel) renderLogs(width, height int) string {
 		if m.logAutoScroll {
 			statusText = fmt.Sprintf("▲ %d/%d logs | Auto-Scroll: Ativo (use ↑/k para rolar)", currentPos, totalLines)
 		} else {
-			statusText = fmt.Sprintf("▼ %d/%d logs | Auto-Scroll: Pausado (pressione 's' ou 'G' para ir ao fim)", currentPos, totalLines)
+			statusText = fmt.Sprintf("▼ %d/%d logs | Auto-Scroll: Pausado (pressione 'G' ou role até o fim)", currentPos, totalLines)
 		}
 
 		statusStyled := lipgloss.NewStyle().

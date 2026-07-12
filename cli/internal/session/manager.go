@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -36,6 +38,11 @@ type SyncEntry struct {
 	GitBranch      string    `json:"git_branch,omitempty"`
 	GitCommit      string    `json:"git_commit,omitempty"`
 	GitGuardActive bool      `json:"git_guard_active,omitempty"`
+
+	// Nome do projeto cadastrado (config) dono deste sync; vazio = sync avulso.
+	// Preenchido uma vez na criação; entries antigas sem o campo caem no
+	// fallback heurístico por prefixo de caminho (matchProjectName).
+	Project string `json:"project,omitempty"`
 
 	// PID do processo que mantém este sync vivo e quem ele é ("cli" ou "tui").
 	// Owner evita que `sync stop` derrube a TUI inteira ao matar o dono.
@@ -234,14 +241,53 @@ func (m *Manager) RemoveSession(name string) error {
 
 	if m.state.ActiveSession == name {
 		m.state.ActiveSession = ""
-		// Tenta definir outra sessão como ativa
+		// Tenta definir outra sessão como ativa — a menor alfabeticamente,
+		// para a escolha ser estável (range de map é não determinístico)
+		names := make([]string, 0, len(m.state.Sessions))
 		for n := range m.state.Sessions {
-			m.state.ActiveSession = n
-			break
+			names = append(names, n)
+		}
+		if len(names) > 0 {
+			sort.Strings(names)
+			m.state.ActiveSession = names[0]
 		}
 	}
 
 	return m.saveState()
+}
+
+// FindSyncByLocalDir procura em TODAS as sessões (todos os hosts) um sync cuja
+// pasta local colide com localDir — igual, pai ou filha. Detecta dois hosts
+// sincronizando para a mesma pasta local, o que corromperia a reconciliação.
+// excludeID ignora o próprio sync (re-restore do mesmo par não é colisão).
+func (m *Manager) FindSyncByLocalDir(localDir, excludeID string) (string, SyncEntry, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	clean := strings.TrimSuffix(localDir, "/")
+	for host, sess := range m.state.Sessions {
+		for _, s := range sess.Syncs {
+			if s.ID == excludeID {
+				continue
+			}
+			dir := strings.TrimSuffix(s.LocalDir, "/")
+			if dir == clean ||
+				strings.HasPrefix(dir, clean+"/") ||
+				strings.HasPrefix(clean, dir+"/") {
+				return host, s, true
+			}
+		}
+	}
+	return "", SyncEntry{}, false
+}
+
+// Reload relê o state.json do disco, absorvendo mudanças de outros processos
+// (ex: `unlarp sync start` num terminal enquanto a TUI roda). Falha de leitura
+// preserva o estado em memória — toda mutação local já salva em disco na hora,
+// então o disco é sempre a fonte da verdade.
+func (m *Manager) Reload() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_ = m.loadState()
 }
 
 // loadState carrega o estado do disco
