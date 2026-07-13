@@ -21,6 +21,7 @@ type Config struct {
 	Tunnel      TunnelConfig    `yaml:"tunnel"`
 	Session     SessionConfig   `yaml:"session"`
 	SSH         SSHGlobalConfig `yaml:"ssh"`
+	Daemon      DaemonConfig    `yaml:"daemon"`
 }
 
 // Host representa um workspace remoto configurado
@@ -96,6 +97,12 @@ type SessionConfig struct {
 type SSHGlobalConfig struct {
 	ReadSSHConfig      bool `yaml:"read_ssh_config"`
 	StrictHostChecking bool `yaml:"strict_host_checking"`
+}
+
+// DaemonConfig controla o daemon local (opt-in nesta fase — ver DAEMON.md).
+// Default false: TUI e CLI seguem rodando as engines in-process.
+type DaemonConfig struct {
+	Enabled bool `yaml:"enabled"`
 }
 
 // PollIntervalDuration retorna o poll interval como time.Duration
