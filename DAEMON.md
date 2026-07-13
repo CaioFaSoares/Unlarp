@@ -1,7 +1,43 @@
 # DAEMON.md — Design do daemon local do Unlarp
 
-> Status: **design aprovado para implementação futura** — nada aqui está implementado.
-> Este documento descreve como o CLI local vai evoluir para um modelo com daemon.
+> Status: **implementado (fases 1–4 da seção 8)** — é **opt-in**, não o
+> padrão. Sem ativação, CLI e TUI continuam rodando as engines in-process,
+> exatamente como antes deste documento.
+
+## 0. Como ativar hoje
+
+### CLI
+
+- `unlarp sync start --daemon --remote-dir <dir> [--local-dir <dir>] [host]`
+  cria o sync no daemon em vez de in-process. Sobe o daemon sozinho (fork/exec
+  desanexado) se ele ainda não estiver de pé. O sync sobrevive ao fechamento
+  do terminal.
+- `unlarp tunnel <portas> [host] --daemon` faz o mesmo para túneis.
+- `unlarp sync status` / `sync stop <id>` / `tunnel list` / `tunnel stop <id>`
+  (e `stop --all`) já detectam sozinhos o que está no daemon e mesclam com o
+  que está in-process — nenhuma flag extra necessária para consultar ou parar.
+- Gerência direta do processo do daemon (raramente precisa ser chamado à mão,
+  o auto-start acima já cobre o uso comum):
+  - `unlarp daemon` — roda o servidor em foreground.
+  - `unlarp daemon status` — versão, protocolo, PID, uptime, nº de syncs.
+  - `unlarp daemon stop` — SIGTERM + espera o socket sumir.
+
+### TUI
+
+- Aba **Dashboard**, tecla **`D`** — liga/desliga `daemon.enabled` em
+  `~/.unlarp.yaml`; o estado atual aparece na própria aba ("Daemon local:
+  ativado/desativado (D para alternar)").
+- Com o toggle ligado, **novos syncs criados pela TUI** (prompt `s`) passam a
+  ser criados no daemon; a aba **Logs** passa a mesclar os eventos do daemon
+  (`GET /v1/logs`) no polling de 1s já existente.
+- **Túneis criados pela TUI continuam in-process** mesmo com o toggle ligado
+  — por enquanto só o CLI (`unlarp tunnel --daemon`) cria túneis no daemon. A
+  rota condicional equivalente à da Fase 3 ainda não chegou em
+  `createTunnelLive` (`internal/tui/app.go`).
+- Syncs de outros processos (do daemon ou de um `unlarp sync start` em outro
+  terminal) continuam só sendo **exibidos**, nunca recriados: os guards de
+  `Owner`/`PID`/`Alive()` seguem em vigor, e um sync do daemon aparece como
+  "externo (daemon, pid <pid>)" na aba Syncs.
 
 ## 1. Motivação
 
@@ -107,10 +143,18 @@ O daemon vira **a fonte de verdade dos logs**:
 
 ## 8. Ordem de implementação sugerida
 
-1. `internal/daemonapi` (tipos + contrato, espelho do agentapi) e o servidor
-   `unlarp daemon` hospedando o código de engine que hoje vive em `cmd/sync.go`
-   e `internal/tui/app.go` (`startSyncEngine` é praticamente o corpo do handler
-   `POST /v1/syncs`).
-2. Cliente + auto-start; `sync start/stop/status` chamando a API.
-3. TUI consumindo `/v1/syncs` e `/v1/logs` (remoção dos guards de Owner/PID).
-4. Túneis.
+> As 4 fases abaixo estão implementadas (ver seção 0 para como ativar). O
+> daemon ficou **opt-in** neste ciclo — diferente do que a fase 3 original
+> cogitava, os guards de Owner/PID/Alive() da TUI **não** foram removidos,
+> já que in-process continua sendo o caminho padrão quando o toggle está
+> desligado.
+
+1. ✅ `internal/daemonapi` (tipos + contrato, espelho do agentapi) e o servidor
+   `unlarp daemon` hospedando o código de engine que antes vivia em
+   `cmd/sync.go` e `internal/tui/app.go` (`startSyncEngine` virou o corpo do
+   handler `POST /v1/syncs`, em `internal/daemon/registry.go`).
+2. ✅ Cliente + auto-start; `sync start/stop/status --daemon` chamando a API.
+3. ✅ TUI: toggle opt-in (`D` no Dashboard) roteando `createSyncLiveCmd` para
+   o daemon e mesclando `/v1/logs` na aba Logs. Guards de Owner/PID mantidos.
+4. ✅ Túneis via daemon, mas só no CLI (`unlarp tunnel --daemon`) — a TUI
+   (`createTunnelLive`) ainda cria túneis in-process independente do toggle.
