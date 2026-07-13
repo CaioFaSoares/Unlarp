@@ -47,6 +47,10 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
 
 RUN pipx install uv
 
+# Headroom (proxy de otimização de contexto) — o entrypoint o supervisiona na
+# 8787; instalar aqui garante que um volume /root novo já suba com o binário.
+RUN /root/.local/bin/uv tool install headroom-ai
+
 # 4. Instalar o Gerenciador de Pacotes Nix (Single User Mode)
 # Criamos o nix.conf previamente para desabilitar o build-users-group (necessário para rodar sob o root no container)
 # e habilitar os experimental-features (nix-command flakes)
