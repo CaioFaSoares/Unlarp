@@ -118,6 +118,12 @@ func (m *AppModel) renderDashboard(width, height int) string {
 	}
 	sb.WriteString(fmt.Sprintf("%s %s\n", styles.StatusLabelStyle.Render("Workspace:"), host.Workspace))
 
+	daemonState := "desativado"
+	if m.cfg.Daemon.Enabled {
+		daemonState = "ativado"
+	}
+	sb.WriteString(fmt.Sprintf("%s %s (%s para alternar)\n", styles.StatusLabelStyle.Render("Daemon local:"), daemonState, styles.KeyStyle.Render("D")))
+
 	sb.WriteString("\n")
 	sb.WriteString(styles.TableHeaderStyle.Width(width).Render("Visão Geral de Recursos Remotos"))
 	sb.WriteString("\n")

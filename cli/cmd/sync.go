@@ -16,6 +16,8 @@ import (
 
 	"github.com/CaioFaSoares/unlarp/internal/agent"
 	"github.com/CaioFaSoares/unlarp/internal/config"
+	"github.com/CaioFaSoares/unlarp/internal/daemon"
+	"github.com/CaioFaSoares/unlarp/internal/daemonapi"
 	"github.com/CaioFaSoares/unlarp/internal/session"
 	internalssh "github.com/CaioFaSoares/unlarp/internal/ssh"
 	internalsync "github.com/CaioFaSoares/unlarp/internal/sync"
@@ -31,6 +33,7 @@ var (
 	syncStopAll     bool
 	syncInteractive bool
 	syncProject     string
+	syncDaemon      bool
 )
 
 var syncCmd = &cobra.Command{
@@ -80,6 +83,7 @@ func init() {
 	syncStartCmd.Flags().StringVar(&syncInit, "initial-sync", "full", "sync inicial: full | none")
 	syncStartCmd.Flags().BoolVarP(&syncInteractive, "interactive", "i", false, "iniciar seletor interativo de pastas")
 	syncStartCmd.Flags().StringVar(&syncProject, "project", "", "nome do projeto cadastrado dono deste sync (marca o sync como sync de projeto)")
+	syncStartCmd.Flags().BoolVar(&syncDaemon, "daemon", false, "criar o sync no daemon local (sobrevive ao fechamento do terminal; sobe o daemon automaticamente se preciso)")
 
 	// Flags para stop
 	syncStopCmd.Flags().BoolVar(&syncStopAll, "all", false, "parar todas as sessões de sync")
@@ -117,6 +121,10 @@ func runSyncStart(cmd *cobra.Command, args []string) error {
 		if !found {
 			return fmt.Errorf("projeto '%s' não cadastrado no host %s (veja ~/.unlarp.yaml)", syncProject, displayName)
 		}
+	}
+
+	if syncDaemon {
+		return runSyncStartDaemon(displayName)
 	}
 
 	// Verifica se deve rodar no modo interativo (caso as pastas não sejam fornecidas ou forçado por flag)
@@ -415,6 +423,58 @@ func runSyncStart(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// runSyncStartDaemon delega a criação do sync ao daemon local (subindo-o via
+// auto-start se preciso) em vez de rodar a engine no processo do CLI — o
+// sync sobrevive ao fechamento deste terminal. Picker interativo de pasta
+// remota não está disponível aqui (exigiria SFTP neste processo); use
+// --remote-dir ou --project.
+func runSyncStartDaemon(displayName string) error {
+	if syncRemoteDir == "" {
+		return fmt.Errorf("--remote-dir (ou --project) é obrigatório com --daemon")
+	}
+
+	localPath := syncLocalDir
+	if localPath == "" {
+		localPath = "."
+	}
+	var absLocal string
+	var err error
+	if syncInteractive {
+		absLocal, err = ui.ChooseLocalDir(localPath)
+	} else {
+		absLocal, err = filepath.Abs(localPath)
+	}
+	if err != nil {
+		return fmt.Errorf("caminho local inválido: %w", err)
+	}
+
+	spin := ui.NewSpinner("Conectando ao daemon local...")
+	spin.Start()
+	client, err := daemon.Connect()
+	if err != nil {
+		spin.StopWithError("Falha ao conectar/subir o daemon")
+		return err
+	}
+
+	info, err := client.CreateSync(daemonapi.CreateSyncRequest{
+		Host:        displayName,
+		LocalDir:    absLocal,
+		RemoteDir:   syncRemoteDir,
+		Mode:        syncMode,
+		Project:     syncProject,
+		InitialSync: syncInit,
+	})
+	if err != nil {
+		spin.StopWithError("Falha ao criar sync no daemon")
+		return err
+	}
+	spin.StopWithSuccess("Sync criado no daemon")
+
+	ui.Success("Sessão %s: %s -> %s@%s", info.ID, info.LocalDir, displayName, info.RemoteDir)
+	ui.Info("Roda no daemon — sobrevive ao fechamento deste terminal. `unlarp sync status` / `sync stop %s`.", info.ID)
+	return nil
+}
+
 func runSyncStatus(cmd *cobra.Command, args []string) error {
 	sessMgr, err := session.NewManager()
 	if err != nil {
@@ -427,8 +487,27 @@ func runSyncStatus(cmd *cobra.Command, args []string) error {
 	table := tablewriter.NewTable(os.Stdout)
 	table.Header("SESSION ID", "HOST", "LOCAL DIR", "REMOTE DIR", "MODE", "STATUS", "LAST SYNC")
 
+	// Syncs do daemon são listados a partir da API (fonte de verdade para os
+	// syncs que ele criou); daemonIDs evita listar a mesma entrada de novo a
+	// partir do state.json abaixo.
+	daemonIDs := map[string]bool{}
+	if client, err := daemon.NewClient(); err == nil {
+		if resp, err := client.ListSyncs(); err == nil {
+			for _, s := range resp.Syncs {
+				hasSyncs = true
+				daemonIDs[s.ID] = true
+				// ponytail: sem LastSync no daemonapi.SyncInfo ainda — o
+				// progresso já mostra o que está rolando agora.
+				table.Append(s.ID, s.Host, s.LocalDir, s.RemoteDir, s.Mode, "ativo (daemon)", "—")
+			}
+		}
+	}
+
 	for name, sess := range sessions {
 		for _, s := range sess.Syncs {
+			if daemonIDs[s.ID] {
+				continue
+			}
 			hasSyncs = true
 			status := "morto"
 			if s.Alive() {
@@ -458,6 +537,13 @@ func runSyncStop(cmd *cobra.Command, args []string) error {
 	}
 
 	if syncStopAll {
+		if client, err := daemon.NewClient(); err == nil {
+			if resp, err := client.ListSyncs(); err == nil {
+				for _, s := range resp.Syncs {
+					_ = client.DeleteSync(s.ID)
+				}
+			}
+		}
 		sessions := sessMgr.ListSessions()
 		count := 0
 		for name, sess := range sessions {
@@ -479,6 +565,17 @@ func runSyncStop(cmd *cobra.Command, args []string) error {
 	}
 
 	id := args[0]
+
+	// Sync do daemon: ele é o dono único do seu registro em state.json —
+	// pede a ele para parar o watcher e remover a entrada. Se o daemon não
+	// está de pé ou não conhece esse ID, cai no caminho local abaixo.
+	if client, err := daemon.NewClient(); err == nil {
+		if err := client.DeleteSync(id); err == nil {
+			ui.Success("Sessão de sincronização '%s' parada e removida (daemon).", id)
+			return nil
+		}
+	}
+
 	sessions := sessMgr.ListSessions()
 	for name, sess := range sessions {
 		for _, s := range sess.Syncs {

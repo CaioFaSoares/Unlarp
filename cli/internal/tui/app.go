@@ -23,6 +23,8 @@ import (
 	"github.com/CaioFaSoares/unlarp/internal/agent"
 	"github.com/CaioFaSoares/unlarp/internal/agentapi"
 	"github.com/CaioFaSoares/unlarp/internal/config"
+	"github.com/CaioFaSoares/unlarp/internal/daemon"
+	"github.com/CaioFaSoares/unlarp/internal/daemonapi"
 	"github.com/CaioFaSoares/unlarp/internal/git"
 	"github.com/CaioFaSoares/unlarp/internal/session"
 	internalssh "github.com/CaioFaSoares/unlarp/internal/ssh"
@@ -155,6 +157,34 @@ type syncStartedMsg struct {
 	localWatcher  *watcher.LocalWatcher
 	remoteWatcher watcher.Stopper
 	restored      bool // true quando religado automaticamente a partir do state persistido, não criado pelo usuário agora
+	daemon        bool // true quando criado no daemon (ver DAEMON.md) — sem engine/watcher local, entry já persistida pelo daemon
+}
+
+// daemonLogsMsg carrega uma página de GET /v1/logs?since= do daemon local,
+// mesclada na aba Logs junto dos eventos da própria TUI (ver DAEMON.md).
+type daemonLogsMsg struct {
+	entries []daemonapi.LogEntry
+	latest  uint64
+}
+
+// fetchDaemonLogsCmd busca novas entradas do log do daemon desde o último
+// cursor visto. Silencioso se o daemon não está de pé (opt-in) ou desativado.
+func (m *AppModel) fetchDaemonLogsCmd() tea.Cmd {
+	if !m.cfg.Daemon.Enabled {
+		return nil
+	}
+	since := m.daemonLogCursor
+	return func() tea.Msg {
+		client, err := daemon.NewClient()
+		if err != nil {
+			return nil
+		}
+		resp, err := client.Logs(since)
+		if err != nil {
+			return nil
+		}
+		return daemonLogsMsg{entries: resp.Entries, latest: resp.Latest}
+	}
 }
 
 // Índices das abas do painel principal — Dashboard e Projetos ficam lado a lado
@@ -258,6 +288,7 @@ type AppModel struct {
 	logScrollOffset int
 	logAutoScroll   bool
 	logsMu          sync.Mutex // addLog é chamado de goroutines de background
+	daemonLogCursor uint64     // último Seq visto de GET /v1/logs (ver DAEMON.md)
 
 	// Syncs cujo restore falhou nesta execução (não re-tentar a cada reload)
 	failedRestores map[string]bool
@@ -460,6 +491,14 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// senão fica órfã (sem registro em syncSessions nem saída de pendingSyncs).
 		m.handleSyncStarted(bg)
 		return m, tea.Batch(cmds...)
+	case daemonLogsMsg:
+		if bg.latest > m.daemonLogCursor {
+			m.daemonLogCursor = bg.latest
+		}
+		for _, e := range bg.entries {
+			m.addLog(fmt.Sprintf("[daemon] %s: %s", e.Level, e.Msg))
+		}
+		return m, tea.Batch(cmds...)
 	}
 
 	if m.pickerActive {
@@ -567,6 +606,10 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, m.checkProjectsCmd())
 
 			cmds = append(cmds, m.dispatchWatchersCmd()...)
+
+			if cmd := m.fetchDaemonLogsCmd(); cmd != nil {
+				cmds = append(cmds, cmd)
+			}
 
 			m.claudeTickCounter++
 			if m.claudeTickCounter >= 3 {
@@ -933,6 +976,23 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			} else {
 				m.addLog("Não está rodando sob uma sessão do Tmux.")
+			}
+			return m, nil
+
+		case "D":
+			// Toggle do daemon local (opt-in — ver DAEMON.md): novos syncs
+			// passam a ser criados no daemon em vez de in-process. Syncs já
+			// vivos não migram sozinhos.
+			if !m.sidebarFocus && m.activeTab == tabDashboard {
+				m.cfg.Daemon.Enabled = !m.cfg.Daemon.Enabled
+				store := config.NewStore()
+				if err := store.Save(m.cfg); err != nil {
+					m.addLog(fmt.Sprintf("Erro ao salvar config do daemon: %v", err))
+				} else if m.cfg.Daemon.Enabled {
+					m.addLog("Daemon local ativado: novos syncs serão criados no daemon.")
+				} else {
+					m.addLog("Daemon local desativado: novos syncs voltam a rodar in-process.")
+				}
 			}
 			return m, nil
 
@@ -1746,6 +1806,24 @@ func (m *AppModel) createSyncLiveCmd(syncID, val string) tea.Cmd {
 			return syncStartedMsg{err: fmt.Errorf("pasta local %s colide com o sync %s do host %s (%s)", absLocal, other.ID, otherHost, other.LocalDir), host: host, syncID: syncID}
 		}
 
+		if m.cfg.Daemon.Enabled {
+			daemonClient, err := daemon.Connect()
+			if err != nil {
+				return syncStartedMsg{err: fmt.Errorf("erro ao conectar no daemon: %w", err), host: host, syncID: syncID}
+			}
+			if _, err := daemonClient.CreateSync(daemonapi.CreateSyncRequest{
+				Host:        host,
+				LocalDir:    absLocal,
+				RemoteDir:   remoteDir,
+				Mode:        "bidirectional",
+				Project:     matchProjectName(m.projects, remoteDir),
+				InitialSync: m.cfg.Sync.InitialSync,
+			}); err != nil {
+				return syncStartedMsg{err: fmt.Errorf("erro ao criar sync no daemon: %w", err), host: host, syncID: syncID}
+			}
+			return syncStartedMsg{host: host, syncID: syncID, localDir: absLocal, remoteDir: remoteDir, daemon: true}
+		}
+
 		// Garante conexão SSH e SFTP
 		client, err := m.getOrCreateSSHClient(host, &hostCfg)
 		if err != nil {
@@ -1985,6 +2063,14 @@ func (m *AppModel) handleSyncStarted(msg syncStartedMsg) {
 			m.failedRestores[msg.syncID] = true
 		}
 		m.addLog(fmt.Sprintf("Erro ao criar sincronização: %v", msg.err))
+		return
+	}
+
+	if msg.daemon {
+		// Sem engine local: o daemon já persistiu a entry (Owner=daemon) em
+		// state.json. Ela aparece sozinha no próximo tick de reload, exibida
+		// como "externo" pelo mesmo guard que outros processos externos usam.
+		m.addLog(fmt.Sprintf("Sincronização criada no daemon local em %s.", msg.host))
 		return
 	}
 

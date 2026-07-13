@@ -13,6 +13,8 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/CaioFaSoares/unlarp/internal/config"
+	"github.com/CaioFaSoares/unlarp/internal/daemon"
+	"github.com/CaioFaSoares/unlarp/internal/daemonapi"
 	"github.com/CaioFaSoares/unlarp/internal/session"
 	internalssh "github.com/CaioFaSoares/unlarp/internal/ssh"
 	"github.com/CaioFaSoares/unlarp/internal/tunnel"
@@ -21,6 +23,7 @@ import (
 
 var tunnelBackground bool
 var tunnelLocal bool
+var tunnelDaemon bool
 
 var tunnelCmd = &cobra.Command{
 	Use:   "tunnel <portas> [name]",
@@ -77,6 +80,7 @@ func init() {
 
 	tunnelCmd.Flags().BoolVarP(&tunnelBackground, "background", "b", false, "manter rodando sem exibir status (o processo precisa continuar vivo — não é um daemon)")
 	tunnelCmd.Flags().BoolVarP(&tunnelLocal, "local", "l", false, "escutar na máquina local e encaminhar para o host remoto (ssh -L), em vez do padrão (ssh -R)")
+	tunnelCmd.Flags().BoolVar(&tunnelDaemon, "daemon", false, "criar o(s) túnel(is) no daemon local (sobrevive ao fechamento do terminal; sobe o daemon automaticamente se preciso)")
 	tunnelStopCmd.Flags().BoolVar(&tunnelStopAll, "all", false, "parar todos os túneis")
 }
 
@@ -147,6 +151,10 @@ func runTunnel(cmd *cobra.Command, args []string) error {
 	displayName := hostName
 	if displayName == "" {
 		displayName = getActiveHost()
+	}
+
+	if tunnelDaemon {
+		return runTunnelDaemon(displayName, mappings)
 	}
 
 	// Lê config de tunnel para auto_reconnect
@@ -268,6 +276,49 @@ func runTunnel(cmd *cobra.Command, args []string) error {
 	}
 }
 
+// runTunnelDaemon cria o(s) túnel(is) no daemon local em vez de in-process —
+// sobrevivem ao fechamento do terminal (ver DAEMON.md Fase 4).
+func runTunnelDaemon(displayName string, mappings []portMapping) error {
+	direction := tunnel.DirectionRemote
+	if tunnelLocal {
+		direction = tunnel.DirectionLocal
+	}
+
+	spin := ui.NewSpinner("Conectando ao daemon local...")
+	spin.Start()
+	client, err := daemon.Connect()
+	if err != nil {
+		spin.StopWithError("Falha ao conectar/subir o daemon")
+		return err
+	}
+	spin.StopWithSuccess("Conectado ao daemon")
+
+	var created int
+	for _, m := range mappings {
+		info, err := client.CreateTunnel(daemonapi.CreateTunnelRequest{
+			Host:       displayName,
+			LocalPort:  m.LocalPort,
+			RemotePort: m.RemotePort,
+			Direction:  direction.String(),
+		})
+		if err != nil {
+			ui.Error("Falha ao criar túnel %d → %d no daemon: %v", m.RemotePort, m.LocalPort, err)
+			continue
+		}
+		created++
+		if direction == tunnel.DirectionLocal {
+			ui.Success("Túnel %s: localhost:%d → workspace:%d (daemon)", info.ID, info.LocalPort, info.RemotePort)
+		} else {
+			ui.Success("Túnel %s: workspace:%d → localhost:%d (daemon)", info.ID, info.RemotePort, info.LocalPort)
+		}
+	}
+	if created == 0 {
+		return fmt.Errorf("nenhum túnel foi criado no daemon")
+	}
+	ui.Info("Roda no daemon — sobrevive ao fechamento deste terminal. `unlarp tunnel list` / `tunnel stop <id>`.")
+	return nil
+}
+
 func printTunnelStatus(mgr *tunnel.Manager) {
 	infos := mgr.List()
 	for _, info := range infos {
@@ -302,8 +353,23 @@ func runTunnelList(cmd *cobra.Command, args []string) error {
 	table := tablewriter.NewTable(os.Stdout)
 	table.Header("ID", "HOST", "MAPPING", "DIRECTION", "ORIGIN", "STATUS")
 
+	daemonIDs := map[string]bool{}
+	if client, err := daemon.NewClient(); err == nil {
+		if resp, err := client.ListTunnels(); err == nil {
+			for _, t := range resp.Tunnels {
+				hasTunnels = true
+				daemonIDs[t.ID] = true
+				mapping := fmt.Sprintf("%d → %d", t.RemotePort, t.LocalPort)
+				table.Append(t.ID, t.Host, mapping, t.Direction, "manual", "● Ativo (daemon)")
+			}
+		}
+	}
+
 	for name, sess := range sessions {
 		for _, t := range sess.Tunnels {
+			if daemonIDs[t.ID] {
+				continue
+			}
 			hasTunnels = true
 			mapping := fmt.Sprintf("%d → %d", t.RemotePort, t.LocalPort)
 			direction := t.Direction
@@ -334,6 +400,14 @@ func runTunnelStop(cmd *cobra.Command, args []string) error {
 	}
 
 	if tunnelStopAll {
+		if client, err := daemon.NewClient(); err == nil {
+			if resp, err := client.ListTunnels(); err == nil {
+				for _, t := range resp.Tunnels {
+					_ = client.DeleteTunnel(t.ID)
+				}
+			}
+		}
+
 		sessions := sessMgr.ListSessions()
 		count := 0
 		for name, sess := range sessions {
@@ -355,6 +429,13 @@ func runTunnelStop(cmd *cobra.Command, args []string) error {
 	}
 
 	id := args[0]
+	if client, err := daemon.NewClient(); err == nil {
+		if err := client.DeleteTunnel(id); err == nil {
+			ui.Success("Túnel '%s' removido (daemon).", id)
+			return nil
+		}
+	}
+
 	sessions := sessMgr.ListSessions()
 	for name, sess := range sessions {
 		for _, t := range sess.Tunnels {
