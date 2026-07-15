@@ -82,6 +82,9 @@ func (m *AppModel) renderProjects(width, height int) string {
 			}
 
 			nameCol := fmt.Sprintf("%s %s", indicator, item.Project.Name)
+			if item.Project.Account != "" {
+				nameCol += " " + lipgloss.NewStyle().Foreground(styles.ColorSecondary).Render("["+item.Project.Account+"]")
+			}
 			branchStr := item.Project.Branch
 
 			var hasAlert bool

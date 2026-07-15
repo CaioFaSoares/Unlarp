@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/mitchellh/go-homedir"
@@ -26,15 +27,26 @@ type Config struct {
 
 // Host representa um workspace remoto configurado
 type Host struct {
-	Host      string    `yaml:"host"`
-	Port      int       `yaml:"port"`
-	User      string    `yaml:"user"`
-	Key       string    `yaml:"key"`
-	Workspace string    `yaml:"workspace"`
-	Container string    `yaml:"container,omitempty"` // Para operações Docker diretas (local only)
-	Password  string    `yaml:"-"`                   // Usado apenas em memória para bootstrap/setup
-	Projects  []Project `yaml:"projects,omitempty"`
-	Watchers  []Watcher `yaml:"watchers,omitempty"`
+	Host      string            `yaml:"host"`
+	Port      int               `yaml:"port"`
+	User      string            `yaml:"user"`
+	Key       string            `yaml:"key"`
+	Workspace string            `yaml:"workspace"`
+	Container string            `yaml:"container,omitempty"` // Para operações Docker diretas (local only)
+	Password  string            `yaml:"-"`                   // Usado apenas em memória para bootstrap/setup
+	Projects  []Project         `yaml:"projects,omitempty"`
+	Watchers  []Watcher         `yaml:"watchers,omitempty"`
+	Accounts  map[string]string `yaml:"accounts,omitempty"` // conta Claude Code: nome → CLAUDE_CONFIG_DIR remoto (path absoluto)
+}
+
+// AccountDir resolve o CLAUDE_CONFIG_DIR de uma conta cadastrada.
+// Nome vazio ou desconhecido → ("", false): sessão sem injeção (usa ~/.claude do remoto).
+func (h *Host) AccountDir(name string) (string, bool) {
+	if name == "" {
+		return "", false
+	}
+	dir, ok := h.Accounts[name]
+	return dir, ok && dir != ""
 }
 
 // Watcher é um comando shell executado periodicamente no host remoto, com o
@@ -60,6 +72,7 @@ type Project struct {
 	RemotePath string `yaml:"remote_path"`
 	LocalDir   string `yaml:"local_dir,omitempty"` // pasta local vinculada, se um sync foi criado no cadastro
 	Compose    string `yaml:"compose,omitempty"`   // arquivo docker-compose relativo ao path do projeto (vazio = padrão do docker)
+	Account    string `yaml:"account,omitempty"`   // conta Claude Code (chave de Host.Accounts) usada nas sessões deste projeto
 }
 
 // SyncConfig contém as configurações globais de sincronização
@@ -330,6 +343,93 @@ func (s *Store) RemoveProject(hostName, remotePath string) error {
 	cfg.Hosts[hostName] = host
 
 	return s.Save(cfg)
+}
+
+// AddAccount cadastra uma conta Claude Code (nome → CLAUDE_CONFIG_DIR remoto) em um host e salva
+func (s *Store) AddAccount(hostName, name, dir string) error {
+	cfg, err := s.Load()
+	if err != nil {
+		return err
+	}
+
+	host, exists := cfg.Hosts[hostName]
+	if !exists {
+		return fmt.Errorf("host '%s' não encontrado", hostName)
+	}
+
+	if _, ok := host.Accounts[name]; ok {
+		return fmt.Errorf("conta '%s' já cadastrada neste host", name)
+	}
+
+	if host.Accounts == nil {
+		host.Accounts = make(map[string]string)
+	}
+	host.Accounts[name] = dir
+	cfg.Hosts[hostName] = host
+
+	return s.Save(cfg)
+}
+
+// RemoveAccount remove uma conta cadastrada; recusa se algum projeto ainda a referencia.
+// O diretório remoto nunca é apagado (contém credenciais).
+func (s *Store) RemoveAccount(hostName, name string) error {
+	cfg, err := s.Load()
+	if err != nil {
+		return err
+	}
+
+	host, exists := cfg.Hosts[hostName]
+	if !exists {
+		return fmt.Errorf("host '%s' não encontrado", hostName)
+	}
+
+	if _, ok := host.Accounts[name]; !ok {
+		return fmt.Errorf("conta '%s' não encontrada neste host", name)
+	}
+
+	var inUse []string
+	for _, p := range host.Projects {
+		if p.Account == name {
+			inUse = append(inUse, p.Name)
+		}
+	}
+	if len(inUse) > 0 {
+		return fmt.Errorf("conta '%s' em uso pelos projetos: %s", name, strings.Join(inUse, ", "))
+	}
+
+	delete(host.Accounts, name)
+	cfg.Hosts[hostName] = host
+
+	return s.Save(cfg)
+}
+
+// SetProjectAccount define (ou limpa, com account vazio) a conta de um projeto e salva
+func (s *Store) SetProjectAccount(hostName, remotePath, account string) error {
+	cfg, err := s.Load()
+	if err != nil {
+		return err
+	}
+
+	host, exists := cfg.Hosts[hostName]
+	if !exists {
+		return fmt.Errorf("host '%s' não encontrado", hostName)
+	}
+
+	if account != "" {
+		if _, ok := host.Accounts[account]; !ok {
+			return fmt.Errorf("conta '%s' não cadastrada neste host", account)
+		}
+	}
+
+	for i := range host.Projects {
+		if host.Projects[i].RemotePath == remotePath {
+			host.Projects[i].Account = account
+			cfg.Hosts[hostName] = host
+			return s.Save(cfg)
+		}
+	}
+
+	return fmt.Errorf("projeto em '%s' não encontrado neste host", remotePath)
 }
 
 // SetDefault define o host default

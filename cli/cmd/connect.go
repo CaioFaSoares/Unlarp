@@ -86,17 +86,21 @@ Exemplos:
 			if connectCwd != "" {
 				newSessionFlags = " -c " + shellQuote(connectCwd)
 			}
+			if connectClaudeConfigDir != "" {
+				// -e só afeta a criação; se a sessão já existe o new-session é no-op
+				newSessionFlags += " -e " + shellQuote("CLAUDE_CONFIG_DIR="+connectClaudeConfigDir)
+			}
 			// Garante a sessão em background, configura Ctrl+G como atalho de detach rápido sem prefixo, e atacha (com -u para forçar UTF-8 e status-bar customizada)
 			shellCmd = fmt.Sprintf(
 				"export LANG=C.UTF-8; export LC_ALL=C.UTF-8; "+
-				"tmux -u new-session -d -s %[1]s%[2]s 2>/dev/null; "+
-				"tmux -u bind-key -n C-g detach-client 2>/dev/null; "+
-				"tmux -u set-option -t %[1]s status-left-length 50 2>/dev/null; "+
-				"tmux -u set-option -t %[1]s status-left '#[fg=magenta,bold] unlarp #[fg=cyan]⬡ #[fg=white,bold]#S #[fg=cyan]⬢ ' 2>/dev/null; "+
-				"tmux -u set-option -t %[1]s status-right '#[fg=magenta,bold]Ctrl+G: Detach #[fg=cyan]| #[fg=white]%%H:%%M ' 2>/dev/null; "+
-				"tmux -u set-option -t %[1]s status-style 'bg=black,fg=white' 2>/dev/null; "+
-				"tmux -u set-option -t %[1]s window-status-current-style 'fg=magenta,bold' 2>/dev/null; "+
-				"tmux -u attach-session -t %[1]s",
+					"tmux -u new-session -d -s %[1]s%[2]s 2>/dev/null; "+
+					"tmux -u bind-key -n C-g detach-client 2>/dev/null; "+
+					"tmux -u set-option -t %[1]s status-left-length 50 2>/dev/null; "+
+					"tmux -u set-option -t %[1]s status-left '#[fg=magenta,bold] unlarp #[fg=cyan]⬡ #[fg=white,bold]#S #[fg=cyan]⬢ ' 2>/dev/null; "+
+					"tmux -u set-option -t %[1]s status-right '#[fg=magenta,bold]Ctrl+G: Detach #[fg=cyan]| #[fg=white]%%H:%%M ' 2>/dev/null; "+
+					"tmux -u set-option -t %[1]s status-style 'bg=black,fg=white' 2>/dev/null; "+
+					"tmux -u set-option -t %[1]s window-status-current-style 'fg=magenta,bold' 2>/dev/null; "+
+					"tmux -u attach-session -t %[1]s",
 				connectTmuxSession, newSessionFlags,
 			)
 			ui.Dim("Iniciando Tmux (Sessão: %s)...", connectTmuxSession)
@@ -111,9 +115,10 @@ Exemplos:
 }
 
 var (
-	connectUseTmux     bool
-	connectTmuxSession string
-	connectCwd         string
+	connectUseTmux         bool
+	connectTmuxSession     string
+	connectCwd             string
+	connectClaudeConfigDir string
 )
 
 func init() {
@@ -123,6 +128,7 @@ func init() {
 	connectCmd.Flags().BoolVarP(&connectUseTmux, "tmux", "t", false, "iniciar sessão dentro do Tmux persistente")
 	connectCmd.Flags().StringVar(&connectTmuxSession, "tmux-session", "unlarp", "nome da sessão Tmux a ser usada")
 	connectCmd.Flags().StringVar(&connectCwd, "cwd", "", "diretório de trabalho inicial da sessão Tmux (apenas na criação)")
+	connectCmd.Flags().StringVar(&connectClaudeConfigDir, "claude-config-dir", "", "CLAUDE_CONFIG_DIR injetado na sessão Tmux (apenas na criação)")
 }
 
 // shellQuote coloca uma string entre aspas simples seguras para uso em shell POSIX
