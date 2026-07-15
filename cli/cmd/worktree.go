@@ -10,6 +10,7 @@ import (
 	"github.com/CaioFaSoares/unlarp/internal/agentapi"
 	"github.com/CaioFaSoares/unlarp/internal/config"
 	"github.com/CaioFaSoares/unlarp/internal/git"
+	internalssh "github.com/CaioFaSoares/unlarp/internal/ssh"
 	"github.com/CaioFaSoares/unlarp/internal/ui"
 )
 
@@ -96,6 +97,24 @@ func runWorktreeAdd(cmd *cobra.Command, args []string) error {
 	}
 
 	wtPath, tmuxSession, localPath := worktreePaths(proj, branch)
+
+	// Garante que o repo remoto exista e esteja em dia ANTES do worktree add:
+	// este comando roda direto no remoto (ou via unlarp-agent) e não passa
+	// pela engine de sync, então sem isso um repo remoto vazio/quebrado (ou
+	// só defasado) faz o add falhar ou criar a worktree a partir de um HEAD
+	// antigo. Best-effort e seguro para projetos sem LocalDir vinculado —
+	// EnsureRemoteRepo é no-op quando o local não é repo git.
+	if proj.LocalDir != "" {
+		if sftpC, err := internalssh.NewSFTPClient(sshClient); err != nil {
+			ui.Warn("não consegui abrir SFTP pra garantir o git remoto: %v", err)
+		} else {
+			_, bootstrapErr := git.EnsureRemoteRepo(sshClient, sftpC.Inner(), proj.LocalDir, proj.RemotePath)
+			sftpC.Close()
+			if bootstrapErr != nil {
+				ui.Warn("não consegui garantir/atualizar o git remoto: %v", bootstrapErr)
+			}
+		}
+	}
 
 	// git worktree add [-b branch] <path> [branch]
 	var gitArgs []string
