@@ -124,6 +124,7 @@ type Project struct {
 	Name     string
 	Branch   string
 	LocalDir string // pasta local vinculada, se um sync foi criado no cadastro
+	Account  string // conta Claude Code do projeto (chave de Host.Accounts), "" = padrão
 }
 
 type projectsMsg []Project
@@ -196,6 +197,7 @@ const (
 	tabTunnels
 	tabLogs
 	tabWatch
+	tabAccounts
 	tabCount
 )
 
@@ -282,6 +284,16 @@ type AppModel struct {
 	pickerStage  string // "local" | "remote"
 	chosenLocal  string
 	chosenRemote string
+
+	// Picker de conta Claude Code — aparece ao criar sessão de projeto sem conta
+	accountPickerActive bool
+	accountPickerCursor int
+	accountPickerSave   bool // Enter também grava a conta no projeto (tecla s alterna)
+	pendingSessionName  string
+
+	// Aba Contas
+	selectedAccountRow int
+	pendingAccount     string // conta alvo do prompt de exclusão
 
 	// Logs
 	logs            []string
@@ -715,6 +727,16 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.selectedProjectRow = 0
 		}
 
+	case accountAddedMsg:
+		if msg.err != nil {
+			m.addLog(fmt.Sprintf("Erro ao cadastrar conta '%s': %v", msg.name, msg.err))
+		} else {
+			if cfg, err := config.NewStore().Load(); err == nil {
+				m.cfg = cfg
+			}
+			m.addLog(fmt.Sprintf("Conta '%s' cadastrada → %s. Login: unlarp account login %s", msg.name, msg.dir, msg.name))
+		}
+
 	case projectsGitMsg:
 		m.projects = msg.projects
 		// Mescla as informações Git ricas coletadas
@@ -828,6 +850,45 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+		// Picker de conta Claude Code (criação de sessão de projeto)
+		if m.accountPickerActive {
+			names := m.hostAccounts()
+			total := len(names) + 1 // opção 0 = "(sem conta — padrão)"
+			switch msg.String() {
+			case "esc":
+				m.accountPickerActive = false
+				return m, nil
+			case "up", "k":
+				m.accountPickerCursor = (m.accountPickerCursor - 1 + total) % total
+				return m, nil
+			case "down", "j":
+				m.accountPickerCursor = (m.accountPickerCursor + 1) % total
+				return m, nil
+			case "s":
+				m.accountPickerSave = !m.accountPickerSave
+				return m, nil
+			case "enter":
+				m.accountPickerActive = false
+				account := ""
+				if m.accountPickerCursor > 0 {
+					account = names[m.accountPickerCursor-1]
+				}
+				if m.accountPickerSave && account != "" {
+					if err := config.NewStore().SetProjectAccount(m.activeHost, m.pendingProject.Path, account); err != nil {
+						m.addLog("Erro ao salvar conta no projeto: " + err.Error())
+					} else if cfg, err := config.NewStore().Load(); err == nil {
+						m.cfg = cfg
+						m.addLog(fmt.Sprintf("Conta '%s' salva no projeto '%s'", account, m.pendingProject.Name))
+					}
+				}
+				return m, tea.Batch(
+					m.createProjectSessionCmd(m.pendingSessionName, m.pendingProject.Path, m.accountDirFor(account)),
+					m.checkProjectsCmd(),
+				)
+			}
+			return m, nil
+		}
+
 		// Se o prompt estiver ativo, redireciona todas as teclas para o input
 		if m.promptActive {
 			switch msg.String() {
@@ -909,6 +970,9 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						if item.Project.Path != "" {
 							connectArgs = append(connectArgs, "--cwd", item.Project.Path)
 						}
+						if dir := m.accountDirFor(item.Project.Account); dir != "" {
+							connectArgs = append(connectArgs, "--claude-config-dir", dir)
+						}
 						c := exec.Command(exe, connectArgs...)
 						return m, tea.ExecProcess(c, func(err error) tea.Msg {
 							return resumeTuiMsg{err: err}
@@ -939,6 +1003,16 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.textInput.Placeholder = ""
 				m.textInput.Blur()
 				return m, nil
+			}
+
+			// Cadastrar conta Claude Code (aba Contas)
+			if !m.sidebarFocus && m.activeTab == tabAccounts {
+				m.promptType = "account_add"
+				m.promptActive = true
+				m.textInput.SetValue("")
+				m.textInput.Placeholder = "nome [dir remoto] (ex: pessoal ou pessoal /root/.claude-accounts/pessoal)"
+				m.textInput.Focus()
+				return m, textinput.Blink
 			}
 
 			// Atalho para cadastrar um projeto (aba Projetos): abre o navegador
@@ -1030,6 +1104,7 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Atalho para abrir terminal interativo SSH (usando Tmux por padrão)
 			sessionName := "unlarp"
 			cwd := ""
+			accDir := ""
 			if !m.sidebarFocus {
 				if m.activeTab == tabDashboard && len(m.tmuxSessions) > 0 {
 					sessionName = m.tmuxSessions[m.selectedTmuxRow].Name
@@ -1044,6 +1119,7 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							sessionName = item.Session.Name
 							cwd = item.Project.Path
 						}
+						accDir = m.accountDirFor(item.Project.Account)
 					}
 				}
 			}
@@ -1056,6 +1132,9 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			connectArgs := []string{"connect", m.activeHost, "--tmux", "--tmux-session", sessionName}
 			if cwd != "" {
 				connectArgs = append(connectArgs, "--cwd", cwd)
+			}
+			if accDir != "" {
+				connectArgs = append(connectArgs, "--claude-config-dir", accDir)
 			}
 
 			c := exec.Command(exe, connectArgs...)
@@ -1428,6 +1507,15 @@ func (m *AppModel) renderFooter() string {
 					styles.KeyStyle.Render("Tab"),
 					styles.KeyStyle.Render("q"),
 				}
+			} else if m.activeTab == tabAccounts {
+				actions = "%s Navegar | %s Cadastrar Conta | %s Remover | %s Mudar Foco | %s Sair"
+				keys = []string{
+					styles.KeyStyle.Render("↑/↓/j/k"),
+					styles.KeyStyle.Render("a"),
+					styles.KeyStyle.Render("x"),
+					styles.KeyStyle.Render("Tab"),
+					styles.KeyStyle.Render("q"),
+				}
 			} else if m.activeTab == tabProjects {
 				actions = "%s Navegar | %s Cadastrar | %s Expandir/Conectar | %s Nova Sessão | %s Worktree | %s Remover/Kill | %s Sair"
 				keys = []string{
@@ -1493,6 +1581,11 @@ func (m *AppModel) handleMainPanelUp() {
 			m.logScrollOffset = 0
 		}
 		return
+	} else if m.activeTab == tabAccounts {
+		if n := len(m.hostAccounts()); n > 0 {
+			m.selectedAccountRow = (m.selectedAccountRow - 1 + n) % n
+		}
+		return
 	}
 
 	sess, ok := m.sessMgr.GetSession(m.activeHost)
@@ -1522,6 +1615,11 @@ func (m *AppModel) handleMainPanelDown() {
 		return
 	} else if m.activeTab == tabLogs {
 		m.logScrollOffset++
+		return
+	} else if m.activeTab == tabAccounts {
+		if n := len(m.hostAccounts()); n > 0 {
+			m.selectedAccountRow = (m.selectedAccountRow + 1) % n
+		}
 		return
 	}
 
@@ -1566,6 +1664,29 @@ func (m *AppModel) handlePromptSubmit() tea.Cmd {
 		return m.createSyncLiveCmd("s-"+generateRandomString(6), val)
 	case "new_tmux_session":
 		return m.createTmuxSessionCmd(val)
+	case "account_add":
+		parts := strings.Fields(val)
+		name := parts[0]
+		dir := ""
+		if len(parts) > 1 {
+			dir = parts[1]
+		}
+		return m.addAccountCmd(name, dir)
+	case "account_delete_confirm":
+		if !strings.HasPrefix(strings.ToLower(val), "s") {
+			return nil
+		}
+		store := config.NewStore()
+		if err := store.RemoveAccount(m.activeHost, m.pendingAccount); err != nil {
+			m.addLog("Erro ao remover conta: " + err.Error())
+			return nil
+		}
+		if cfg, err := store.Load(); err == nil {
+			m.cfg = cfg
+		}
+		m.selectedAccountRow = 0
+		m.addLog(fmt.Sprintf("Conta '%s' removida (diretório remoto mantido).", m.pendingAccount))
+		return nil
 	case "new_project_session":
 		suffix := strings.TrimSpace(val)
 		if suffix == "" {
@@ -1579,7 +1700,15 @@ func (m *AppModel) handlePromptSubmit() tea.Cmd {
 			sessionName = suffix
 		}
 		m.expandedProjects[m.pendingProject.Path] = true
-		return m.createProjectSessionCmd(sessionName, m.pendingProject.Path)
+		// Projeto sem conta e host com contas cadastradas → abre o picker antes de criar
+		if m.pendingProject.Account == "" && len(m.hostAccounts()) > 0 {
+			m.pendingSessionName = sessionName
+			m.accountPickerActive = true
+			m.accountPickerCursor = 0
+			m.accountPickerSave = false
+			return nil
+		}
+		return m.createProjectSessionCmd(sessionName, m.pendingProject.Path, m.accountDirFor(m.pendingProject.Account))
 	case "git_switch_branch":
 		return m.switchBranchCmd(m.pendingProject.Path, val)
 	case "worktree_add":
@@ -2123,6 +2252,20 @@ func (m *AppModel) handleSyncStarted(msg syncStartedMsg) {
 
 // handleDeleteSelection deleta o item que está selecionado na view ativa
 func (m *AppModel) handleDeleteSelection() tea.Cmd {
+	if m.activeTab == tabAccounts {
+		names := m.hostAccounts()
+		if len(names) == 0 || m.selectedAccountRow >= len(names) {
+			return nil
+		}
+		m.pendingAccount = names[m.selectedAccountRow]
+		m.promptType = "account_delete_confirm"
+		m.promptActive = true
+		m.textInput.SetValue("n")
+		m.textInput.Placeholder = "s/n"
+		m.textInput.Focus()
+		return textinput.Blink
+	}
+
 	if m.activeTab == tabProjects {
 		items := m.buildProjectTree()
 		if len(items) == 0 || m.selectedProjectRow >= len(items) {
@@ -2544,6 +2687,7 @@ func (m *AppModel) checkProjectsCmd() tea.Cmd {
 				Name:     p.Name,
 				Branch:   branches[p.RemotePath],
 				LocalDir: p.LocalDir,
+				Account:  p.Account,
 			})
 		}
 		return projectsGitMsg{projects: projects, gitInfos: gitInfos}
@@ -2870,8 +3014,34 @@ func (m *AppModel) createTmuxSessionCmd(name string) tea.Cmd {
 	}
 }
 
-// createProjectSessionCmd cria uma sessão tmux remota com o diretório de trabalho especificado
-func (m *AppModel) createProjectSessionCmd(name, path string) tea.Cmd {
+// hostAccounts retorna os nomes das contas Claude Code do host ativo, ordenados
+func (m *AppModel) hostAccounts() []string {
+	hostCfg, ok := m.cfg.Hosts[m.activeHost]
+	if !ok {
+		return nil
+	}
+	names := make([]string, 0, len(hostCfg.Accounts))
+	for n := range hostCfg.Accounts {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// accountDirFor resolve o CLAUDE_CONFIG_DIR de uma conta no host ativo ("" = sem injeção)
+func (m *AppModel) accountDirFor(account string) string {
+	hostCfg, ok := m.cfg.Hosts[m.activeHost]
+	if !ok {
+		return ""
+	}
+	dir, _ := hostCfg.AccountDir(account)
+	return dir
+}
+
+// createProjectSessionCmd cria uma sessão tmux remota com o diretório de trabalho
+// especificado; accountDir != "" injeta
+// CLAUDE_CONFIG_DIR via `tmux -e` (export antes do tmux não propaga com server já ativo)
+func (m *AppModel) createProjectSessionCmd(name, path, accountDir string) tea.Cmd {
 	return func() tea.Msg {
 		hostCfg, ok := m.cfg.Hosts[m.activeHost]
 		if !ok {
@@ -2884,7 +3054,13 @@ func (m *AppModel) createProjectSessionCmd(name, path string) tea.Cmd {
 		}
 
 		m.addLog(fmt.Sprintf("Criando sessão Tmux '%s' no diretório '%s'...", name, path))
-		cmdStr := fmt.Sprintf("export LANG=C.UTF-8; export LC_ALL=C.UTF-8; tmux -u new-session -d -s %s -c %s", shellQuote(name), shellQuote(path))
+		envFlag := ""
+		if accountDir != "" {
+			// mkdir -p protege contra volume resetado; -e fixa a env na sessão
+			_, _, _ = client.RunCommand("mkdir -p " + shellQuote(accountDir))
+			envFlag = " -e " + shellQuote("CLAUDE_CONFIG_DIR="+accountDir)
+		}
+		cmdStr := fmt.Sprintf("export LANG=C.UTF-8; export LC_ALL=C.UTF-8; tmux -u new-session -d -s %s -c %s%s", shellQuote(name), shellQuote(path), envFlag)
 		_, _, _ = client.RunCommand(cmdStr)
 		return m.checkTmuxCmd()()
 	}
@@ -2982,7 +3158,8 @@ func (m *AppModel) worktreeAddCmd(proj Project, branch string) tea.Cmd {
 		} else {
 			m.addLog("Worktree criada.")
 		}
-		return m.createProjectSessionCmd(sessionName, wtPath)()
+		// Worktree herda a conta do projeto (sem picker)
+		return m.createProjectSessionCmd(sessionName, wtPath, m.accountDirFor(proj.Account))()
 	}
 }
 

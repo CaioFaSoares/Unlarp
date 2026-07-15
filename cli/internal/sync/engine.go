@@ -14,6 +14,7 @@ import (
 	"github.com/pkg/sftp"
 
 	"github.com/CaioFaSoares/unlarp/internal/fsutil"
+	internalgit "github.com/CaioFaSoares/unlarp/internal/git"
 	internalssh "github.com/CaioFaSoares/unlarp/internal/ssh"
 )
 
@@ -156,6 +157,29 @@ func NewEngine(id string, localDir, remoteDir, hostName string, globalIgnores []
 
 	e.progress.Percent = 100
 	e.progress.Case = 1
+
+	// Bootstrap best-effort: clona o histórico git de localDir pro remoto via
+	// bundle se o remoto ainda não for um repo git. Sem isso, `unlarp worktree
+	// add` e o isolamento nativo de worktree do Claude Code falham no remoto
+	// com "not in a git repository". Falha aqui nunca derruba o sync — nem
+	// todo projeto sincronizado é um repo git. StateWarning é o mesmo canal já
+	// exibido na aba Logs da TUI, no CLI (ui.Warn) e no daemon (logf) — reusa
+	// pra avisar o usuário na primeira vez (ou se falhar) sem UI nova.
+	appendWarning := func(msg string) {
+		if e.StateWarning == "" {
+			e.StateWarning = msg
+			return
+		}
+		e.StateWarning += " | " + msg
+	}
+	bootstrapped, bootstrapErr := internalgit.EnsureRemoteRepo(sshClient, sftpClient, absLocal, remoteDir)
+	if bootstrapErr != nil {
+		e.audit("bootstrap git remoto falhou (seguindo sem git no remoto): %v", bootstrapErr)
+		appendWarning(fmt.Sprintf("bootstrap git remoto falhou (worktree/isolamento vão falhar no remoto): %v", bootstrapErr))
+	} else if bootstrapped {
+		e.audit("bootstrap git remoto: repo criado em %s a partir do histórico local", remoteDir)
+		appendWarning(fmt.Sprintf("repo git inicializado no remoto (%s) a partir do histórico local — worktrees agora funcionam lá", remoteDir))
+	}
 
 	return e, nil
 }

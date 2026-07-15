@@ -11,7 +11,7 @@ import (
 
 // renderMainPanel desenha a barra de abas e o conteúdo da aba selecionada
 func (m *AppModel) renderMainPanel(width, height int) string {
-	tabs := []string{"Dashboard", "Projetos", "Syncs", "Túneis", "Logs", "Watch"}
+	tabs := []string{"Dashboard", "Projetos", "Syncs", "Túneis", "Logs", "Watch", "Contas"}
 	var renderedTabs []string
 
 	for i, t := range tabs {
@@ -43,6 +43,35 @@ func (m *AppModel) renderMainPanel(width, height int) string {
 		return lipgloss.JoinVertical(lipgloss.Left, tabRow, pickerBox)
 	}
 
+	if m.accountPickerActive {
+		var sb strings.Builder
+		sb.WriteString(styles.HostActiveStyle.Render(fmt.Sprintf("Conta Claude Code para a sessão '%s'", m.pendingSessionName)))
+		sb.WriteString("\n\n")
+		options := append([]string{"(sem conta — padrão do remoto)"}, m.hostAccounts()...)
+		for i, opt := range options {
+			line := "  " + opt
+			if i == m.accountPickerCursor {
+				line = styles.HostSelectedStyle.Render("> " + opt)
+			}
+			sb.WriteString(line + "\n")
+		}
+		saveMark := "[ ]"
+		if m.accountPickerSave {
+			saveMark = "[x]"
+		}
+		sb.WriteString(fmt.Sprintf("\n%s salvar como conta do projeto (%s alterna)\n", saveMark, styles.KeyStyle.Render("s")))
+		sb.WriteString(styles.KeyStyle.Render("↑/↓") + " navegar  " + styles.KeyStyle.Render("Enter") + " criar sessão  " + styles.KeyStyle.Render("Esc") + " cancelar")
+
+		pickerBox := lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(styles.ColorSecondary).
+			Padding(1, 2).
+			Width(width - 6).
+			Render(sb.String())
+
+		return lipgloss.JoinVertical(lipgloss.Left, tabRow, pickerBox)
+	}
+
 	if m.promptActive {
 		var promptTitle string
 		switch m.promptType {
@@ -62,6 +91,10 @@ func (m *AppModel) renderMainPanel(width, height int) string {
 			promptTitle = fmt.Sprintf("Trocar branch do projeto '%s'", m.pendingProject.Name)
 		case "worktree_add":
 			promptTitle = fmt.Sprintf("Nova worktree em '%s' — nome da branch", m.pendingProject.Name)
+		case "account_add":
+			promptTitle = "Cadastrar Conta Claude Code — nome [dir remoto]"
+		case "account_delete_confirm":
+			promptTitle = fmt.Sprintf("Remover conta '%s' do config? O diretório remoto é mantido. (s/n)", m.pendingAccount)
 		}
 
 		promptBox := lipgloss.NewStyle().
@@ -93,6 +126,8 @@ func (m *AppModel) renderMainPanel(width, height int) string {
 		content = m.renderLogs(width, contentHeight)
 	case tabWatch:
 		content = m.renderWatch(width, contentHeight)
+	case tabAccounts:
+		content = m.renderAccounts(width, contentHeight)
 	default:
 		content = "Aba desconhecida"
 	}
