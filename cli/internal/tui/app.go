@@ -289,6 +289,7 @@ type AppModel struct {
 	accountPickerActive bool
 	accountPickerCursor int
 	accountPickerSave   bool // Enter também grava a conta no projeto (tecla s alterna)
+	accountPickerEdit   bool // modo edição (tecla e na aba Projetos): só grava, não cria sessão
 	pendingSessionName  string
 
 	// Aba Contas
@@ -857,6 +858,7 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			switch msg.String() {
 			case "esc":
 				m.accountPickerActive = false
+				m.accountPickerEdit = false
 				return m, nil
 			case "up", "k":
 				m.accountPickerCursor = (m.accountPickerCursor - 1 + total) % total
@@ -865,13 +867,32 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.accountPickerCursor = (m.accountPickerCursor + 1) % total
 				return m, nil
 			case "s":
-				m.accountPickerSave = !m.accountPickerSave
+				if !m.accountPickerEdit {
+					m.accountPickerSave = !m.accountPickerSave
+				}
 				return m, nil
 			case "enter":
 				m.accountPickerActive = false
 				account := ""
 				if m.accountPickerCursor > 0 {
 					account = names[m.accountPickerCursor-1]
+				}
+				if m.accountPickerEdit {
+					m.accountPickerEdit = false
+					store := config.NewStore()
+					if err := store.SetProjectAccount(m.activeHost, m.pendingProject.Path, account); err != nil {
+						m.addLog("Erro ao definir conta do projeto: " + err.Error())
+						return m, nil
+					}
+					if cfg, err := store.Load(); err == nil {
+						m.cfg = cfg
+					}
+					if account == "" {
+						m.addLog(fmt.Sprintf("Projeto '%s' sem conta (usa o ~/.claude padrão). Sessões existentes não mudam.", m.pendingProject.Name))
+					} else {
+						m.addLog(fmt.Sprintf("Projeto '%s' agora usa a conta '%s'. Vale para sessões novas; as existentes não mudam.", m.pendingProject.Name, account))
+					}
+					return m, m.checkProjectsCmd()
 				}
 				if m.accountPickerSave && account != "" {
 					if err := config.NewStore().SetProjectAccount(m.activeHost, m.pendingProject.Path, account); err != nil {
@@ -1179,6 +1200,31 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.textInput.Placeholder = "branch de destino (ex: main, feature/x)"
 					m.textInput.Focus()
 					return m, textinput.Blink
+				}
+			}
+
+		case "e":
+			// Editar a conta Claude Code do projeto selecionado (aba Projetos)
+			if !m.sidebarFocus && m.activeTab == tabProjects {
+				items := m.buildProjectTree()
+				if len(items) > 0 && m.selectedProjectRow < len(items) {
+					names := m.hostAccounts()
+					if len(names) == 0 {
+						m.addLog("Nenhuma conta cadastrada. Cadastre na aba Contas (tecla a) ou com: unlarp account add <nome>")
+						return m, nil
+					}
+					m.pendingProject = items[m.selectedProjectRow].Project
+					m.accountPickerActive = true
+					m.accountPickerEdit = true
+					// cursor começa na conta atual do projeto (0 = sem conta)
+					m.accountPickerCursor = 0
+					for i, n := range names {
+						if n == m.pendingProject.Account {
+							m.accountPickerCursor = i + 1
+							break
+						}
+					}
+					return m, nil
 				}
 			}
 
@@ -1517,13 +1563,14 @@ func (m *AppModel) renderFooter() string {
 					styles.KeyStyle.Render("q"),
 				}
 			} else if m.activeTab == tabProjects {
-				actions = "%s Navegar | %s Cadastrar | %s Expandir/Conectar | %s Nova Sessão | %s Worktree | %s Remover/Kill | %s Sair"
+				actions = "%s Navegar | %s Cadastrar | %s Expandir/Conectar | %s Nova Sessão | %s Worktree | %s Conta | %s Remover/Kill | %s Sair"
 				keys = []string{
 					styles.KeyStyle.Render("↑/↓/j/k"),
 					styles.KeyStyle.Render("a"),
 					styles.KeyStyle.Render("Enter/c"),
 					styles.KeyStyle.Render("n"),
 					styles.KeyStyle.Render("w"),
+					styles.KeyStyle.Render("e"),
 					styles.KeyStyle.Render("x"),
 					styles.KeyStyle.Render("q"),
 				}

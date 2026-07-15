@@ -45,7 +45,11 @@ func (m *AppModel) renderMainPanel(width, height int) string {
 
 	if m.accountPickerActive {
 		var sb strings.Builder
-		sb.WriteString(styles.HostActiveStyle.Render(fmt.Sprintf("Conta Claude Code para a sessão '%s'", m.pendingSessionName)))
+		title := fmt.Sprintf("Conta Claude Code para a sessão '%s'", m.pendingSessionName)
+		if m.accountPickerEdit {
+			title = fmt.Sprintf("Conta Claude Code do projeto '%s'", m.pendingProject.Name)
+		}
+		sb.WriteString(styles.HostActiveStyle.Render(title))
 		sb.WriteString("\n\n")
 		options := append([]string{"(sem conta — padrão do remoto)"}, m.hostAccounts()...)
 		for i, opt := range options {
@@ -55,12 +59,16 @@ func (m *AppModel) renderMainPanel(width, height int) string {
 			}
 			sb.WriteString(line + "\n")
 		}
-		saveMark := "[ ]"
-		if m.accountPickerSave {
-			saveMark = "[x]"
+		if m.accountPickerEdit {
+			sb.WriteString("\n" + styles.KeyStyle.Render("↑/↓") + " navegar  " + styles.KeyStyle.Render("Enter") + " salvar  " + styles.KeyStyle.Render("Esc") + " cancelar")
+		} else {
+			saveMark := "[ ]"
+			if m.accountPickerSave {
+				saveMark = "[x]"
+			}
+			sb.WriteString(fmt.Sprintf("\n%s salvar como conta do projeto (%s alterna)\n", saveMark, styles.KeyStyle.Render("s")))
+			sb.WriteString(styles.KeyStyle.Render("↑/↓") + " navegar  " + styles.KeyStyle.Render("Enter") + " criar sessão  " + styles.KeyStyle.Render("Esc") + " cancelar")
 		}
-		sb.WriteString(fmt.Sprintf("\n%s salvar como conta do projeto (%s alterna)\n", saveMark, styles.KeyStyle.Render("s")))
-		sb.WriteString(styles.KeyStyle.Render("↑/↓") + " navegar  " + styles.KeyStyle.Render("Enter") + " criar sessão  " + styles.KeyStyle.Render("Esc") + " cancelar")
 
 		pickerBox := lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
