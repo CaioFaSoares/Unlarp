@@ -158,10 +158,11 @@ func NewEngine(id string, localDir, remoteDir, hostName string, globalIgnores []
 	e.progress.Percent = 100
 	e.progress.Case = 1
 
-	// Bootstrap best-effort: clona o histórico git de localDir pro remoto via
-	// bundle se o remoto ainda não for um repo git. Sem isso, `unlarp worktree
-	// add` e o isolamento nativo de worktree do Claude Code falham no remoto
-	// com "not in a git repository". Falha aqui nunca derruba o sync — nem
+	// Bootstrap best-effort: garante que remoteDir tenha um repo git funcional
+	// e em dia, clonando/atualizando o histórico de localDir via bundle. Sem
+	// isso, `unlarp worktree add` e o isolamento nativo de worktree do Claude
+	// Code falham no remoto com "not in a git repository" — ou partem de um
+	// HEAD remoto defasado/quebrado. Falha aqui nunca derruba o sync — nem
 	// todo projeto sincronizado é um repo git. StateWarning é o mesmo canal já
 	// exibido na aba Logs da TUI, no CLI (ui.Warn) e no daemon (logf) — reusa
 	// pra avisar o usuário na primeira vez (ou se falhar) sem UI nova.
@@ -172,13 +173,27 @@ func NewEngine(id string, localDir, remoteDir, hostName string, globalIgnores []
 		}
 		e.StateWarning += " | " + msg
 	}
-	bootstrapped, bootstrapErr := internalgit.EnsureRemoteRepo(sshClient, sftpClient, absLocal, remoteDir)
-	if bootstrapErr != nil {
+	action, bootstrapErr := internalgit.EnsureRemoteRepo(sshClient, sftpClient, absLocal, remoteDir)
+	switch {
+	case bootstrapErr != nil:
 		e.audit("bootstrap git remoto falhou (seguindo sem git no remoto): %v", bootstrapErr)
 		appendWarning(fmt.Sprintf("bootstrap git remoto falhou (worktree/isolamento vão falhar no remoto): %v", bootstrapErr))
-	} else if bootstrapped {
+	case action == internalgit.BootstrapCreated:
 		e.audit("bootstrap git remoto: repo criado em %s a partir do histórico local", remoteDir)
 		appendWarning(fmt.Sprintf("repo git inicializado no remoto (%s) a partir do histórico local — worktrees agora funcionam lá", remoteDir))
+	case action == internalgit.BootstrapHealed:
+		e.audit("bootstrap git remoto: repo em %s estava vazio/quebrado, recuperado do histórico local", remoteDir)
+		appendWarning(fmt.Sprintf("repo git remoto (%s) estava vazio/quebrado — recuperado do histórico local", remoteDir))
+	case action == internalgit.BootstrapRefreshed:
+		// Evento esperado a cada sessão (remoto avança pro HEAD local) — só
+		// audit, sem poluir o StateWarning exibido ao usuário.
+		e.audit("bootstrap git remoto: repo em %s atualizado pro HEAD local", remoteDir)
+	case action == internalgit.BootstrapDiverged:
+		// ponytail: reconciliação de divergência remota fica adiada — por ora
+		// só avisamos e não tocamos no remoto, pra não perder commits que só
+		// existam lá.
+		e.audit("bootstrap git remoto: repo em %s divergiu do local, refresh pulado", remoteDir)
+		appendWarning(fmt.Sprintf("git remoto (%s) divergiu do local; refresh pulado", remoteDir))
 	}
 
 	return e, nil

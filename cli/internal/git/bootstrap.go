@@ -16,54 +16,100 @@ import (
 // o histórico git via SFTP durante o bootstrap (removido ao final).
 const remoteBootstrapBundle = ".unlarp-bootstrap.bundle"
 
-// EnsureRemoteRepo garante que remoteDir tenha um repositório git funcional,
-// clonando o histórico de localDir via `git bundle` quando o remoto ainda não
-// é um repo git. Necessário porque a engine de sync propositalmente NÃO
-// sincroniza o diretório .git bruto (ver IgnoreMatcher.Matches): refs e index
-// não são seguros para sync de arquivo genérico, então cada lado precisa do
-// seu próprio .git independente, só sincronizamos os metadados leves de
+// BootstrapAction descreve o que EnsureRemoteRepo de fato fez no remoto.
+type BootstrapAction string
+
+const (
+	// BootstrapNone: remoto já é um repo git saudável e em dia — no-op.
+	BootstrapNone BootstrapAction = ""
+	// BootstrapCreated: remoto ainda não era repo git; criado agora do zero.
+	BootstrapCreated BootstrapAction = "created"
+	// BootstrapHealed: remoto já tinha .git, mas sem HEAD (vazio ou quebrado
+	// por um bootstrap anterior que falhou entre o init e o fetch).
+	BootstrapHealed BootstrapAction = "healed"
+	// BootstrapRefreshed: remoto saudável mas atrás do local; avançado pro
+	// HEAD local (só quando o HEAD remoto é ancestral do local — ver
+	// isAncestorLocal).
+	BootstrapRefreshed BootstrapAction = "refreshed"
+	// BootstrapDiverged: remoto tem commit(s) que o local não tem. Não
+	// tocamos no remoto pra não perder histórico — só sinalizamos.
+	// ponytail: reconciliação de divergência remota fica adiada; hoje só
+	// avisamos e deixamos o remoto como está.
+	BootstrapDiverged BootstrapAction = "diverged"
+)
+
+// EnsureRemoteRepo garante que remoteDir tenha um repositório git funcional e
+// em dia, clonando/atualizando o histórico de localDir via `git bundle`.
+// Necessário porque a engine de sync propositalmente NÃO sincroniza o
+// diretório .git bruto (ver IgnoreMatcher.Matches): refs e index não são
+// seguros para sync de arquivo genérico, então cada lado precisa do seu
+// próprio .git independente, só sincronizamos os metadados leves de
 // .git/worktrees/* com rewrite de gitdir (ver shouldRewriteGitPath).
 //
 // Um bundle resolve isso sem exigir que o remoto tenha rede/credenciais para
 // o origin: é um arquivo único, completo, transferido pela mesma conexão
 // SSH/SFTP que o unlarp já usa.
 //
-// Retorna bootstrapped=true quando de fato criou o repo no remoto agora (para
-// o caller poder avisar o usuário na primeira vez) — false em todo no-op.
-// No-op (sem erro) se localDir não for um repo git, ou se remoteDir já for.
-func EnsureRemoteRepo(sshClient *internalssh.Client, sftpClient *sftp.Client, localDir, remoteDir string) (bootstrapped bool, err error) {
+// O guard de "já é repo" antigo confiava em `git rev-parse
+// --is-inside-work-tree`, que é true mesmo pra um repo vazio (sem HEAD) — se
+// um bootstrap anterior falhasse entre o `git init` e o `fetch` (rede, bundle
+// truncado, disco), o remoto ficava com um .git vazio e o guard virava no-op
+// pra sempre, deixando o projeto "sem histórico" indefinidamente. Por isso o
+// guard abaixo também considera CommitHash (vazio = sem HEAD = precisa
+// curar) e compara o HEAD remoto com o local (atrás = atualiza; divergente =
+// não mexe).
+//
+// No-op (sem erro, BootstrapNone) se localDir não for um repo git, ou se
+// remoteDir já for um repo saudável e no mesmo commit do local.
+func EnsureRemoteRepo(sshClient *internalssh.Client, sftpClient *sftp.Client, localDir, remoteDir string) (action BootstrapAction, err error) {
 	local := LocalInfo(localDir)
 	if !local.IsGitRepo {
-		return false, nil
+		return BootstrapNone, nil
 	}
 
 	remote, err := GetRemoteGitInfo(sshClient, remoteDir)
 	if err != nil {
-		return false, fmt.Errorf("checando git remoto: %w", err)
+		return BootstrapNone, fmt.Errorf("checando git remoto: %w", err)
 	}
-	if remote.IsGitRepo {
-		return false, nil
+
+	switch {
+	case !remote.IsGitRepo:
+		action = BootstrapCreated
+	case remote.CommitHash == "":
+		// repo existe mas nunca ganhou HEAD — bootstrap anterior deve ter
+		// falhado no meio do caminho.
+		action = BootstrapHealed
+	case remote.CommitHash != local.CommitHash:
+		if isAncestorLocal(localDir, remote.CommitHash) {
+			action = BootstrapRefreshed
+		} else {
+			return BootstrapDiverged, nil
+		}
+	default:
+		return BootstrapNone, nil
 	}
 
 	tmpBundle, err := os.CreateTemp("", "unlarp-bootstrap-*.bundle")
 	if err != nil {
-		return false, fmt.Errorf("criando bundle temporário: %w", err)
+		return BootstrapNone, fmt.Errorf("criando bundle temporário: %w", err)
 	}
 	tmpBundle.Close()
 	defer os.Remove(tmpBundle.Name())
 
 	if out, err := exec.Command("git", "-C", localDir, "bundle", "create", tmpBundle.Name(), "--all").CombinedOutput(); err != nil {
-		return false, fmt.Errorf("git bundle create falhou: %s: %w", strings.TrimSpace(string(out)), err)
+		return BootstrapNone, fmt.Errorf("git bundle create falhou: %s: %w", strings.TrimSpace(string(out)), err)
 	}
 
 	remoteBundlePath := strings.TrimSuffix(remoteDir, "/") + "/" + remoteBootstrapBundle
 	if err := uploadFile(sftpClient, tmpBundle.Name(), remoteBundlePath); err != nil {
-		return false, fmt.Errorf("enviando bundle pro remoto: %w", err)
+		return BootstrapNone, fmt.Errorf("enviando bundle pro remoto: %w", err)
 	}
 
 	// Passos críticos numa subshell só pra isolar o exit code deles do
 	// cleanup best-effort abaixo — "A && B ; C" reporta o status de C, então
 	// sem isso um `rm -f` bem-sucedido mascararia falha no init/fetch/reset.
+	// `git init` é idempotente, então reusar o mesmo bloco pra create/heal/
+	// refresh é seguro — inclusive quando o remoto já tinha .git.
 	critical := fmt.Sprintf("git -C %s init -q", shellQuote(remoteDir))
 	critical += fmt.Sprintf(" && git -C %s fetch -q %s '+refs/heads/*:refs/heads/*'", shellQuote(remoteDir), shellQuote(remoteBundlePath))
 	if local.Branch != "" {
@@ -84,10 +130,21 @@ func EnsureRemoteRepo(sshClient *internalssh.Client, sftpClient *sftp.Client, lo
 	cmd := fmt.Sprintf("(%s); st=$?%s; exit $st", critical, cleanup)
 
 	if _, stderr, err := sshClient.RunCommand(cmd); err != nil {
-		return false, fmt.Errorf("bootstrap git remoto falhou: %s: %w", strings.TrimSpace(stderr), err)
+		return BootstrapNone, fmt.Errorf("bootstrap git remoto falhou: %s: %w", strings.TrimSpace(stderr), err)
 	}
 
-	return true, nil
+	return action, nil
+}
+
+// isAncestorLocal diz se commit é ancestral (ou igual) do HEAD local — só
+// nesse caso é seguro avançar o remoto sem risco de perder commits que só
+// existam lá. Se o objeto não existir localmente (histórico divergente) o
+// comando falha e tratamos como não-ancestral.
+func isAncestorLocal(localDir, commit string) bool {
+	if commit == "" {
+		return false
+	}
+	return exec.Command("git", "-C", localDir, "merge-base", "--is-ancestor", commit, "HEAD").Run() == nil
 }
 
 // uploadFile copia um arquivo local para o remoto via SFTP (sem rewrite de
