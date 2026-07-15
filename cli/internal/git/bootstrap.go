@@ -73,7 +73,11 @@ func EnsureRemoteRepo(sshClient *internalssh.Client, sftpClient *sftp.Client, lo
 
 	cleanup := ""
 	if local.RemoteURL != "" {
-		cleanup += fmt.Sprintf(" ; git -C %s remote add origin %s >/dev/null 2>&1", shellQuote(remoteDir), shellQuote(local.RemoteURL))
+		remoteName := local.RemoteName
+		if remoteName == "" {
+			remoteName = "origin"
+		}
+		cleanup += fmt.Sprintf(" ; git -C %s remote add %s %s >/dev/null 2>&1", shellQuote(remoteDir), shellQuote(remoteName), shellQuote(local.RemoteURL))
 	}
 	cleanup += fmt.Sprintf(" ; rm -f %s", shellQuote(remoteBundlePath))
 

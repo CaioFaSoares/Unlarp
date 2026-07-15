@@ -18,6 +18,7 @@ type RemoteGitInfo struct {
 	CommitMessage string
 	CommitTime    time.Time
 	IsDirty       bool
+	RemoteName    string
 	RemoteURL     string
 	AheadBehind   AheadBehind
 }
@@ -41,8 +42,10 @@ func GetRemoteGitInfo(client *internalssh.Client, projectPath string) (RemoteGit
 			`echo "MSG|$(git log -1 --format=%%s 2>/dev/null)" && `+
 			`echo "TIME|$(git log -1 --format=%%aI 2>/dev/null)" && `+
 			`echo "DIRTY|$(git status --porcelain 2>/dev/null | head -1)" && `+
-			`echo "URL|$(git remote get-url origin 2>/dev/null)" && `+
-			`echo "AB|$(git rev-list --left-right --count HEAD...origin/$(git rev-parse --abbrev-ref HEAD) 2>/dev/null)" || `+
+			`REMOTE=$(git remote | grep -x "origin" || git remote | head -1) && `+
+			`echo "REMOTE|$REMOTE" && `+
+			`echo "URL|$(git remote get-url $REMOTE 2>/dev/null)" && `+
+			`echo "AB|$(git rev-list --left-right --count HEAD...$REMOTE/$(git rev-parse --abbrev-ref HEAD) 2>/dev/null)" || `+
 			`echo "REPO|false"`,
 		shellQuote(projectPath),
 	)
@@ -79,6 +82,8 @@ func GetRemoteGitInfo(client *internalssh.Client, projectPath string) (RemoteGit
 			}
 		case "DIRTY":
 			info.IsDirty = val != ""
+		case "REMOTE":
+			info.RemoteName = val
 		case "URL":
 			info.RemoteURL = val
 		case "AB":
@@ -114,8 +119,23 @@ func LocalInfo(dir string) RemoteGitInfo {
 		info.CommitTime = t
 	}
 	info.IsDirty = run("status", "--porcelain") != ""
-	info.RemoteURL = run("remote", "get-url", "origin")
-	if ab := strings.Fields(run("rev-list", "--left-right", "--count", "HEAD...origin/"+info.Branch)); len(ab) == 2 {
+	
+	remote := "origin"
+	if remotes := strings.Split(run("remote"), "\n"); len(remotes) > 0 && remotes[0] != "" {
+		hasOrigin := false
+		for _, r := range remotes {
+			if r == "origin" {
+				hasOrigin = true
+				break
+			}
+		}
+		if !hasOrigin {
+			remote = remotes[0]
+		}
+	}
+	info.RemoteName = remote
+	info.RemoteURL = run("remote", "get-url", remote)
+	if ab := strings.Fields(run("rev-list", "--left-right", "--count", "HEAD..."+remote+"/"+info.Branch)); len(ab) == 2 {
 		info.AheadBehind.Ahead, _ = strconv.Atoi(ab[0])
 		info.AheadBehind.Behind, _ = strconv.Atoi(ab[1])
 	}

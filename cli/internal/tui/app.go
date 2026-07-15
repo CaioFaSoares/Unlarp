@@ -2663,8 +2663,10 @@ func (m *AppModel) checkProjectsCmd() tea.Cmd {
 						`echo "MSG|$(git log -1 --format=%%%%s 2>/dev/null)" && `+
 						`echo "TIME|$(git log -1 --format=%%%%aI 2>/dev/null)" && `+
 						`echo "DIRTY|$(git status --porcelain 2>/dev/null | head -1)" && `+
-						`echo "URL|$(git remote get-url origin 2>/dev/null)" && `+
-						`echo "AB|$(git rev-list --left-right --count HEAD...origin/$(git rev-parse --abbrev-ref HEAD) 2>/dev/null)" || `+
+						`REMOTE=$(git remote | grep -x "origin" || git remote | head -1) && `+
+						`echo "REMOTE|$REMOTE" && `+
+						`echo "URL|$(git remote get-url $REMOTE 2>/dev/null)" && `+
+						`echo "AB|$(git rev-list --left-right --count HEAD...$REMOTE/$(git rev-parse --abbrev-ref HEAD) 2>/dev/null)" || `+
 						`echo "REPO|false"; `+
 						`done`,
 					strings.TrimSpace(paths.String()),
@@ -2710,6 +2712,8 @@ func (m *AppModel) checkProjectsCmd() tea.Cmd {
 							}
 						case "DIRTY":
 							currentInfo.IsDirty = val != ""
+						case "REMOTE":
+							currentInfo.RemoteName = val
 						case "URL":
 							currentInfo.RemoteURL = val
 						case "AB":
