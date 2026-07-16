@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/pkg/sftp"
 
@@ -67,9 +68,13 @@ func EnsureRemoteRepo(sshClient *internalssh.Client, sftpClient *sftp.Client, lo
 		return BootstrapNone, nil
 	}
 
-	remote, err := GetRemoteGitInfo(sshClient, remoteDir)
-	if err != nil {
-		return BootstrapNone, fmt.Errorf("checando git remoto: %w", err)
+	var remote RemoteGitInfo
+	if timeoutErr := withTimeout(30*time.Second, func() error {
+		var infoErr error
+		remote, infoErr = GetRemoteGitInfo(sshClient, remoteDir)
+		return infoErr
+	}); timeoutErr != nil {
+		return BootstrapNone, fmt.Errorf("checando git remoto: %w", timeoutErr)
 	}
 
 	switch {
@@ -101,7 +106,12 @@ func EnsureRemoteRepo(sshClient *internalssh.Client, sftpClient *sftp.Client, lo
 	}
 
 	remoteBundlePath := strings.TrimSuffix(remoteDir, "/") + "/" + remoteBootstrapBundle
-	if err := uploadFile(sftpClient, tmpBundle.Name(), remoteBundlePath); err != nil {
+	// Timeout generoso — bundle de histórico completo pode passar de 100MB em
+	// repos grandes (ex: assets versionados) e SFTP sem pipelining é lento em
+	// links ruins; 10min cobre isso sem travar pra sempre numa conexão morta.
+	if err := withTimeout(10*time.Minute, func() error {
+		return uploadFile(sftpClient, tmpBundle.Name(), remoteBundlePath)
+	}); err != nil {
 		return BootstrapNone, fmt.Errorf("enviando bundle pro remoto: %w", err)
 	}
 
@@ -114,7 +124,15 @@ func EnsureRemoteRepo(sshClient *internalssh.Client, sftpClient *sftp.Client, lo
 	// existe (ex: antes do primeiro file-sync).
 	critical := fmt.Sprintf("mkdir -p %s", shellQuote(remoteDir))
 	critical += fmt.Sprintf(" && git -C %s init -q", shellQuote(remoteDir))
-	critical += fmt.Sprintf(" && git -C %s fetch -q %s '+refs/heads/*:refs/heads/*'", shellQuote(remoteDir), shellQuote(remoteBundlePath))
+	// --update-head-ok: sem isso, git recusa fetch pra dentro do branch
+	// atualmente checked out num repo não-bare (erro "refusing to fetch
+	// into branch ... checked out") — que é sempre o caso aqui a partir do
+	// segundo bootstrap bem-sucedido em diante, já que o passo de
+	// symbolic-ref abaixo deixa HEAD remoto exatamente na ref que o fetch
+	// seguinte precisa atualizar. Seguro porque o reset --mixed abaixo
+	// reconcilia o index, e a árvore de arquivos é gerenciada pelo sync
+	// SFTP separado, não por checkout git.
+	critical += fmt.Sprintf(" && git -C %s fetch -q --update-head-ok %s '+refs/heads/*:refs/heads/*'", shellQuote(remoteDir), shellQuote(remoteBundlePath))
 	if local.Branch != "" {
 		critical += fmt.Sprintf(" && git -C %s symbolic-ref HEAD %s", shellQuote(remoteDir), shellQuote("refs/heads/"+local.Branch))
 		critical += fmt.Sprintf(" && git -C %s reset --mixed -q", shellQuote(remoteDir))
@@ -132,11 +150,34 @@ func EnsureRemoteRepo(sshClient *internalssh.Client, sftpClient *sftp.Client, lo
 
 	cmd := fmt.Sprintf("(%s); st=$?%s; exit $st", critical, cleanup)
 
-	if _, stderr, err := sshClient.RunCommand(cmd); err != nil {
-		return BootstrapNone, fmt.Errorf("bootstrap git remoto falhou: %s: %w", strings.TrimSpace(stderr), err)
+	var stderr string
+	if timeoutErr := withTimeout(60*time.Second, func() error {
+		var cmdErr error
+		_, stderr, cmdErr = sshClient.RunCommand(cmd)
+		return cmdErr
+	}); timeoutErr != nil {
+		return BootstrapNone, fmt.Errorf("bootstrap git remoto falhou: %s: %w", strings.TrimSpace(stderr), timeoutErr)
 	}
 
 	return action, nil
+}
+
+// withTimeout roda fn numa goroutine e retorna erro de timeout se ela não
+// terminar em d. ponytail: RunCommand/SFTP não têm deadline nativo — numa
+// conexão SSH morta, uma leitura/escrita trava pra sempre sem isso (era o
+// "terminal congelou" observado no comando `unlarp git heal`). A goroutine
+// perdida no caso de timeout é aceitável aqui: best-effort, raro, e o
+// processo segue vivo em vez de travado. Se isso passar a doer, a correção
+// de fundo é dar contexto/deadline ao *internalssh.Client em si.
+func withTimeout(d time.Duration, fn func() error) error {
+	done := make(chan error, 1)
+	go func() { done <- fn() }()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(d):
+		return fmt.Errorf("timeout após %s — conexão remota pode estar lenta ou morta", d)
+	}
 }
 
 // HealProject é um projeto candidato a bootstrap: nome pra relatório,
@@ -160,11 +201,19 @@ type HealResult struct {
 // sftpClient do host para todos, já que o bootstrap não depende de estado
 // entre projetos. Projetos sem LocalDir são pulados (nada pra fazer bundle
 // a partir de) e não geram entrada no resultado.
-func HealAllProjects(sshClient *internalssh.Client, sftpClient *sftp.Client, projects []HealProject) []HealResult {
+//
+// onStart, se não nil, é chamado com o nome do projeto antes de processá-lo —
+// primeiro bootstrap de um repo grande pode levar minutos (envia o histórico
+// inteiro via bundle), então sem isso o caller fica sem qualquer sinal de
+// progresso até o fim.
+func HealAllProjects(sshClient *internalssh.Client, sftpClient *sftp.Client, projects []HealProject, onStart func(name string)) []HealResult {
 	var results []HealResult
 	for _, p := range projects {
 		if p.LocalDir == "" {
 			continue
+		}
+		if onStart != nil {
+			onStart(p.Name)
 		}
 		action, err := EnsureRemoteRepo(sshClient, sftpClient, p.LocalDir, p.RemotePath)
 		results = append(results, HealResult{Name: p.Name, Action: action, Err: err})

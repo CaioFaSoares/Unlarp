@@ -2622,8 +2622,23 @@ func (m *AppModel) healProjectsOnce(hostName string, hostCfg config.Host, client
 	for _, p := range hostCfg.Projects {
 		projects = append(projects, git.HealProject{Name: p.Name, LocalDir: p.LocalDir, RemotePath: p.RemotePath})
 	}
+	if len(projects) == 0 {
+		return
+	}
 
-	go git.HealAllProjects(client, sftpCli, projects)
+	go func() {
+		m.addLog(fmt.Sprintf("cura de git remoto iniciada em %s (%d projeto(s)) — pode levar minutos no primeiro bootstrap", hostName, len(projects)))
+		onStart := func(name string) { m.addLog(fmt.Sprintf("git remoto: verificando %s...", name)) }
+		results := git.HealAllProjects(client, sftpCli, projects, onStart)
+		for _, r := range results {
+			switch {
+			case r.Err != nil:
+				m.addLog(fmt.Sprintf("git remoto: %s falhou (%v)", r.Name, r.Err))
+			case r.Action != "":
+				m.addLog(fmt.Sprintf("git remoto: %s — %s", r.Name, r.Action))
+			}
+		}
+	}()
 }
 
 // checkProjectsCmd retorna um comando assíncrono que atualiza o status rico do Git
