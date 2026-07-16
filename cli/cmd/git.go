@@ -77,7 +77,10 @@ func runGitHeal(cmd *cobra.Command, args []string) error {
 		projects = append(projects, git.HealProject{Name: p.Name, LocalDir: p.LocalDir, RemotePath: p.RemotePath})
 	}
 
-	results := git.HealAllProjects(sshClient, sftpC.Inner(), projects)
+	onStart := func(name string) {
+		ui.Info("verificando %s... (primeiro bootstrap de um repo grande pode levar minutos)", name)
+	}
+	results := git.HealAllProjects(sshClient, sftpC.Inner(), projects, onStart)
 	if len(results) == 0 {
 		ui.Info("Nenhum projeto com diretório local vinculado em %s", displayName)
 		return nil

@@ -35,9 +35,15 @@ func GetRemoteGitInfo(client *internalssh.Client, projectPath string) (RemoteGit
 	var info RemoteGitInfo
 
 	cmd := fmt.Sprintf(
+		// symbolic-ref --short (não rev-parse --abbrev-ref) pra achar o
+		// branch: abbrev-ref desambigua o nome contra QUALQUER ref
+		// existente, então um remote chamado "main" (em vez de "origin")
+		// faz ele devolver "heads/main" em vez de "main" — e isso vazava
+		// pro bootstrap remoto como refs/heads/heads/main, uma ref sem
+		// commits, deixando HEAD remoto apontado pra lugar nenhum.
 		`cd %s 2>/dev/null && git rev-parse --is-inside-work-tree >/dev/null 2>&1 && `+
 			`echo "REPO|true" && `+
-			`echo "BRANCH|$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" && `+
+			`echo "BRANCH|$(git symbolic-ref --short HEAD 2>/dev/null)" && `+
 			`echo "HASH|$(git rev-parse --short HEAD 2>/dev/null)" && `+
 			`echo "MSG|$(git log -1 --format=%%s 2>/dev/null)" && `+
 			`echo "TIME|$(git log -1 --format=%%aI 2>/dev/null)" && `+
@@ -45,7 +51,7 @@ func GetRemoteGitInfo(client *internalssh.Client, projectPath string) (RemoteGit
 			`REMOTE=$(git remote | grep -x "origin" || git remote | head -1) && `+
 			`echo "REMOTE|$REMOTE" && `+
 			`echo "URL|$(git remote get-url $REMOTE 2>/dev/null)" && `+
-			`echo "AB|$(git rev-list --left-right --count HEAD...$REMOTE/$(git rev-parse --abbrev-ref HEAD) 2>/dev/null)" || `+
+			`echo "AB|$(git rev-list --left-right --count HEAD...$REMOTE/$(git symbolic-ref --short HEAD 2>/dev/null) 2>/dev/null)" || `+
 			`echo "REPO|false"`,
 		shellQuote(projectPath),
 	)
@@ -112,7 +118,7 @@ func LocalInfo(dir string) RemoteGitInfo {
 		return info
 	}
 	info.IsGitRepo = true
-	info.Branch = run("rev-parse", "--abbrev-ref", "HEAD")
+	info.Branch = run("symbolic-ref", "--short", "HEAD")
 	info.CommitHash = run("rev-parse", "--short", "HEAD")
 	info.CommitMessage = run("log", "-1", "--format=%s")
 	if t, err := time.Parse(time.RFC3339, run("log", "-1", "--format=%aI")); err == nil {
