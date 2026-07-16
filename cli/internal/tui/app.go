@@ -243,6 +243,9 @@ type AppModel struct {
 	tunnelManagers map[string]*tunnel.Manager
 	syncSessions   map[string]map[string]*liveSyncSession
 	pendingSyncs   map[string][]pendingSync
+	// healedHosts marca hosts onde já disparamos a cura proativa de git
+	// (git.HealAllProjects) nesta sessão da TUI — evita repetir a cada tick.
+	healedHosts map[string]bool
 
 	// Sessões Tmux
 	tmuxSessions []TmuxSession
@@ -369,6 +372,7 @@ func NewAppModel() (*AppModel, error) {
 		sshMu:                  &sync.Mutex{},
 		sshClients:             make(map[string]*internalssh.Client),
 		sftpClients:            make(map[string]*sftp.Client),
+		healedHosts:            make(map[string]bool),
 		agentClients:           make(map[string]*agent.Client),
 		tunnelManagers:         make(map[string]*tunnel.Manager),
 		syncSessions:           make(map[string]map[string]*liveSyncSession),
@@ -2594,6 +2598,34 @@ func (m *AppModel) checkTmuxCmd() tea.Cmd {
 	}
 }
 
+// healProjectsOnce dispara git.HealAllProjects em background pra todos os
+// projetos cadastrados em hostName, uma única vez por sessão da TUI (evita
+// repetir o bootstrap a cada tick de checkProjectsCmd). Best-effort: erros
+// só viram log de audit dentro de EnsureRemoteRepo, nunca bloqueiam a UI —
+// cobre projetos sem sync ativo, como um remoto sincronizado antes dessa
+// feature existir e que nunca ganhou um .git.
+func (m *AppModel) healProjectsOnce(hostName string, hostCfg config.Host, client *internalssh.Client) {
+	m.sshMu.Lock()
+	if m.healedHosts[hostName] {
+		m.sshMu.Unlock()
+		return
+	}
+	m.healedHosts[hostName] = true
+	m.sshMu.Unlock()
+
+	sftpCli, err := m.getOrCreateSFTPClient(hostName, client)
+	if err != nil {
+		return
+	}
+
+	projects := make([]git.HealProject, 0, len(hostCfg.Projects))
+	for _, p := range hostCfg.Projects {
+		projects = append(projects, git.HealProject{Name: p.Name, LocalDir: p.LocalDir, RemotePath: p.RemotePath})
+	}
+
+	go git.HealAllProjects(client, sftpCli, projects)
+}
+
 // checkProjectsCmd retorna um comando assíncrono que atualiza o status rico do Git
 // de cada projeto já cadastrado (config.Host.Projects) no host ativo de uma só vez.
 func (m *AppModel) checkProjectsCmd() tea.Cmd {
@@ -2619,6 +2651,8 @@ func (m *AppModel) checkProjectsCmd() tea.Cmd {
 		branches := make(map[string]string)
 
 		if client, err := m.getOrCreateSSHClient(m.activeHost, &hostCfg); err == nil {
+			m.healProjectsOnce(m.activeHost, hostCfg, client)
+
 			allPaths := make([]string, 0, len(hostCfg.Projects)+len(sessionPaths))
 			queried := make(map[string]bool)
 			for _, p := range hostCfg.Projects {

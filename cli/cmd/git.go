@@ -9,6 +9,7 @@ import (
 	"github.com/CaioFaSoares/unlarp/internal/agent"
 	"github.com/CaioFaSoares/unlarp/internal/agentapi"
 	"github.com/CaioFaSoares/unlarp/internal/git"
+	internalssh "github.com/CaioFaSoares/unlarp/internal/ssh"
 	"github.com/CaioFaSoares/unlarp/internal/ui"
 )
 
@@ -33,11 +34,66 @@ automático), use a tecla "b" na aba Projects da TUI.`,
 	RunE: runGitSwitch,
 }
 
+var gitHealCmd = &cobra.Command{
+	Use:   "heal [host]",
+	Short: "Recuperar o repositório git remoto de todos os projetos cadastrados",
+	Long: `Roda o bootstrap de git (bundle do histórico local) em todos os projetos
+com diretório local vinculado nesse host — cria o repo remoto se não existir,
+recupera um .git vazio/quebrado, ou avança o HEAD remoto pro local. Mesmo
+mecanismo best-effort que já roda ao iniciar um sync; útil para curar
+projetos sem sync ativo (ex: sincronizados antes dessa feature existir).`,
+	Args: cobra.MaximumNArgs(1),
+	RunE: runGitHeal,
+}
+
 func init() {
 	rootCmd.AddCommand(gitCmd)
 	gitCmd.AddCommand(gitSwitchCmd)
+	gitCmd.AddCommand(gitHealCmd)
 	gitSwitchCmd.Flags().StringVar(&gitProject, "project", "", "nome do projeto cadastrado no host")
 	gitSwitchCmd.Flags().StringVar(&gitRemoteDir, "remote-dir", "", "diretório remoto do repositório")
+}
+
+func runGitHeal(cmd *cobra.Command, args []string) error {
+	sshClient, displayName, err := connectForAgent(args)
+	if err != nil {
+		return err
+	}
+	defer sshClient.Close()
+
+	hostCfg, err := getHostConfig(strings.Join(args, ""))
+	if err != nil {
+		return err
+	}
+
+	sftpC, err := internalssh.NewSFTPClient(sshClient)
+	if err != nil {
+		return fmt.Errorf("abrindo SFTP: %w", err)
+	}
+	defer sftpC.Close()
+
+	var projects []git.HealProject
+	for _, p := range hostCfg.Projects {
+		projects = append(projects, git.HealProject{Name: p.Name, LocalDir: p.LocalDir, RemotePath: p.RemotePath})
+	}
+
+	results := git.HealAllProjects(sshClient, sftpC.Inner(), projects)
+	if len(results) == 0 {
+		ui.Info("Nenhum projeto com diretório local vinculado em %s", displayName)
+		return nil
+	}
+
+	for _, r := range results {
+		switch {
+		case r.Err != nil:
+			ui.Error("%s: falhou (%v)", r.Name, r.Err)
+		case r.Action == git.BootstrapNone:
+			ui.Dim("%s: ok", r.Name)
+		default:
+			ui.Success("%s: %s", r.Name, r.Action)
+		}
+	}
+	return nil
 }
 
 func runGitSwitch(cmd *cobra.Command, args []string) error {

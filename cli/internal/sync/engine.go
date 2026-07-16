@@ -59,7 +59,16 @@ type Engine struct {
 	// OnConflict é chamado a cada conflito resolvido pela estratégia
 	// (winner: "local" ou "remote"), para a TUI/CLI dar visibilidade.
 	OnConflict func(path string, winner string)
+
+	// lastGitHeal marca a última vez que EnsureRemoteRepo rodou dentro do
+	// SyncExec — throttle pra não pagar um round-trip SSH extra em todo ciclo.
+	lastGitHeal time.Time
 }
+
+// gitHealInterval é o intervalo mínimo entre re-checagens do git remoto
+// dentro de um sync ativo — cura repos quebrados/atrasados sem esperar o
+// próximo restart da engine.
+const gitHealInterval = 60 * time.Second
 
 // GitGuard protege contra sobrescrita quando o remote mudou via Git
 type GitGuard struct {
@@ -163,9 +172,22 @@ func NewEngine(id string, localDir, remoteDir, hostName string, globalIgnores []
 	// isso, `unlarp worktree add` e o isolamento nativo de worktree do Claude
 	// Code falham no remoto com "not in a git repository" — ou partem de um
 	// HEAD remoto defasado/quebrado. Falha aqui nunca derruba o sync — nem
-	// todo projeto sincronizado é um repo git. StateWarning é o mesmo canal já
-	// exibido na aba Logs da TUI, no CLI (ui.Warn) e no daemon (logf) — reusa
-	// pra avisar o usuário na primeira vez (ou se falhar) sem UI nova.
+	// todo projeto sincronizado é um repo git.
+	e.applyBootstrap(internalgit.EnsureRemoteRepo(sshClient, sftpClient, absLocal, remoteDir))
+	e.lastGitHeal = time.Now()
+
+	return e, nil
+}
+
+// applyBootstrap traduz o resultado de EnsureRemoteRepo em audit log + aviso
+// pro usuário. Extraído de NewEngine pra ser reusado pelo re-check periódico
+// em SyncExec — chamado com action==BootstrapNone (caso comum, remoto já
+// saudável) não faz nada, então repeti-lo a cada ciclo é barato.
+// StateWarning é o mesmo canal já exibido na aba Logs da TUI, no CLI
+// (ui.Warn) e no daemon (logf) — reusa pra avisar o usuário na primeira vez
+// (ou se falhar) sem UI nova.
+func (e *Engine) applyBootstrap(action internalgit.BootstrapAction, bootstrapErr error) {
+	remoteDir := e.RemoteDir
 	appendWarning := func(msg string) {
 		if e.StateWarning == "" {
 			e.StateWarning = msg
@@ -173,7 +195,6 @@ func NewEngine(id string, localDir, remoteDir, hostName string, globalIgnores []
 		}
 		e.StateWarning += " | " + msg
 	}
-	action, bootstrapErr := internalgit.EnsureRemoteRepo(sshClient, sftpClient, absLocal, remoteDir)
 	switch {
 	case bootstrapErr != nil:
 		e.audit("bootstrap git remoto falhou (seguindo sem git no remoto): %v", bootstrapErr)
@@ -195,8 +216,6 @@ func NewEngine(id string, localDir, remoteDir, hostName string, globalIgnores []
 		e.audit("bootstrap git remoto: repo em %s divergiu do local, refresh pulado", remoteDir)
 		appendWarning(fmt.Sprintf("git remoto (%s) divergiu do local; refresh pulado", remoteDir))
 	}
-
-	return e, nil
 }
 
 // UpdateSFTPClient troca o cliente SFTP usado pela engine (ex: após uma
@@ -591,6 +610,15 @@ func (e *Engine) SyncExec() (int, error) {
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
+
+	// Re-checa o git remoto periodicamente (não só no NewEngine): cura um
+	// .git quebrado/ausente e acompanha o HEAD local sem esperar a engine
+	// reiniciar. Caso comum (remoto já saudável) é barato — EnsureRemoteRepo
+	// só consulta estado, sem criar bundle.
+	if e.sshClient != nil && e.sftpClient != nil && time.Since(e.lastGitHeal) > gitHealInterval {
+		e.applyBootstrap(internalgit.EnsureRemoteRepo(e.sshClient, e.sftpClient, e.LocalDir, e.RemoteDir))
+		e.lastGitHeal = time.Now()
+	}
 
 	// Reconstrói o ignore matcher com todos os arquivos .gitignore locais dinamicamente
 	e.rebuildMatcher()
