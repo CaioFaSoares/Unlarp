@@ -109,8 +109,11 @@ func EnsureRemoteRepo(sshClient *internalssh.Client, sftpClient *sftp.Client, lo
 	// cleanup best-effort abaixo — "A && B ; C" reporta o status de C, então
 	// sem isso um `rm -f` bem-sucedido mascararia falha no init/fetch/reset.
 	// `git init` é idempotente, então reusar o mesmo bloco pra create/heal/
-	// refresh é seguro — inclusive quando o remoto já tinha .git.
-	critical := fmt.Sprintf("git -C %s init -q", shellQuote(remoteDir))
+	// refresh é seguro — inclusive quando o remoto já tinha .git. `mkdir -p`
+	// cobre cura proativa de um projeto registrado cujo remoteDir ainda não
+	// existe (ex: antes do primeiro file-sync).
+	critical := fmt.Sprintf("mkdir -p %s", shellQuote(remoteDir))
+	critical += fmt.Sprintf(" && git -C %s init -q", shellQuote(remoteDir))
 	critical += fmt.Sprintf(" && git -C %s fetch -q %s '+refs/heads/*:refs/heads/*'", shellQuote(remoteDir), shellQuote(remoteBundlePath))
 	if local.Branch != "" {
 		critical += fmt.Sprintf(" && git -C %s symbolic-ref HEAD %s", shellQuote(remoteDir), shellQuote("refs/heads/"+local.Branch))
@@ -134,6 +137,39 @@ func EnsureRemoteRepo(sshClient *internalssh.Client, sftpClient *sftp.Client, lo
 	}
 
 	return action, nil
+}
+
+// HealProject é um projeto candidato a bootstrap: nome pra relatório,
+// diretório local vinculado e caminho remoto correspondente.
+type HealProject struct {
+	Name       string
+	LocalDir   string
+	RemotePath string
+}
+
+// HealResult é o resultado do bootstrap de um HealProject.
+type HealResult struct {
+	Name   string
+	Action BootstrapAction
+	Err    error
+}
+
+// HealAllProjects roda EnsureRemoteRepo em sequência para cada projeto que
+// tem LocalDir — cobre cura proativa de todos os projetos cadastrados num
+// host (não só o que está com sync ativo). Reusa o mesmo sshClient/
+// sftpClient do host para todos, já que o bootstrap não depende de estado
+// entre projetos. Projetos sem LocalDir são pulados (nada pra fazer bundle
+// a partir de) e não geram entrada no resultado.
+func HealAllProjects(sshClient *internalssh.Client, sftpClient *sftp.Client, projects []HealProject) []HealResult {
+	var results []HealResult
+	for _, p := range projects {
+		if p.LocalDir == "" {
+			continue
+		}
+		action, err := EnsureRemoteRepo(sshClient, sftpClient, p.LocalDir, p.RemotePath)
+		results = append(results, HealResult{Name: p.Name, Action: action, Err: err})
+	}
+	return results
 }
 
 // isAncestorLocal diz se commit é ancestral (ou igual) do HEAD local — só
