@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -16,6 +17,10 @@ import (
 // remoteBootstrapBundle é o nome do arquivo temporário usado para transferir
 // o histórico git via SFTP durante o bootstrap (removido ao final).
 const remoteBootstrapBundle = ".unlarp-bootstrap.bundle"
+
+// remotePullBundle é o equivalente do caminho inverso: bundle criado no
+// remoto e baixado pro local quando o remoto está na frente.
+const remotePullBundle = ".unlarp-pull.bundle"
 
 // BootstrapAction descreve o que EnsureRemoteRepo de fato fez no remoto.
 type BootstrapAction string
@@ -32,11 +37,15 @@ const (
 	// HEAD local (só quando o HEAD remoto é ancestral do local — ver
 	// isAncestorLocal).
 	BootstrapRefreshed BootstrapAction = "refreshed"
-	// BootstrapDiverged: remoto tem commit(s) que o local não tem. Não
-	// tocamos no remoto pra não perder histórico — só sinalizamos.
-	// ponytail: reconciliação de divergência remota fica adiada; hoje só
-	// avisamos e deixamos o remoto como está.
+	// BootstrapDiverged: local E remoto têm commits que o outro lado não
+	// tem. Não tocamos em nenhum dos dois pra não perder histórico — só
+	// sinalizamos. O caso "remoto na frente" virou BootstrapPulled; aqui
+	// sobrou só divergência de verdade.
 	BootstrapDiverged BootstrapAction = "diverged"
+	// BootstrapPulled: remoto na frente do local (agente commitou ou criou
+	// branch/worktree lá) — histórico remoto puxado pro local via bundle.
+	// Inverso do Refreshed.
+	BootstrapPulled BootstrapAction = "pulled"
 )
 
 // EnsureRemoteRepo garante que remoteDir tenha um repositório git funcional e
@@ -87,10 +96,30 @@ func EnsureRemoteRepo(sshClient *internalssh.Client, sftpClient *sftp.Client, lo
 	case remote.CommitHash != local.CommitHash:
 		if isAncestorLocal(localDir, remote.CommitHash) {
 			action = BootstrapRefreshed
+		} else if isAncestorRemote(sshClient, remoteDir, local.CommitHash) {
+			// Remoto na frente (agente commitou lá): puxa o histórico de
+			// volta via bundle em vez de só avisar — é o que faz commits,
+			// branches e worktrees remotos aparecerem no local.
+			if _, err := pullRemoteHistory(sshClient, sftpClient, localDir, remoteDir, local, remote); err != nil {
+				return BootstrapNone, err
+			}
+			return BootstrapPulled, nil
 		} else {
 			return BootstrapDiverged, nil
 		}
 	default:
+		// HEADs iguais, mas um branch de worktree pode ter nascido ou
+		// avançado no remoto sem mover o HEAD principal — o digest de heads
+		// pega isso. Direcional: branch só-local não dispara pull.
+		if !headsSubset(remote.Heads, local.Heads) {
+			changed, err := pullRemoteHistory(sshClient, sftpClient, localDir, remoteDir, local, remote)
+			if err != nil {
+				return BootstrapNone, err
+			}
+			if changed {
+				return BootstrapPulled, nil
+			}
+		}
 		return BootstrapNone, nil
 	}
 
@@ -262,4 +291,227 @@ func uploadFile(sftpClient *sftp.Client, localPath, remotePath string) error {
 			return readErr
 		}
 	}
+}
+
+// downloadFile copia um arquivo do remoto para o local via SFTP (sem rewrite
+// de conteúdo — usado só para o bundle binário do pull).
+func downloadFile(sftpClient *sftp.Client, remotePath, localPath string) error {
+	remote, err := sftpClient.Open(remotePath)
+	if err != nil {
+		return err
+	}
+	defer remote.Close()
+
+	local, err := os.Create(localPath)
+	if err != nil {
+		return err
+	}
+	defer local.Close()
+
+	_, err = io.Copy(local, remote)
+	return err
+}
+
+// isAncestorRemote diz se commit é ancestral (ou igual) do HEAD remoto — o
+// caso em que é seguro puxar o histórico remoto sem perder commits locais.
+// Qualquer falha (objeto inexistente lá, SSH caído) conta como não-ancestral.
+func isAncestorRemote(sshClient *internalssh.Client, remoteDir, commit string) bool {
+	if commit == "" {
+		return false
+	}
+	ok := false
+	if err := withTimeout(30*time.Second, func() error {
+		_, _, cmdErr := sshClient.RunCommand(fmt.Sprintf(
+			"git -C %s merge-base --is-ancestor %s HEAD",
+			shellQuote(remoteDir), shellQuote(commit)))
+		ok = cmdErr == nil
+		return nil
+	}); err != nil {
+		return false
+	}
+	return ok
+}
+
+// headsSubset diz se todo par "name:hash" de sub está presente em super.
+// Direcional de propósito: um branch só-local não dispara pull (o remoto
+// nunca vai ter essa ref, e re-puxar todo ciclo seria loop infinito).
+func headsSubset(sub, super string) bool {
+	have := make(map[string]bool)
+	for _, p := range strings.Fields(super) {
+		have[p] = true
+	}
+	for _, p := range strings.Fields(sub) {
+		if !have[p] {
+			return false
+		}
+	}
+	return true
+}
+
+// pullRemoteHistory traz o histórico git do remoto pro local: o remoto cria
+// um bundle incremental (só o que falta aqui), o bundle desce via SFTP e
+// applyPullBundle aplica refs e index. changed=false quando não havia nada
+// novo de fato (nem objetos nem refs).
+func pullRemoteHistory(sshClient *internalssh.Client, sftpClient *sftp.Client, localDir, remoteDir string, local, remote RemoteGitInfo) (bool, error) {
+	remoteBundlePath := strings.TrimSuffix(remoteDir, "/") + "/" + remotePullBundle
+
+	var basis []string
+	for _, pair := range strings.Fields(local.Heads) {
+		if _, hash, ok := strings.Cut(pair, ":"); ok && hash != "" {
+			basis = append(basis, hash)
+		}
+	}
+	hashList := strings.Join(basis, " ")
+	if hashList == "" {
+		hashList = `""` // `for h in ;` é erro de sintaxe em sh
+	}
+	// O for/cat-file filtra hashes que o remoto não conhece (branch
+	// só-local): um hash desconhecido direto no --not derrubaria o bundle
+	// create com "bad revision".
+	bundleCmd := fmt.Sprintf(
+		`cd %s && basis=""; for h in %s; do git cat-file -e "$h^{commit}" 2>/dev/null && basis="$basis ^$h"; done; git bundle create %s --all $basis`,
+		shellQuote(remoteDir), hashList, shellQuote(remotePullBundle))
+
+	var stderr string
+	emptyBundle := false
+	if err := withTimeout(10*time.Minute, func() error {
+		var cmdErr error
+		_, stderr, cmdErr = sshClient.RunCommand(bundleCmd)
+		return cmdErr
+	}); err != nil {
+		if strings.Contains(stderr, "empty bundle") {
+			// Nenhum objeto novo — ainda pode haver ref nova apontando pra
+			// objeto que o local já tem (worktree add recém-criada).
+			emptyBundle = true
+		} else {
+			return false, fmt.Errorf("criando bundle no remoto: %s: %w", strings.TrimSpace(stderr), err)
+		}
+	}
+
+	bundlePath := ""
+	if !emptyBundle {
+		defer func() {
+			// Cleanup remoto best-effort — não dá pra usar o truque de
+			// subshell do push porque o download acontece entre create e rm.
+			_ = withTimeout(30*time.Second, func() error {
+				_, _, _ = sshClient.RunCommand("rm -f " + shellQuote(remoteBundlePath))
+				return nil
+			})
+		}()
+
+		tmp, err := os.CreateTemp("", "unlarp-pull-*.bundle")
+		if err != nil {
+			return false, fmt.Errorf("criando bundle temporário: %w", err)
+		}
+		tmp.Close()
+		defer os.Remove(tmp.Name())
+		if err := withTimeout(10*time.Minute, func() error {
+			return downloadFile(sftpClient, remoteBundlePath, tmp.Name())
+		}); err != nil {
+			return false, fmt.Errorf("baixando bundle do remoto: %w", err)
+		}
+		bundlePath = tmp.Name()
+	}
+
+	return applyPullBundle(localDir, bundlePath, remote.Branch, remote.Heads)
+}
+
+// applyPullBundle aplica localmente o resultado de um pull: fetch do bundle
+// (quando houver), criação das refs que não vieram em bundle nenhum e o
+// mesmo truque symbolic-ref+reset do bootstrap remoto pra seguir o branch
+// do remoto. 100% local — testável sem SSH. bundlePath=="" significa "sem
+// objetos novos, só refs".
+func applyPullBundle(localDir, bundlePath, remoteBranch, remoteHeads string) (bool, error) {
+	gitOut := func(args ...string) (string, error) {
+		out, err := exec.Command("git", append([]string{"-C", localDir}, args...)...).CombinedOutput()
+		return strings.TrimSpace(string(out)), err
+	}
+
+	headBefore, _ := gitOut("rev-parse", "HEAD")
+
+	changed := false
+	if bundlePath != "" {
+		if out, err := gitOut("bundle", "verify", bundlePath); err != nil {
+			return false, fmt.Errorf("bundle inválido: %s", out)
+		}
+		// Refspec sem force = ff-only por ref: branch local que divergiu é
+		// recusado (nunca sobrescrito), e rejeição parcial não é erro fatal
+		// — os objetos entram mesmo assim. --update-head-ok pela mesma
+		// razão do push remoto: o branch checked-out é justamente o alvo
+		// mais comum.
+		_, _ = gitOut("fetch", "-q", "--update-head-ok", bundlePath, "refs/heads/*:refs/heads/*")
+		changed = true
+	}
+
+	// Refs novas cujo tip o local já tem não entram em bundle (limitação do
+	// git bundle) — cria direto a partir da lista de heads do remoto.
+	haveOut, _ := gitOut("for-each-ref", "--format=%(refname:short)", "refs/heads/")
+	have := make(map[string]bool)
+	for _, name := range strings.Fields(haveOut) {
+		have[name] = true
+	}
+	for _, pair := range strings.Fields(remoteHeads) {
+		name, hash, ok := strings.Cut(pair, ":")
+		if !ok || name == "" || have[name] {
+			continue
+		}
+		if _, err := gitOut("branch", "--", name, hash); err == nil {
+			changed = true
+		}
+	}
+	if !changed {
+		return false, nil
+	}
+
+	// Daqui pra baixo é seguir o HEAD remoto — só quando é seguro mexer.
+	branch, headErr := gitOut("symbolic-ref", "-q", "--short", "HEAD")
+	if headErr != nil {
+		return changed, nil // detached — só refs neste ciclo
+	}
+	for _, marker := range []string{"MERGE_HEAD", "rebase-merge", "rebase-apply"} {
+		gp, _ := gitOut("rev-parse", "--git-path", marker)
+		if gp == "" {
+			continue
+		}
+		if !filepath.IsAbs(gp) {
+			gp = filepath.Join(localDir, gp)
+		}
+		if _, err := os.Stat(gp); err == nil {
+			return changed, nil // merge/rebase em curso — não mexe no HEAD
+		}
+	}
+
+	if remoteBranch != "" && remoteBranch != branch {
+		if _, err := gitOut("rev-parse", "--verify", "refs/heads/"+remoteBranch); err == nil {
+			_, _ = gitOut("symbolic-ref", "HEAD", "refs/heads/"+remoteBranch)
+		}
+	}
+
+	// reset --mixed só quando o commit sob HEAD de fato mudou: reconcilia o
+	// index preservando a árvore (que é do file sync, dos dois lados — a
+	// mesma justificativa do bootstrap remoto). Sem isso o status local
+	// mostraria "deleted" pra tudo que o commit novo trouxe.
+	if headAfter, _ := gitOut("rev-parse", "HEAD"); headAfter != headBefore {
+		_, _ = gitOut("reset", "--mixed", "-q")
+	}
+
+	// Worktrees locais vinculadas: o index delas também fica pra trás se o
+	// branch avançou via fetch. Best-effort, erros ignorados.
+	// ponytail: se o git local recusar fetch em ref checked-out de worktree
+	// (varia por versão), a ref atrasa um ciclo; upgrade é fetch+reset por
+	// worktree.
+	if wtOut, err := gitOut("worktree", "list", "--porcelain"); err == nil {
+		for _, line := range strings.Split(wtOut, "\n") {
+			if !strings.HasPrefix(line, "worktree ") {
+				continue
+			}
+			wt := strings.TrimPrefix(line, "worktree ")
+			if wt == localDir {
+				continue
+			}
+			_ = exec.Command("git", "-C", wt, "reset", "--mixed", "-q").Run()
+		}
+	}
+
+	return changed, nil
 }

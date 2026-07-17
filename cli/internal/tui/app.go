@@ -3396,7 +3396,19 @@ func (m *AppModel) checkGitCmd() tea.Cmd {
 			if diverged {
 				if exists {
 					if sessCtx, exists := activeHostSyncs[syncEntry.ID]; exists && sessCtx.engine != nil {
-						sessCtx.engine.Pause(reason)
+						// Remoto avançou ou trocou de branch: em vez de pausar
+						// direto, tenta resolver na hora — HealGitNow puxa o
+						// histórico remoto via bundle (BootstrapPulled) e o
+						// local segue o branch remoto. Pausa só quando há
+						// divergência de verdade (commits únicos dos 2 lados).
+						action, healErr := sessCtx.engine.HealGitNow()
+						if healErr != nil || action == git.BootstrapDiverged {
+							sessCtx.engine.Pause(reason)
+						} else {
+							sessCtx.engine.UpdateGitState(info.CommitHash, info.Branch)
+							diverged = false
+							reason = ""
+						}
 					}
 				}
 			}
@@ -3431,9 +3443,16 @@ func (m *AppModel) resolveGitCmd(syncID, action, localDir, remoteDir, branch str
 
 		switch action {
 		case "pull":
-			err := git.PullLocal(localDir, "origin", branch)
+			// Puxa direto do servidor via bundle (HealGitNow → pull) em vez
+			// de `git pull` no upstream (GitHub): o fluxo só depende do SSH
+			// que o sync já usa, nenhuma credencial extra.
+			healAction, err := sessCtx.engine.HealGitNow()
 			if err != nil {
 				return gitResolvedMsg{syncID: syncID, action: action, err: err}
+			}
+			if healAction == git.BootstrapDiverged {
+				return gitResolvedMsg{syncID: syncID, action: action,
+					err: fmt.Errorf("local e remoto divergiram (commits únicos dos dois lados); reconcilie manualmente")}
 			}
 
 			hostCfg, ok := m.cfg.Hosts[host]

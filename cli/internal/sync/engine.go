@@ -209,13 +209,34 @@ func (e *Engine) applyBootstrap(action internalgit.BootstrapAction, bootstrapErr
 		// Evento esperado a cada sessão (remoto avança pro HEAD local) — só
 		// audit, sem poluir o StateWarning exibido ao usuário.
 		e.audit("bootstrap git remoto: repo em %s atualizado pro HEAD local", remoteDir)
+	case action == internalgit.BootstrapPulled:
+		// Espelho do Refreshed: agente commitou/criou branch no remoto e o
+		// histórico desceu via bundle. Evento esperado — só audit.
+		e.audit("bootstrap git remoto: remoto (%s) avançou; histórico puxado pro local via bundle", remoteDir)
 	case action == internalgit.BootstrapDiverged:
-		// ponytail: reconciliação de divergência remota fica adiada — por ora
-		// só avisamos e não tocamos no remoto, pra não perder commits que só
-		// existam lá.
+		// Divergência de verdade (commits únicos dos DOIS lados) — não
+		// tocamos em nenhum, pra não perder histórico. Casos só-remoto-na-
+		// frente agora resolvem sozinhos via BootstrapPulled.
 		e.audit("bootstrap git remoto: repo em %s divergiu do local, refresh pulado", remoteDir)
 		appendWarning(fmt.Sprintf("git remoto (%s) divergiu do local; refresh pulado", remoteDir))
 	}
+}
+
+// HealGitNow força um EnsureRemoteRepo fora do throttle de gitHealInterval.
+// Usado pelo GitGuard da TUI pra auto-resolver "remote avançou" (vira pull
+// via bundle) sem pausar o sync. Serializa em e.mu — o mesmo lock que
+// SyncExec segura o ciclo inteiro — então TUI e loop da engine nunca puxam
+// ou empurram bundle ao mesmo tempo.
+func (e *Engine) HealGitNow() (internalgit.BootstrapAction, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.sshClient == nil || e.sftpClient == nil {
+		return internalgit.BootstrapNone, fmt.Errorf("engine sem conexão SSH/SFTP ativa")
+	}
+	action, err := internalgit.EnsureRemoteRepo(e.sshClient, e.sftpClient, e.LocalDir, e.RemoteDir)
+	e.applyBootstrap(action, err)
+	e.lastGitHeal = time.Now()
+	return action, err
 }
 
 // UpdateSFTPClient troca o cliente SFTP usado pela engine (ex: após uma
