@@ -21,6 +21,12 @@ type RemoteGitInfo struct {
 	RemoteName    string
 	RemoteURL     string
 	AheadBehind   AheadBehind
+	// Heads lista todos os branches do repo como pares "name:fullhash"
+	// separados por espaço, na ordem do for-each-ref (refname). Hash completo
+	// de propósito: --short varia de tamanho por repo e quebraria a comparação
+	// entre lados. É o que permite detectar trabalho em worktree (que move
+	// refs/heads/<branch> sem mover o HEAD do repo principal).
+	Heads string
 }
 
 // AheadBehind representa a comparação entre HEAD local e origin
@@ -48,6 +54,7 @@ func GetRemoteGitInfo(client *internalssh.Client, projectPath string) (RemoteGit
 			`echo "MSG|$(git log -1 --format=%%s 2>/dev/null)" && `+
 			`echo "TIME|$(git log -1 --format=%%aI 2>/dev/null)" && `+
 			`echo "DIRTY|$(git status --porcelain 2>/dev/null | head -1)" && `+
+			`echo "HEADS|$(git for-each-ref --format='%%(refname:short):%%(objectname)' refs/heads/ 2>/dev/null | tr '\n' ' ')" && `+
 			`REMOTE=$(git remote | grep -x "origin" || git remote | head -1) && `+
 			`echo "REMOTE|$REMOTE" && `+
 			`echo "URL|$(git remote get-url $REMOTE 2>/dev/null)" && `+
@@ -88,6 +95,8 @@ func GetRemoteGitInfo(client *internalssh.Client, projectPath string) (RemoteGit
 			}
 		case "DIRTY":
 			info.IsDirty = val != ""
+		case "HEADS":
+			info.Heads = val
 		case "REMOTE":
 			info.RemoteName = val
 		case "URL":
@@ -125,6 +134,7 @@ func LocalInfo(dir string) RemoteGitInfo {
 		info.CommitTime = t
 	}
 	info.IsDirty = run("status", "--porcelain") != ""
+	info.Heads = strings.Join(strings.Fields(run("for-each-ref", "--format=%(refname:short):%(objectname)", "refs/heads/")), " ")
 	
 	remote := "origin"
 	if remotes := strings.Split(run("remote"), "\n"); len(remotes) > 0 && remotes[0] != "" {
@@ -146,26 +156,6 @@ func LocalInfo(dir string) RemoteGitInfo {
 		info.AheadBehind.Behind, _ = strconv.Atoi(ab[1])
 	}
 	return info
-}
-
-// PullLocal executa `git pull` no repositório local do usuário.
-func PullLocal(localDir string, remote string, branch string) error {
-	if remote == "" {
-		remote = "origin"
-	}
-
-	args := []string{"-C", localDir, "pull", remote}
-	if branch != "" {
-		args = append(args, branch)
-	}
-
-	cmd := exec.Command("git", args...)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("git pull falhou: %s: %w", strings.TrimSpace(string(output)), err)
-	}
-
-	return nil
 }
 
 // shellQuote protege um argumento para uso seguro em shell remoto
