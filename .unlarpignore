@@ -1,0 +1,10 @@
+# Artefatos gerados/voláteis que não devem trafegar no sync (binário buildado,
+# SQLite com WAL vivo, cache do graphify). Sem âncora de path para casar em
+# qualquer profundidade, incluindo dentro das worktrees em .claude/worktrees/.
+.tokensave/
+graphify-out/
+*.db
+*.db-wal
+*.db-shm
+cli/unlarp
+**/cli/unlarp
