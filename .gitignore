@@ -1,1 +1,8 @@
 .claude/
+/cli/unlarp
+**/cli/unlarp
+.tokensave/
+cli/.tokensave/
+graphify-out/
+*.db-wal
+*.db-shm
