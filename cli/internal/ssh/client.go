@@ -16,11 +16,19 @@ import (
 	"github.com/CaioFaSoares/unlarp/internal/config"
 )
 
+// keepaliveInterval/keepaliveTimeout regem o watchdog de conexão morta (ver
+// watchConnection). var, não const, para o teste poder encolhê-los.
+var (
+	keepaliveInterval = 15 * time.Second
+	keepaliveTimeout  = 10 * time.Second
+)
+
 // Client encapsula uma conexão SSH reutilizável
 type Client struct {
-	host   *config.Host
-	conn   *ssh.Client
-	config *ssh.ClientConfig
+	host          *config.Host
+	conn          *ssh.Client
+	config        *ssh.ClientConfig
+	stopKeepalive chan struct{}
 }
 
 // NewClient cria um novo client SSH a partir de um Host configurado
@@ -51,11 +59,49 @@ func (c *Client) Connect() error {
 		return fmt.Errorf("falha ao conectar em %s: %w", addr, err)
 	}
 	c.conn = conn
+	c.stopKeepalive = make(chan struct{})
+	go c.watchConnection()
 	return nil
+}
+
+// watchConnection fecha a conexão se ela parar de responder a keepalives.
+// ponytail: RunCommand/SFTP não têm deadline nativo de socket — numa conexão
+// morta, um read/write trava pra sempre. Fechar aqui destrava qualquer
+// transfer em andamento em vez de vazar a goroutine bloqueada (era o "Mac
+// trava e precisa reiniciar" observado durante o git heal de repos grandes).
+func (c *Client) watchConnection() {
+	ticker := time.NewTicker(keepaliveInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-c.stopKeepalive:
+			return
+		case <-ticker.C:
+			done := make(chan error, 1)
+			go func() {
+				_, _, err := c.conn.SendRequest("keepalive@unlarp", true, nil)
+				done <- err
+			}()
+			select {
+			case err := <-done:
+				if err != nil {
+					c.conn.Close()
+					return
+				}
+			case <-time.After(keepaliveTimeout):
+				c.conn.Close()
+				return
+			}
+		}
+	}
 }
 
 // Close fecha a conexão SSH
 func (c *Client) Close() error {
+	if c.stopKeepalive != nil {
+		close(c.stopKeepalive)
+		c.stopKeepalive = nil
+	}
 	if c.conn != nil {
 		return c.conn.Close()
 	}
