@@ -22,6 +22,19 @@ const remoteBootstrapBundle = ".unlarp-bootstrap.bundle"
 // remoto e baixado pro local quando o remoto está na frente.
 const remotePullBundle = ".unlarp-pull.bundle"
 
+// maxBundleBytes é o teto de tamanho de um bundle git antes de recusarmos
+// trafegá-lo pela conexão SSH/SFTP. Um bundle de histórico saudável tem alguns
+// MB; passar disso significa artefato binário/DB commitado no histórico (o
+// bundle é `--all`, então não dá pra excluir por path). Mandar 100MB+ sem
+// pipelining na mesma conexão do file-sync satura CPU/memória e trava a
+// máquina — melhor pular o git-sync com aviso e deixar o usuário rodar
+// git gc / purgar o histórico.
+// ponytail: teto fixo; se algum repo legítimo precisar de mais, virar config.
+const maxBundleBytes = 50 << 20 // 50MB
+
+// bundleTooLarge decide se um bundle desse tamanho deve ser recusado no sync.
+func bundleTooLarge(size int64) bool { return size > maxBundleBytes }
+
 // BootstrapAction descreve o que EnsureRemoteRepo de fato fez no remoto.
 type BootstrapAction string
 
@@ -132,6 +145,10 @@ func EnsureRemoteRepo(sshClient *internalssh.Client, sftpClient *sftp.Client, lo
 
 	if out, err := exec.Command("git", "-C", localDir, "bundle", "create", tmpBundle.Name(), "--all").CombinedOutput(); err != nil {
 		return BootstrapNone, fmt.Errorf("git bundle create falhou: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+
+	if fi, err := os.Stat(tmpBundle.Name()); err == nil && bundleTooLarge(fi.Size()) {
+		return BootstrapNone, fmt.Errorf("histórico git grande demais para sync (%dMB > %dMB) — rode git gc ou purgue binários/DBs do histórico", fi.Size()>>20, int64(maxBundleBytes)>>20)
 	}
 
 	remoteBundlePath := strings.TrimSuffix(remoteDir, "/") + "/" + remoteBootstrapBundle
@@ -398,6 +415,13 @@ func pullRemoteHistory(sshClient *internalssh.Client, sftpClient *sftp.Client, l
 				return nil
 			})
 		}()
+
+		// Mesmo teto do push: se o histórico remoto virou um bundle gigante
+		// (artefato binário/DB commitado lá), não baixa 100MB+ pela conexão do
+		// sync. Checa o tamanho no remoto antes de gastar o download.
+		if fi, err := sftpClient.Stat(remoteBundlePath); err == nil && bundleTooLarge(fi.Size()) {
+			return false, fmt.Errorf("histórico git remoto grande demais para sync (%dMB > %dMB) — rode git gc ou purgue binários/DBs do histórico", fi.Size()>>20, int64(maxBundleBytes)>>20)
+		}
 
 		tmp, err := os.CreateTemp("", "unlarp-pull-*.bundle")
 		if err != nil {

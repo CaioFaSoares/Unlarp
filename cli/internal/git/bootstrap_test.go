@@ -40,6 +40,21 @@ func TestHealAllProjectsSkipsProjectsWithoutLocalDir(t *testing.T) {
 	}
 }
 
+// bundleTooLarge é o guard que impede o bundle de histórico gigante (binário
+// commitado) de trafegar e travar a máquina — checa o limiar exato (o `>`,
+// não `>=`).
+func TestBundleTooLargeBoundary(t *testing.T) {
+	if bundleTooLarge(maxBundleBytes) {
+		t.Fatalf("bundle no limite exato (%d) não deve ser recusado", maxBundleBytes)
+	}
+	if bundleTooLarge(maxBundleBytes - 1) {
+		t.Fatal("bundle abaixo do limite não deve ser recusado")
+	}
+	if !bundleTooLarge(maxBundleBytes + 1) {
+		t.Fatal("bundle acima do limite deve ser recusado")
+	}
+}
+
 // withTimeout deve retornar erro (não travar o teste) quando fn nunca
 // termina — é a proteção contra o "terminal congelou" de uma conexão SSH
 // morta, onde RunCommand/SFTP bloqueiam pra sempre sem isso.
