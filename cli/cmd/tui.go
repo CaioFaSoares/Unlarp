@@ -37,7 +37,7 @@ var tuiCmd = &cobra.Command{
 		inSession := false
 		if os.Getenv("TMUX") != "" {
 			sessName, err := getTmuxSessionName()
-			if err == nil && sessName == "unlarp-tui" {
+			if err == nil && strings.HasPrefix(sessName, "unlarp-tui") {
 				inSession = true
 			}
 		}
@@ -65,7 +65,15 @@ var tuiCmd = &cobra.Command{
 		// Habilita scroll com mouse só nesta sessão (não mexe no tmux.conf global do usuário)
 		_ = exec.Command("tmux", "set-option", "-t", "unlarp-tui", "mouse", "on").Run()
 
-		execArgs := []string{"tmux", "attach-session", "-t", "unlarp-tui"}
+		// Cria uma grouped session (view independente das windows compartilhadas)
+		// para que cada terminal possa navegar entre windows de forma independente.
+		// destroy-unattached garante limpeza automática ao detach.
+		groupedName := fmt.Sprintf("unlarp-tui-%d", os.Getpid())
+		execArgs := []string{"tmux",
+			"new-session", "-t", "unlarp-tui", "-s", groupedName,
+			";", "set", "destroy-unattached", "on",
+			";", "set", "mouse", "on",
+		}
 		env := os.Environ()
 		execErr := syscall.Exec(tmuxPath, execArgs, env)
 		if execErr != nil {
@@ -84,18 +92,25 @@ var tuiKillCmd = &cobra.Command{
 }
 
 func killTuiSession() error {
-	hasSess := exec.Command("tmux", "has-session", "-t", "unlarp-tui").Run() == nil
-	if !hasSess {
+	out, err := exec.Command("tmux", "list-sessions", "-F", "#{session_name}").Output()
+	if err != nil {
 		fmt.Println("Nenhuma sessão persistente do Unlarp ('unlarp-tui') está rodando.")
 		return nil
 	}
 
-	err := exec.Command("tmux", "kill-session", "-t", "unlarp-tui").Run()
-	if err != nil {
-		return fmt.Errorf("erro ao encerrar sessão: %w", err)
+	killed := false
+	for _, name := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if strings.HasPrefix(name, "unlarp-tui") {
+			_ = exec.Command("tmux", "kill-session", "-t", name).Run()
+			killed = true
+		}
 	}
 
-	fmt.Println("Sessão persistente do Unlarp ('unlarp-tui') encerrada com sucesso.")
+	if !killed {
+		fmt.Println("Nenhuma sessão persistente do Unlarp ('unlarp-tui') está rodando.")
+	} else {
+		fmt.Println("Sessões persistentes do Unlarp ('unlarp-tui') encerradas com sucesso.")
+	}
 	return nil
 }
 
